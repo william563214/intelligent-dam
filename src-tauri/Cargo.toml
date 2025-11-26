@@ -1,0 +1,28 @@
+[package]
+name = "intelligent-dam"
+version = "0.1.0"
+description = "Intelligent Digital Asset Management System"
+authors = ["liaoweizhe"]
+edition = "2021"
+
+[lib]
+name = "intelligent_dam_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.11", features = ["json"] }
+notify = "6.1"
+anyhow = "1.0"
+thiserror = "1.0"
+walkdir = "2.4"
+image = "0.24"
+regex = "1.10"
