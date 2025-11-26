@@ -104,3 +104,25 @@ pub fn scan_and_import<P: AsRef<Path>>(
     import_files(db, scanned_files)
 }
 
+/// 掃描多個目錄並匯入
+pub fn scan_multiple_directories(
+    db: &Database,
+    paths: Vec<String>,
+) -> Result<Vec<i64>> {
+    let mut all_imported_ids = Vec::new();
+
+    for path in paths {
+        match scan_and_import(db, &path) {
+            Ok(ids) => {
+                all_imported_ids.extend(ids);
+            }
+            Err(e) => {
+                eprintln!("Failed to scan directory {}: {}", path, e);
+                // 繼續掃描其他目錄，不中斷整個流程
+            }
+        }
+    }
+
+    Ok(all_imported_ids)
+}
+

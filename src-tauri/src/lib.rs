@@ -28,6 +28,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::scan_directory_command,
+            commands::scan_multiple_directories_command,
             commands::get_all_files_command,
             commands::scrape_file_command,
             commands::update_file_metadata_command,

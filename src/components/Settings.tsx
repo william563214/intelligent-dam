@@ -1,8 +1,8 @@
 import { useState, useEffect } from "react";
-import { scanDirectory, checkFFmpegAvailable } from "../api";
+import { scanMultipleDirectories, checkFFmpegAvailable } from "../api";
 
 interface SettingsData {
-  scanDirectory: string;
+  scanDirectories: string[];
   avdcPath: string;
   stashdbUrl: string;
   outputTemplate: string;
@@ -10,11 +10,12 @@ interface SettingsData {
 
 export default function Settings() {
   const [settings, setSettings] = useState<SettingsData>({
-    scanDirectory: "",
+    scanDirectories: [],
     avdcPath: "",
     stashdbUrl: "https://stashdb.org",
     outputTemplate: "{{studio}}/{{date}}_{{title}}.mp4",
   });
+  const [newDirectory, setNewDirectory] = useState("");
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<string | null>(null);
   const [ffmpegAvailable, setFFmpegAvailable] = useState<boolean | null>(null);
@@ -52,16 +53,33 @@ export default function Settings() {
     }
   };
 
+  const handleAddDirectory = () => {
+    if (newDirectory.trim() && !settings.scanDirectories.includes(newDirectory.trim())) {
+      setSettings({
+        ...settings,
+        scanDirectories: [...settings.scanDirectories, newDirectory.trim()],
+      });
+      setNewDirectory("");
+    }
+  };
+
+  const handleRemoveDirectory = (index: number) => {
+    setSettings({
+      ...settings,
+      scanDirectories: settings.scanDirectories.filter((_, i) => i !== index),
+    });
+  };
+
   const handleScan = async () => {
-    if (!settings.scanDirectory) {
-      alert("請先設定掃描目錄");
+    if (settings.scanDirectories.length === 0) {
+      alert("請先添加至少一個掃描目錄");
       return;
     }
 
     try {
       setScanning(true);
       setScanResult(null);
-      const result = await scanDirectory(settings.scanDirectory);
+      const result = await scanMultipleDirectories(settings.scanDirectories);
       setScanResult(
         `掃描完成！成功匯入 ${result.imported_count} 個檔案。`
       );
@@ -80,24 +98,56 @@ export default function Settings() {
       <div className="bg-white rounded-lg shadow p-6 space-y-6">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">
-            掃描目錄
+            掃描目錄（支援多個目錄，會遞迴掃描所有子資料夾）
           </label>
-          <div className="flex space-x-2">
-            <input
-              type="text"
-              value={settings.scanDirectory}
-              onChange={(e) =>
-                setSettings({ ...settings, scanDirectory: e.target.value })
-              }
-              placeholder="例如: C:/Videos 或 /Users/username/Videos"
-              className="flex-1 px-3 py-2 border border-gray-300 rounded-md"
-            />
+          <div className="space-y-2">
+            <div className="flex space-x-2">
+              <input
+                type="text"
+                value={newDirectory}
+                onChange={(e) => setNewDirectory(e.target.value)}
+                onKeyPress={(e) => {
+                  if (e.key === "Enter") {
+                    handleAddDirectory();
+                  }
+                }}
+                placeholder="例如: C:/Videos 或 /Users/username/Videos"
+                className="flex-1 px-3 py-2 border border-gray-300 rounded-md"
+              />
+              <button
+                onClick={handleAddDirectory}
+                disabled={!newDirectory.trim()}
+                className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600 disabled:bg-gray-400"
+              >
+                添加
+              </button>
+            </div>
+            {settings.scanDirectories.length > 0 && (
+              <div className="space-y-1">
+                {settings.scanDirectories.map((dir, index) => (
+                  <div
+                    key={index}
+                    className="flex items-center justify-between px-3 py-2 bg-gray-50 rounded-md"
+                  >
+                    <span className="text-sm text-gray-700 flex-1 truncate mr-2">
+                      {dir}
+                    </span>
+                    <button
+                      onClick={() => handleRemoveDirectory(index)}
+                      className="px-2 py-1 text-sm text-red-600 hover:text-red-800"
+                    >
+                      移除
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
             <button
               onClick={handleScan}
-              disabled={scanning || !settings.scanDirectory}
-              className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400"
+              disabled={scanning || settings.scanDirectories.length === 0}
+              className="w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400"
             >
-              {scanning ? "掃描中..." : "掃描目錄"}
+              {scanning ? "掃描中..." : `掃描 ${settings.scanDirectories.length} 個目錄`}
             </button>
           </div>
           {scanResult && (
@@ -109,6 +159,9 @@ export default function Settings() {
               {scanResult}
             </p>
           )}
+          <p className="mt-1 text-xs text-gray-500">
+            可以添加多個目錄，系統會遞迴掃描每個目錄及其所有子資料夾
+          </p>
         </div>
 
         <div>
