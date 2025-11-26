@@ -10,6 +10,10 @@ export async function scanDirectory(path: string): Promise<ScanResult> {
   return await invoke("scan_directory_command", { path });
 }
 
+export async function scanMultipleDirectories(paths: string[]): Promise<ScanResult> {
+  return await invoke("scan_multiple_directories_command", { paths });
+}
+
 export async function getAllFiles(): Promise<FileWithMetadata[]> {
   return await invoke("get_all_files_command");
 }

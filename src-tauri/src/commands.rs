@@ -38,6 +38,26 @@ pub async fn scan_directory_command(
 }
 
 #[tauri::command]
+pub async fn scan_multiple_directories_command(
+    paths: Vec<String>,
+    db: State<'_, Mutex<Database>>,
+) -> Result<ScanResult, String> {
+    if paths.is_empty() {
+        return Err("No directories provided".to_string());
+    }
+
+    let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
+    
+    let imported_ids = scanner::scan_multiple_directories(&db, paths)
+        .map_err(|e| format!("Scan failed: {}", e))?;
+
+    Ok(ScanResult {
+        imported_count: imported_ids.len(),
+        file_ids: imported_ids,
+    })
+}
+
+#[tauri::command]
 pub async fn get_all_files_command(
     db: State<'_, Mutex<Database>>,
 ) -> Result<Vec<FileWithMetadata>, String> {
