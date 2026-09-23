@@ -41,3 +41,10 @@ export interface ScrapeResult {
   error: string | null;
 }
 
+export interface AppSettings {
+  scanDirectories: string[];
+  avdcPath: string;
+  stashdbUrl: string;
+  outputTemplate: string;
+}
+

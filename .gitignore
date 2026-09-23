@@ -1,3 +1,6 @@
+# Temporary test / diagnostic artifacts
+.temp/
+
 # Logs
 logs
 *.log
