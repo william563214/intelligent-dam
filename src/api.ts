@@ -6,6 +6,7 @@ import type {
   ScrapeResult,
   Metadata,
   WatcherStatus,
+  TaskQueueStatus,
 } from "./types";
 
 export async function scanDirectory(path: string): Promise<ScanResult> {
@@ -72,5 +73,13 @@ export async function stopWatcher(): Promise<WatcherStatus> {
 
 export async function getWatcherStatus(): Promise<WatcherStatus> {
   return await invoke("get_watcher_status_command");
+}
+
+export async function getTaskQueueStatus(): Promise<TaskQueueStatus> {
+  return await invoke("get_task_queue_status_command");
+}
+
+export async function retryTask(jobId: number): Promise<number> {
+  return await invoke("retry_task_command", { jobId });
 }
 
