@@ -25,6 +25,14 @@ const video_extensions: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg",
 ];
 
+/// True when path has a known video extension (case-insensitive).
+pub fn is_video_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| video_extensions.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 /// Walk a directory and collect video files. No DB and no ffmpeg.
 pub fn scan_directory<P: AsRef<Path>>(path: P) -> Result<Vec<ScannedFile>> {
     let mut files = Vec::new();
@@ -36,19 +44,15 @@ pub fn scan_directory<P: AsRef<Path>>(path: P) -> Result<Vec<ScannedFile>> {
     {
         let path = entry.path();
 
-        if let Some(ext) = path.extension() {
-            if let Some(ext_str) = ext.to_str() {
-                if video_extensions.contains(&ext_str.to_lowercase().as_str()) {
-                    let metadata = std::fs::metadata(path)
-                        .with_context(|| format!("Failed to read metadata for {:?}", path))?;
+        if is_video_path(path) {
+            let metadata = std::fs::metadata(path)
+                .with_context(|| format!("Failed to read metadata for {:?}", path))?;
 
-                    files.push(ScannedFile {
-                        path: path.to_path_buf(),
-                        size: metadata.len(),
-                        phash: None,
-                    });
-                }
-            }
+            files.push(ScannedFile {
+                path: path.to_path_buf(),
+                size: metadata.len(),
+                phash: None,
+            });
         }
     }
 
@@ -225,6 +229,14 @@ mod tests {
             .expect("spawn ffmpeg");
         assert!(status.success());
         video
+    }
+
+    #[test]
+    fn is_video_path_accepts_common_extensions() {
+        assert!(is_video_path(Path::new("/tmp/a.mp4")));
+        assert!(is_video_path(Path::new("/tmp/a.MKV")));
+        assert!(!is_video_path(Path::new("/tmp/a.txt")));
+        assert!(!is_video_path(Path::new("/tmp/noext")));
     }
 
     #[test]

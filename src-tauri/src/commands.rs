@@ -4,11 +4,12 @@ use crate::file_status;
 use crate::scanner;
 use crate::scraper::{scrape_metadata, to_database_metadata};
 use crate::settings::{AppSettings, SettingsStore};
+use crate::watcher::{self, WatcherManager, WatcherStatus};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Mutex;
-use tauri::State;
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, State};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanResult {
@@ -27,7 +28,7 @@ pub struct ScrapeResult {
 #[tauri::command]
 pub async fn scan_directory_command(
     path: String,
-    db: State<'_, Mutex<Database>>,
+    db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<ScanResult, String> {
     // Directory walk off the async runtime; no DB lock held.
     let scanned = tokio::task::spawn_blocking(move || scanner::scan_directory(path))
@@ -66,7 +67,7 @@ pub async fn scan_directory_command(
 #[tauri::command]
 pub async fn scan_multiple_directories_command(
     paths: Vec<String>,
-    db: State<'_, Mutex<Database>>,
+    db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<ScanResult, String> {
     if paths.is_empty() {
         return Err("No directories provided".to_string());
@@ -104,7 +105,7 @@ pub async fn scan_multiple_directories_command(
 
 #[tauri::command]
 pub async fn get_all_files_command(
-    db: State<'_, Mutex<Database>>,
+    db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<Vec<FileWithMetadata>, String> {
     let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
     
@@ -128,13 +129,75 @@ pub fn get_settings_command(
 pub fn save_settings_command(
     settings: AppSettings,
     settings_store: State<'_, Mutex<SettingsStore>>,
+    watcher: State<'_, WatcherManager>,
+    app: AppHandle,
+    db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<(), String> {
-    let store = settings_store
-        .lock()
-        .map_err(|e| format!("Settings lock error: {}", e))?;
-    store
-        .save(&settings)
-        .map_err(|e| format!("Failed to save settings: {}", e))
+    {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .save(&settings)
+            .map_err(|e| format!("Failed to save settings: {}", e))?;
+    }
+
+    // Running watcher picks up new scan directories immediately
+    if watcher.is_running() {
+        let paths = watcher::resolve_watch_paths(&settings.scan_directories);
+        if paths.is_empty() {
+            watcher
+                .stop()
+                .map_err(|e| format!("Failed to stop watcher after settings save: {:#}", e))?;
+        } else {
+            watcher
+                .start(paths, app, Arc::clone(&db))
+                .map_err(|e| format!("Failed to reload watcher paths: {:#}", e))?;
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+pub fn start_watcher_command(
+    app: AppHandle,
+    db: State<'_, Arc<Mutex<Database>>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
+    watcher: State<'_, WatcherManager>,
+) -> Result<WatcherStatus, String> {
+    let settings = {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .load()
+            .map_err(|e| format!("Failed to load settings: {}", e))?
+    };
+
+    let paths = watcher::resolve_watch_paths(&settings.scan_directories);
+    if paths.is_empty() {
+        return Err(
+            "No valid watch directories. Add existing scan directories in Settings first.".to_string(),
+        );
+    }
+
+    watcher
+        .start(paths, app, Arc::clone(&db))
+        .map_err(|e| format!("Failed to start watcher: {:#}", e))
+}
+
+#[tauri::command]
+pub fn stop_watcher_command(watcher: State<'_, WatcherManager>) -> Result<WatcherStatus, String> {
+    watcher
+        .stop()
+        .map_err(|e| format!("Failed to stop watcher: {:#}", e))?;
+    Ok(watcher.status())
+}
+
+#[tauri::command]
+pub fn get_watcher_status_command(watcher: State<'_, WatcherManager>) -> WatcherStatus {
+    watcher.status()
 }
 
 #[tauri::command]
@@ -142,7 +205,7 @@ pub async fn scrape_file_command(
     file_id: i64,
     avdc_path: Option<String>,
     stashdb_url: Option<String>,
-    db: State<'_, Mutex<Database>>,
+    db: State<'_, Arc<Mutex<Database>>>,
     settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<ScrapeResult, String> {
     // 未傳入時改讀持久化設定 讓 Rust 端可取得完整設定
@@ -266,7 +329,7 @@ pub async fn scrape_file_command(
 pub async fn update_file_metadata_command(
     file_id: i64,
     metadata: Metadata,
-    db: State<'_, Mutex<Database>>,
+    db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<(), String> {
     let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
     
@@ -277,7 +340,7 @@ pub async fn update_file_metadata_command(
 #[tauri::command]
 pub async fn generate_preview_command(
     file_id: i64,
-    db: State<'_, Mutex<Database>>,
+    db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<String, String> {
     // 獲取檔案資訊並標為 processing（在 await 之前完成）
     let (file_path, previous_status) = {
@@ -359,7 +422,7 @@ pub async fn generate_preview_command(
 pub async fn generate_thumbnail_command(
     file_id: i64,
     timestamp: Option<f64>,
-    db: State<'_, Mutex<Database>>,
+    db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<String, String> {
     // 獲取檔案資訊（在 await 之前完成）
     let file_path = {

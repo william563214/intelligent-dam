@@ -5,6 +5,7 @@ import type {
   ScanResult,
   ScrapeResult,
   Metadata,
+  WatcherStatus,
 } from "./types";
 
 export async function scanDirectory(path: string): Promise<ScanResult> {
@@ -59,5 +60,17 @@ export async function getSettings(): Promise<AppSettings> {
 
 export async function saveSettings(settings: AppSettings): Promise<void> {
   return await invoke("save_settings_command", { settings });
+}
+
+export async function startWatcher(): Promise<WatcherStatus> {
+  return await invoke("start_watcher_command");
+}
+
+export async function stopWatcher(): Promise<WatcherStatus> {
+  return await invoke("stop_watcher_command");
+}
+
+export async function getWatcherStatus(): Promise<WatcherStatus> {
+  return await invoke("get_watcher_status_command");
 }
 
