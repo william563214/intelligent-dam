@@ -144,6 +144,9 @@ struct ActiveWatch {
     worker: Option<JoinHandle<()>>,
 }
 
+#[allow(non_upper_case_globals)]
+const worker_join_timeout: Duration = Duration::from_secs(3);
+
 /// Process-wide watcher controller managed as Tauri state.
 pub struct WatcherManager {
     inner: Mutex<Option<ActiveWatch>>,
@@ -174,8 +177,9 @@ impl WatcherManager {
         self.status().running
     }
 
-    /// Stop monitoring if active. Idempotent.
-    pub fn stop(&self) -> Result<()> {
+    /// Signal stop drop the notify watcher and detach the ingest worker.
+    /// Does not join — call [`join_worker`] off the UI thread.
+    pub fn request_stop(&self) -> Result<Option<JoinHandle<()>>> {
         let mut guard = self
             .inner
             .lock()
@@ -184,15 +188,47 @@ impl WatcherManager {
             active.stop_flag.store(true, Ordering::SeqCst);
             // Dropping RecommendedWatcher ends the notify callback and closes tx
             drop(active._watcher);
-            if let Some(handle) = active.worker.take() {
-                // Worker exits when channel disconnects or stop_flag is set
-                let _ = handle.join();
+            Ok(active.worker.take())
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Join a detached ingest worker with a timeout (never blocks forever).
+    pub fn join_worker(handle: JoinHandle<()>, timeout: Duration) {
+        let (done_tx, done_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(timeout) {
+            Ok(()) => {}
+            Err(_) => {
+                eprintln!(
+                    "watcher: ingest worker join timed out after {:?}; left detached",
+                    timeout
+                );
             }
+        }
+    }
+
+    /// Request stop then join with timeout. Prefer async commands + spawn_blocking
+    /// for UI paths; this is for Drop and tests.
+    pub fn stop_with_timeout(&self, timeout: Duration) -> Result<()> {
+        if let Some(handle) = self.request_stop()? {
+            Self::join_worker(handle, timeout);
         }
         Ok(())
     }
 
-    /// Start monitoring `paths`. Replaces any existing session.
+    /// Stop monitoring if active. Idempotent. Uses [`worker_join_timeout`].
+    pub fn stop(&self) -> Result<()> {
+        self.stop_with_timeout(worker_join_timeout)
+    }
+
+    /// Start monitoring `paths`. Caller should have already stopped any prior
+    /// session via [`request_stop`] + [`join_worker`] when on the UI path.
+    /// If still running this will stop with timeout first.
     pub fn start(
         &self,
         paths: Vec<PathBuf>,
@@ -203,7 +239,7 @@ impl WatcherManager {
             anyhow::bail!("No valid watch directories (configure scan directories in settings)");
         }
 
-        self.stop()?;
+        self.stop_with_timeout(worker_join_timeout)?;
 
         let (tx, rx): (Sender<DetectedPath>, Receiver<DetectedPath>) = mpsc::channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -252,6 +288,14 @@ impl WatcherManager {
             running: true,
             watched_paths,
         })
+    }
+}
+
+impl Drop for WatcherManager {
+    fn drop(&mut self) {
+        if let Ok(Some(handle)) = self.request_stop() {
+            Self::join_worker(handle, Duration::from_secs(2));
+        }
     }
 }
 
@@ -346,7 +390,13 @@ fn ingest_worker(
 
         // Optional lightweight phash outside the mutex (same pattern as scan)
         if !jobs.is_empty() {
+            if stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
             let results = scanner::compute_phash_jobs(jobs);
+            if stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
             if let Ok(db_guard) = db.lock() {
                 let _ = scanner::write_phashes(&db_guard, &results);
             }
@@ -524,6 +574,17 @@ mod tests {
         mgr.stop().expect("stop idle");
         assert!(!mgr.status().running);
         assert!(mgr.status().watched_paths.is_empty());
+    }
+
+    #[test]
+    fn request_stop_then_join_with_timeout_is_fast_when_idle() {
+        let mgr = WatcherManager::new();
+        let handle = mgr.request_stop().expect("request");
+        assert!(handle.is_none());
+        let started = Instant::now();
+        mgr.stop_with_timeout(Duration::from_millis(500))
+            .expect("stop");
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

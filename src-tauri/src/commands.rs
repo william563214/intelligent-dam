@@ -126,7 +126,7 @@ pub fn get_settings_command(
 }
 
 #[tauri::command]
-pub fn save_settings_command(
+pub async fn save_settings_command(
     settings: AppSettings,
     settings_store: State<'_, Mutex<SettingsStore>>,
     watcher: State<'_, WatcherManager>,
@@ -142,14 +142,11 @@ pub fn save_settings_command(
             .map_err(|e| format!("Failed to save settings: {}", e))?;
     }
 
-    // Running watcher picks up new scan directories immediately
+    // Running watcher picks up new scan directories; join off the async runtime
     if watcher.is_running() {
         let paths = watcher::resolve_watch_paths(&settings.scan_directories);
-        if paths.is_empty() {
-            watcher
-                .stop()
-                .map_err(|e| format!("Failed to stop watcher after settings save: {:#}", e))?;
-        } else {
+        join_detached_worker(watcher.request_stop()).await?;
+        if !paths.is_empty() {
             watcher
                 .start(paths, app, Arc::clone(&db))
                 .map_err(|e| format!("Failed to reload watcher paths: {:#}", e))?;
@@ -160,7 +157,7 @@ pub fn save_settings_command(
 }
 
 #[tauri::command]
-pub fn start_watcher_command(
+pub async fn start_watcher_command(
     app: AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
     settings_store: State<'_, Mutex<SettingsStore>>,
@@ -182,22 +179,39 @@ pub fn start_watcher_command(
         );
     }
 
+    // Stop prior session without blocking the async runtime on a long join
+    join_detached_worker(watcher.request_stop()).await?;
+
     watcher
         .start(paths, app, Arc::clone(&db))
         .map_err(|e| format!("Failed to start watcher: {:#}", e))
 }
 
 #[tauri::command]
-pub fn stop_watcher_command(watcher: State<'_, WatcherManager>) -> Result<WatcherStatus, String> {
-    watcher
-        .stop()
-        .map_err(|e| format!("Failed to stop watcher: {:#}", e))?;
+pub async fn stop_watcher_command(
+    watcher: State<'_, WatcherManager>,
+) -> Result<WatcherStatus, String> {
+    join_detached_worker(watcher.request_stop()).await?;
     Ok(watcher.status())
 }
 
 #[tauri::command]
 pub fn get_watcher_status_command(watcher: State<'_, WatcherManager>) -> WatcherStatus {
     watcher.status()
+}
+
+async fn join_detached_worker(
+    result: anyhow::Result<Option<std::thread::JoinHandle<()>>>,
+) -> Result<(), String> {
+    let handle = result.map_err(|e| format!("Failed to stop watcher: {:#}", e))?;
+    if let Some(handle) = handle {
+        tokio::task::spawn_blocking(move || {
+            WatcherManager::join_worker(handle, std::time::Duration::from_secs(3));
+        })
+        .await
+        .map_err(|e| format!("Watcher stop task join failed: {}", e))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
