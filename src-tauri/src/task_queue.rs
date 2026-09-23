@@ -440,6 +440,14 @@ impl TaskQueue {
         }
     }
 
+    /// Shared PathSuppression used by Watcher moves and phash near-dedup orphans.
+    pub fn path_suppressions(&self) -> Result<Arc<PathSuppression>, String> {
+        self.suppressions
+            .lock()
+            .map(|g| Arc::clone(&*g))
+            .map_err(|e| format!("queue suppressions lock: {}", e))
+    }
+
     /// Bind runtime deps and ensure worker threads are running.
     /// `suppressions` should be the same Arc the Watcher uses so moves stay suppressed.
     /// Re-binding updates the shared suppressions pointer used by existing workers.
@@ -786,14 +794,14 @@ fn execute_job(
             };
             let results = scanner::compute_phash_jobs(vec![phash_job]);
             match db.lock() {
-                Ok(guard) => match scanner::write_phashes(&guard, &results) {
+                Ok(guard) => match scanner::write_phashes(&guard, &results, Some(suppressions)) {
                     Ok(outcomes) => {
                         let skipped = outcomes.iter().any(|(_, o)| {
                             matches!(o, scanner::PhashApplyOutcome::SkippedDuplicate { .. })
                         });
                         if skipped {
                             eprintln!(
-                                "task_queue: phash job for file {} skipped as near-duplicate",
+                                "task_queue: phash job for file {} skipped as near-duplicate (path suppressed)",
                                 file_id
                             );
                         }
