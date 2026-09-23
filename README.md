@@ -148,6 +148,8 @@ william_video/
 - **第二階段**: 自動化與監控（Watcher Service）
 - **第三階段**: AI 整合（ONNX Runtime + CLIP 模型）
 
+詳細缺口、建議優先序與 checklist 見 **[ROADMAP.md](./ROADMAP.md)**。
+
 ## 授權
 
 本專案為個人專案，僅供學習和研究使用。
