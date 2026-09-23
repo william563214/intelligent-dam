@@ -402,7 +402,7 @@ fn ingest_worker(
                     continue;
                 }
             };
-            match scanner::import_files_pending_phash(&db_guard, &[scanned]) {
+            match scanner::import_files_pending_phash(&db_guard, &[scanned], Some(&suppressions)) {
                 Ok((entries, jobs)) => (entries.into_iter().next(), jobs),
                 Err(e) => {
                     eprintln!("watcher: import failed for {}: {:#}", path_str, e);
@@ -452,6 +452,7 @@ fn ingest_worker(
         );
 
         // Path already known and no phash work: do not re-enqueue pipeline
+        // (documented: known path with no phash job -> don't enqueue)
         if !is_new && jobs.is_empty() {
             eprintln!(
                 "watcher: path dedup skip queue for existing file_id {}",
