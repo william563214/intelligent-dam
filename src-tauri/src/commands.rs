@@ -138,11 +138,15 @@ pub async fn scrape_file_command(
         });
 
     // 獲取檔案資訊（在 await 之前完成）
-    let (file_path, phash) = {
+    let (file_path, phash, existing_sprite) = {
         let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
         let file = db.get_file_by_id(file_id)
             .map_err(|e| format!("File not found: {}", e))?;
-        (PathBuf::from(&file.path), file.phash.clone())
+        let sprite = db
+            .get_metadata(file_id)
+            .map_err(|e| format!("Failed to read metadata: {}", e))?
+            .and_then(|m| m.sprite_sheet_path);
+        (PathBuf::from(&file.path), file.phash.clone(), sprite)
     };
     
     // 執行刮削（不需要持有鎖）
@@ -153,19 +157,23 @@ pub async fn scrape_file_command(
         resolved_stashdb.as_deref(),
     ).await {
         Ok((scraped_meta, source_type)) => {
-            let db_metadata = to_database_metadata(&scraped_meta, file_id, source_type);
+            let db_metadata = to_database_metadata(
+                &scraped_meta,
+                file_id,
+                source_type,
+                existing_sprite,
+            );
 
-            // 儲存 metadata + tags/actors 並將狀態恢復為 ready
+            // metadata + tags + status 同一交易寫入
             let saved_tags = {
                 let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
-                db.update_metadata(&db_metadata)
-                    .map_err(|e| format!("Failed to save metadata: {}", e))?;
-                db.apply_scraped_tags(file_id, &scraped_meta.tags, &scraped_meta.actors)
-                    .map_err(|e| format!("Failed to save tags: {}", e))?;
-                db.update_file_status(file_id, status_ready)
-                    .map_err(|e| format!("Failed to update status: {}", e))?;
-                db.get_file_tags(file_id)
-                    .map_err(|e| format!("Failed to read tags: {}", e))?
+                db.persist_scrape_success(
+                    &db_metadata,
+                    &scraped_meta.tags,
+                    &scraped_meta.actors,
+                    status_ready,
+                )
+                .map_err(|e| format!("Failed to persist scrape result: {}", e))?
             };
 
             Ok(ScrapeResult {
@@ -176,16 +184,29 @@ pub async fn scrape_file_command(
             })
         }
         Err(e) => {
-            // AVDC 與 StashDB 皆失敗時標記 scrape_failed
-            if let Ok(db) = db.lock() {
-                let _ = db.update_file_status(file_id, status_scrape_failed);
+            // AVDC 與 StashDB 皆失敗時標記 scrape_failed 錯誤不可吞掉
+            let scrape_error = e.to_string();
+            {
+                let db = db.lock().map_err(|lock_err| {
+                    format!(
+                        "Scrape failed ({}); also failed to lock DB for scrape_failed: {}",
+                        scrape_error, lock_err
+                    )
+                })?;
+                db.update_file_status(file_id, status_scrape_failed)
+                    .map_err(|status_err| {
+                        format!(
+                            "Scrape failed ({}); also failed to mark scrape_failed: {}",
+                            scrape_error, status_err
+                        )
+                    })?;
             }
 
             Ok(ScrapeResult {
                 success: false,
                 metadata: None,
                 tags: None,
-                error: Some(e.to_string()),
+                error: Some(scrape_error),
             })
         }
     }

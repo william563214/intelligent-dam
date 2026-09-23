@@ -309,10 +309,12 @@ pub async fn scrape_metadata(
 
 /// 將 ScrapedMetadata 的純文字欄位轉成資料庫 Metadata
 /// tags / actors 需另外經 Database::apply_scraped_tags 寫入
+/// existing_sprite_sheet_path 用於保留既有預覽路徑 避免刮削覆寫為空
 pub fn to_database_metadata(
     scraped: &ScrapedMetadata,
     file_id: i64,
     source_type: String,
+    existing_sprite_sheet_path: Option<String>,
 ) -> Metadata {
     Metadata {
         file_id,
@@ -321,7 +323,7 @@ pub fn to_database_metadata(
         release_date: scraped.release_date.clone(),
         summary: scraped.summary.clone(),
         cover_image: scraped.cover_image.clone(),
-        sprite_sheet_path: None,
+        sprite_sheet_path: existing_sprite_sheet_path,
         source_type: Some(source_type),
     }
 }
@@ -372,11 +374,31 @@ mod tests {
             tags: vec!["t1".to_string()],
             actors: vec!["a1".to_string()],
         };
-        let meta = to_database_metadata(&scraped, 42, "scraped_avdc".to_string());
+        let meta = to_database_metadata(&scraped, 42, "scraped_avdc".to_string(), None);
         assert_eq!(meta.file_id, 42);
         assert_eq!(meta.title.as_deref(), Some("T"));
         assert_eq!(meta.source_type.as_deref(), Some("scraped_avdc"));
         assert!(meta.sprite_sheet_path.is_none());
+    }
+
+    #[test]
+    fn to_database_metadata_preserves_existing_sprite_path() {
+        let scraped = ScrapedMetadata {
+            title: Some("T".to_string()),
+            studio: None,
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            tags: Vec::new(),
+            actors: Vec::new(),
+        };
+        let meta = to_database_metadata(
+            &scraped,
+            1,
+            "scraped_stashdb".to_string(),
+            Some("/tmp/sprite.jpg".to_string()),
+        );
+        assert_eq!(meta.sprite_sheet_path.as_deref(), Some("/tmp/sprite.jpg"));
     }
 }
 
