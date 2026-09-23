@@ -787,7 +787,18 @@ fn execute_job(
             let results = scanner::compute_phash_jobs(vec![phash_job]);
             match db.lock() {
                 Ok(guard) => match scanner::write_phashes(&guard, &results) {
-                    Ok(()) => ExecOutcome::Success,
+                    Ok(outcomes) => {
+                        let skipped = outcomes.iter().any(|(_, o)| {
+                            matches!(o, scanner::PhashApplyOutcome::SkippedDuplicate { .. })
+                        });
+                        if skipped {
+                            eprintln!(
+                                "task_queue: phash job for file {} skipped as near-duplicate",
+                                file_id
+                            );
+                        }
+                        ExecOutcome::Success
+                    }
                     Err(e) => ExecOutcome::Failed {
                         error: e.to_string(),
                         retryable: true,

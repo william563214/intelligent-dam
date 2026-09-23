@@ -1,4 +1,5 @@
 use crate::file_status;
+use crate::phash;
 use rusqlite::{Connection, Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -109,12 +110,15 @@ impl Database {
         Ok(())
     }
 
-    pub fn insert_file(
+    /// Upsert by path. Returns `(id, is_new)`.
+    /// Same path never creates a second Files row (UNIQUE + ON CONFLICT).
+    pub fn upsert_file(
         &self,
         path: &str,
         size: u64,
         phash: Option<String>,
-    ) -> SqliteResult<i64> {
+    ) -> SqliteResult<(i64, bool)> {
+        let existed = self.get_file_by_path(path)?.is_some();
         // 掃描再次找到檔案時 若先前為 missing 則恢復 ready
         self.conn.execute(
             "INSERT INTO Files (path, size, phash, status) VALUES (?1, ?2, ?3, ?4)
@@ -127,7 +131,98 @@ impl Database {
                END",
             params![path, size as i64, phash, file_status::ready, file_status::missing],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = match self.get_file_by_path(path)? {
+            Some(f) => f.id,
+            None => self.conn.last_insert_rowid(),
+        };
+        Ok((id, !existed))
+    }
+
+    /// Insert or update by path; returns the stable row id (path-unique).
+    pub fn insert_file(
+        &self,
+        path: &str,
+        size: u64,
+        phash: Option<String>,
+    ) -> SqliteResult<i64> {
+        let (id, _) = self.upsert_file(path, size, phash)?;
+        Ok(id)
+    }
+
+    /// Count Files rows (for path-dedup assertions).
+    pub fn count_files(&self) -> SqliteResult<i64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM Files", [], |row| row.get(0))
+    }
+
+    /// Find another Files row whose phash is within `max_distance` of `phash_hex`.
+    /// Prefers the smallest id (oldest keeper) among matches.
+    pub fn find_near_phash_duplicate(
+        &self,
+        exclude_file_id: i64,
+        phash_hex: &str,
+        max_distance: u32,
+    ) -> SqliteResult<Option<(FileRecord, u32)>> {
+        let probe = match phash::parse_phash_hex(phash_hex) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, created_at, phash, status FROM Files
+             WHERE id != ?1 AND phash IS NOT NULL AND TRIM(phash) != ''
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![exclude_file_id], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get::<_, i64>(2)? as u64,
+                created_at: row.get(3)?,
+                phash: row.get(4)?,
+                status: row.get(5)?,
+            })
+        })?;
+
+        let mut best: Option<(FileRecord, u32)> = None;
+        for row in rows {
+            let file = row?;
+            let Some(ref hex) = file.phash else {
+                continue;
+            };
+            let Some(other) = phash::parse_phash_hex(hex) else {
+                continue;
+            };
+            let dist = phash::hamming_distance(probe, other);
+            if dist > max_distance {
+                continue;
+            }
+            let replace = match &best {
+                None => true,
+                Some((keeper, best_dist)) => {
+                    dist < *best_dist || (dist == *best_dist && file.id < keeper.id)
+                }
+            };
+            if replace {
+                best = Some((file, dist));
+            }
+        }
+        Ok(best)
+    }
+
+    /// Remove a provisional Files row and its Metadata / FileTags (phash skip).
+    pub fn delete_file_record(&self, file_id: i64) -> SqliteResult<()> {
+        self.conn.execute(
+            "DELETE FROM FileTags WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM Metadata WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM Files WHERE id = ?1", params![file_id])?;
+        Ok(())
     }
 
     pub fn get_file_by_id(&self, id: i64) -> SqliteResult<FileRecord> {
@@ -785,6 +880,75 @@ mod tests {
             .expect("exists");
         assert_eq!(file.size, 20);
         assert_eq!(file.phash.as_deref(), Some("aabbccddeeff0011"));
+    }
+
+    #[test]
+    fn same_path_upsert_does_not_double_insert() {
+        let db = open_memory_db();
+        let (id1, is_new1) = db
+            .upsert_file("/tmp/path-dedup.mp4", 100, None)
+            .expect("first");
+        assert!(is_new1);
+        let (id2, is_new2) = db
+            .upsert_file("/tmp/path-dedup.mp4", 200, Some("deadbeefdeadbeef".into()))
+            .expect("second");
+        assert!(!is_new2);
+        assert_eq!(id1, id2);
+        assert_eq!(db.count_files().expect("count"), 1);
+        let file = db.get_file_by_id(id1).expect("get");
+        assert_eq!(file.size, 200);
+        assert_eq!(file.phash.as_deref(), Some("deadbeefdeadbeef"));
+    }
+
+    #[test]
+    fn find_near_phash_duplicate_respects_hamming_threshold() {
+        let db = open_memory_db();
+        let keeper = db
+            .insert_file(
+                "/tmp/keeper.mp4",
+                1,
+                Some("0000000000000000".into()),
+            )
+            .expect("keeper");
+        let candidate = db
+            .insert_file("/tmp/cand.mp4", 1, None)
+            .expect("candidate");
+
+        // distance 8 → match
+        let hit = db
+            .find_near_phash_duplicate(candidate, "00000000000000ff", 8)
+            .expect("query")
+            .expect("should match");
+        assert_eq!(hit.0.id, keeper);
+        assert_eq!(hit.1, 8);
+
+        // distance 9 → no match at max 8
+        let miss = db
+            .find_near_phash_duplicate(candidate, "00000000000001ff", 8)
+            .expect("query");
+        assert!(miss.is_none());
+    }
+
+    #[test]
+    fn delete_file_record_removes_metadata_and_tags() {
+        let db = open_memory_db();
+        let id = db.insert_file("/tmp/drop.mp4", 1, None).expect("insert");
+        db.update_metadata(&Metadata {
+            file_id: id,
+            title: Some("t".into()),
+            studio: None,
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: None,
+        })
+        .expect("meta");
+        db.apply_scraped_tags(id, &["X".into()], &[])
+            .expect("tags");
+        db.delete_file_record(id).expect("delete");
+        assert_eq!(db.count_files().expect("count"), 0);
+        assert!(db.get_metadata(id).expect("meta").is_none());
     }
 }
 

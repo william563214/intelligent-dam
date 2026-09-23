@@ -38,7 +38,7 @@ pub async fn scan_directory_command(
         .map_err(|e| format!("Scan failed: {}", e))?;
 
     // Short lock: insert rows (null phash ok; COALESCE keeps existing).
-    let (imported_ids, jobs) = {
+    let (imported, jobs) = {
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
@@ -59,9 +59,22 @@ pub async fn scan_directory_command(
             .map_err(|e| format!("Failed to write phash: {}", e))?;
     }
 
+    // Drop ids removed by phash near-dedup; unique by path upsert
+    let file_ids: Vec<i64> = {
+        let db = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let mut seen = std::collections::HashSet::new();
+        imported
+            .into_iter()
+            .map(|e| e.file_id)
+            .filter(|id| seen.insert(*id) && db.get_file_by_id(*id).is_ok())
+            .collect()
+    };
+
     Ok(ScanResult {
-        imported_count: imported_ids.len(),
-        file_ids: imported_ids,
+        imported_count: file_ids.len(),
+        file_ids,
     })
 }
 
@@ -78,7 +91,7 @@ pub async fn scan_multiple_directories_command(
         .await
         .map_err(|e| format!("Scan task join failed: {}", e))?;
 
-    let (imported_ids, jobs) = {
+    let (imported, jobs) = {
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
@@ -98,9 +111,21 @@ pub async fn scan_multiple_directories_command(
             .map_err(|e| format!("Failed to write phash: {}", e))?;
     }
 
+    let file_ids: Vec<i64> = {
+        let db = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let mut seen = std::collections::HashSet::new();
+        imported
+            .into_iter()
+            .map(|e| e.file_id)
+            .filter(|id| seen.insert(*id) && db.get_file_by_id(*id).is_ok())
+            .collect()
+    };
+
     Ok(ScanResult {
-        imported_count: imported_ids.len(),
-        file_ids: imported_ids,
+        imported_count: file_ids.len(),
+        file_ids,
     })
 }
 
