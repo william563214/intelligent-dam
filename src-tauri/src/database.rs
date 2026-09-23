@@ -32,7 +32,8 @@ pub struct Tag {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWithMetadata {
-    #[serde(flatten)]
+    // 保持巢狀 shape 與前端 FileWithMetadata.file / metadata / tags 對齊
+    // 勿使用 flatten 否則 invoke JSON 會少掉 file 物件
     pub file: FileRecord,
     pub metadata: Option<Metadata>,
     pub tags: Vec<Tag>,
@@ -349,6 +350,33 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// 刮削成功後在同一交易寫入 metadata tags 與 status
+    pub fn persist_scrape_success(
+        &self,
+        metadata: &Metadata,
+        tags: &[String],
+        actors: &[String],
+        status: &str,
+    ) -> SqliteResult<Vec<Tag>> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let outcome = (|| -> SqliteResult<Vec<Tag>> {
+            self.update_metadata(metadata)?;
+            self.apply_scraped_tags(metadata.file_id, tags, actors)?;
+            self.update_file_status(metadata.file_id, status)?;
+            self.get_file_tags(metadata.file_id)
+        })();
+        match outcome {
+            Ok(saved_tags) => {
+                self.conn.execute("COMMIT", [])?;
+                Ok(saved_tags)
+            }
+            Err(e) => {
+                let _ = self.conn.execute("ROLLBACK", []);
+                Err(e)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -411,6 +439,114 @@ mod tests {
 
         db.update_file_status(file_id, "scrape_failed")
             .expect("update status");
+        let file = db.get_file_by_id(file_id).expect("get file");
+        assert_eq!(file.status, "scrape_failed");
+    }
+
+    #[test]
+    fn file_with_metadata_serializes_nested_file_object() {
+        let payload = FileWithMetadata {
+            file: FileRecord {
+                id: 7,
+                path: "/videos/a.mp4".to_string(),
+                size: 10,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                phash: None,
+                status: "ready".to_string(),
+            },
+            metadata: None,
+            tags: Vec::new(),
+        };
+        let value = serde_json::to_value(&payload).expect("serialize");
+        assert!(value.get("file").is_some(), "expected nested file object");
+        assert!(value.get("id").is_none(), "must not flatten file fields");
+        assert_eq!(value["file"]["id"], 7);
+        assert_eq!(value["file"]["path"], "/videos/a.mp4");
+        assert!(value.get("metadata").is_some());
+        assert!(value.get("tags").is_some());
+    }
+
+    #[test]
+    fn persist_scrape_success_keeps_sprite_and_writes_tags_status() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/scrape.mp4", 512, Some("phash".to_string()))
+            .expect("insert file");
+
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("old".to_string()),
+            studio: None,
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: Some("/tmp/sprite.jpg".to_string()),
+            source_type: None,
+        })
+        .expect("seed metadata");
+
+        let metadata = Metadata {
+            file_id,
+            title: Some("new title".to_string()),
+            studio: Some("Studio".to_string()),
+            release_date: None,
+            summary: None,
+            cover_image: Some("https://example.test/cover.jpg".to_string()),
+            sprite_sheet_path: Some("/tmp/sprite.jpg".to_string()),
+            source_type: Some("scraped_avdc".to_string()),
+        };
+
+        let tags = db
+            .persist_scrape_success(
+                &metadata,
+                &["Beach".to_string()],
+                &["Alice".to_string()],
+                "ready",
+            )
+            .expect("persist scrape");
+
+        assert_eq!(tags.len(), 2);
+        let saved = db.get_metadata(file_id).expect("get metadata").expect("present");
+        assert_eq!(saved.title.as_deref(), Some("new title"));
+        assert_eq!(saved.sprite_sheet_path.as_deref(), Some("/tmp/sprite.jpg"));
+        let file = db.get_file_by_id(file_id).expect("get file");
+        assert_eq!(file.status, "ready");
+    }
+
+    #[test]
+    fn persist_scrape_success_rolls_back_on_failure() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/rollback.mp4", 128, None)
+            .expect("insert file");
+
+        db.update_file_status(file_id, "scrape_failed")
+            .expect("seed status");
+
+        // 破壞 Tags schema 讓 apply_scraped_tags 失敗以驗證交易回滾
+        db.conn
+            .execute("DROP TABLE Tags", [])
+            .expect("drop tags");
+
+        let metadata = Metadata {
+            file_id,
+            title: Some("should not persist".to_string()),
+            studio: None,
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("scraped_avdc".to_string()),
+        };
+
+        let err = db
+            .persist_scrape_success(&metadata, &["x".to_string()], &[], "ready")
+            .expect_err("expected failure");
+        assert!(matches!(err, rusqlite::Error::SqliteFailure(_, _)));
+
+        // metadata 不應寫入 status 應維持 scrape_failed
+        let meta = db.get_metadata(file_id).expect("get metadata");
+        assert!(meta.is_none());
         let file = db.get_file_by_id(file_id).expect("get file");
         assert_eq!(file.status, "scrape_failed");
     }
