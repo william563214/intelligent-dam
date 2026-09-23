@@ -12,12 +12,13 @@
 //! - Non-video extensions: filtered before ingest
 //!
 //! New video paths are enqueued on an internal channel. The worker waits for
-//! write stability (no DB lock), then registers the file (short lock) and
-//! emits `watcher-file-detected` for the UI / later pipeline hooks. Full
-//! scrape → move → preview is out of scope.
+//! write stability (no DB lock), then registers the file (short lock), emits
+//! `watcher-file-detected`, and runs the automatic pipeline
+//! (scrape → Handlebars move → preview) when enabled.
 
 use crate::database::Database;
 use crate::file_stability::{self, StabilityError, StabilityOptions};
+use crate::pipeline::{self, PipelineOptions};
 use crate::scanner::{self, ScannedFile};
 use anyhow::{Context, Result};
 use notify::event::{CreateKind, Event, EventKind, ModifyKind, RenameMode};
@@ -405,6 +406,38 @@ fn ingest_worker(
             }
             if let Ok(db_guard) = db.lock() {
                 let _ = scanner::write_phashes(&db_guard, &results);
+            }
+        }
+
+        // Automatic pipeline scrape → move → preview (isolated failures)
+        if let Some(id) = file_id {
+            if stop_flag.load(Ordering::SeqCst) {
+                break;
+            }
+            let options = PipelineOptions::from_env();
+            if !options.is_noop() {
+                // Catch panics / errors so one file cannot kill the worker
+                let pipeline_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pipeline::run_for_file(&app, &db, id, &options)
+                    }));
+                match pipeline_result {
+                    Ok(result) => {
+                        if !result.errors.is_empty() {
+                            eprintln!(
+                                "watcher: pipeline completed with errors for file {}: {}",
+                                id,
+                                result.errors.join("; ")
+                            );
+                        }
+                    }
+                    Err(panic_payload) => {
+                        eprintln!(
+                            "watcher: pipeline panicked for file {}: {:?}",
+                            id, panic_payload
+                        );
+                    }
+                }
             }
         }
     }

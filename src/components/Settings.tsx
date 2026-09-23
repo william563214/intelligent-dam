@@ -9,7 +9,7 @@ import {
   stopWatcher,
   getWatcherStatus,
 } from "../api";
-import type { AppSettings, WatcherFileEvent, WatcherStatus } from "../types";
+import type { AppSettings, PipelineProgressEvent, WatcherFileEvent, WatcherStatus } from "../types";
 
 const default_settings: AppSettings = {
   scanDirectories: [],
@@ -43,7 +43,9 @@ export default function Settings() {
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let unlistenFile: (() => void) | undefined;
+    let unlistenPipeline: (() => void) | undefined;
+
     listen<WatcherFileEvent>("watcher-file-detected", (event) => {
       const payload = event.payload;
       if (payload.error) {
@@ -52,18 +54,38 @@ export default function Settings() {
       }
       setWatcherMessage(
         `偵測到新檔 (${payload.kind}): ${payload.path}` +
-          (payload.fileId != null ? ` #${payload.fileId}` : "")
+          (payload.fileId != null ? ` #${payload.fileId}` : "") +
+          " → 啟動自動流水線"
       );
     })
       .then((fn) => {
-        unlisten = fn;
+        unlistenFile = fn;
       })
       .catch((err) => {
         console.error("Failed to listen watcher events:", err);
       });
+
+    listen<PipelineProgressEvent>("watcher-pipeline-progress", (event) => {
+      const p = event.payload;
+      const detail = p.message ? ` (${p.message})` : "";
+      const relocated = p.newPath ? ` → ${p.newPath}` : "";
+      setWatcherMessage(
+        `流水線 #${p.fileId} [${p.step}/${p.status}]${relocated}${detail}`
+      );
+    })
+      .then((fn) => {
+        unlistenPipeline = fn;
+      })
+      .catch((err) => {
+        console.error("Failed to listen pipeline events:", err);
+      });
+
     return () => {
-      if (unlisten) {
-        unlisten();
+      if (unlistenFile) {
+        unlistenFile();
+      }
+      if (unlistenPipeline) {
+        unlistenPipeline();
       }
     };
   }, []);
@@ -408,8 +430,10 @@ export default function Settings() {
             <p className="mt-2 text-sm text-gray-700">{watcherMessage}</p>
           )}
           <p className="mt-1 text-xs text-gray-500">
-            使用設定中的掃描目錄；偵測 Created / Moved 的影片後會入庫並送出
-            watcher-file-detected 事件（完整刮削搬運流程另案實作）
+            偵測 Created / Moved 影片後會入庫，並自動執行刮削 → 模板搬運 →
+            預覽（事件：watcher-file-detected / watcher-pipeline-progress）。
+            測試可用環境變數 IDAM_PIPELINE_DISABLE、IDAM_PIPELINE_SKIP_SCRAPE、
+            IDAM_PIPELINE_SKIP_MOVE、IDAM_PIPELINE_SKIP_PREVIEW 跳過步驟。
           </p>
         </div>
 
