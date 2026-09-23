@@ -115,7 +115,9 @@ impl Database {
     ) -> SqliteResult<i64> {
         self.conn.execute(
             "INSERT INTO Files (path, size, phash, status) VALUES (?1, ?2, ?3, 'ready')
-             ON CONFLICT(path) DO UPDATE SET size = ?2, phash = ?3",
+             ON CONFLICT(path) DO UPDATE SET
+               size = excluded.size,
+               phash = COALESCE(excluded.phash, Files.phash)",
             params![path, size as i64, phash],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -549,6 +551,21 @@ mod tests {
         assert!(meta.is_none());
         let file = db.get_file_by_id(file_id).expect("get file");
         assert_eq!(file.status, "scrape_failed");
+    }
+
+    #[test]
+    fn insert_file_coalesce_keeps_existing_phash_on_null() {
+        let db = open_memory_db();
+        db.insert_file("/tmp/keep-phash.mp4", 10, Some("aabbccddeeff0011".into()))
+            .expect("insert");
+        db.insert_file("/tmp/keep-phash.mp4", 20, None)
+            .expect("reinsert without phash");
+        let file = db
+            .get_file_by_path("/tmp/keep-phash.mp4")
+            .expect("query")
+            .expect("exists");
+        assert_eq!(file.size, 20);
+        assert_eq!(file.phash.as_deref(), Some("aabbccddeeff0011"));
     }
 }
 
