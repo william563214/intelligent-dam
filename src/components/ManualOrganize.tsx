@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { getAllFiles, scrapeFile, updateFileMetadata, generatePreview } from "../api";
-import type { FileWithMetadata, Metadata } from "../types";
+import type { FileWithMetadata, Metadata, Tag } from "../types";
 
 export default function ManualOrganize() {
   const [files, setFiles] = useState<FileWithMetadata[]>([]);
@@ -31,11 +31,15 @@ export default function ManualOrganize() {
     }
   }, [selectedFile]);
 
-  const loadFiles = async () => {
+  const loadFiles = async (keepSelectedId?: number) => {
     try {
       setLoading(true);
       const data = await getAllFiles();
       setFiles(data);
+      if (keepSelectedId !== undefined) {
+        const refreshed = data.find((f) => f.file.id === keepSelectedId) || null;
+        setSelectedFile(refreshed);
+      }
     } catch (err) {
       console.error("Failed to load files:", err);
     } finally {
@@ -52,9 +56,10 @@ export default function ManualOrganize() {
       const result = await scrapeFile(selectedFile.file.id);
       if (result.success && result.metadata) {
         setFormData(result.metadata);
-        await loadFiles();
+        await loadFiles(selectedFile.file.id);
         alert("刮削成功！");
       } else {
+        await loadFiles(selectedFile.file.id);
         alert(`刮削失敗: ${result.error || "未知錯誤"}`);
       }
     } catch (err) {
@@ -70,7 +75,7 @@ export default function ManualOrganize() {
     try {
       setScraping(true);
       await generatePreview(selectedFile.file.id);
-      await loadFiles();
+      await loadFiles(selectedFile.file.id);
       alert("預覽生成成功！");
     } catch (err) {
       alert(`生成預覽錯誤: ${err instanceof Error ? err.message : "未知錯誤"}`);
@@ -95,7 +100,7 @@ export default function ManualOrganize() {
         source_type: formData.source_type || null,
       };
       await updateFileMetadata(selectedFile.file.id, metadata);
-      await loadFiles();
+      await loadFiles(selectedFile.file.id);
       setEditing(false);
       alert("儲存成功！");
     } catch (err) {
@@ -105,7 +110,32 @@ export default function ManualOrganize() {
     }
   };
 
-  if (loading) {
+  const actorTags = (selectedFile?.tags || []).filter(
+    (t) => (t.category || "").toLowerCase() === "actor"
+  );
+  const otherTags = (selectedFile?.tags || []).filter(
+    (t) => (t.category || "").toLowerCase() !== "actor"
+  );
+
+  const renderTagList = (items: Tag[], emptyLabel: string) => {
+    if (items.length === 0) {
+      return <span className="text-sm text-gray-400">{emptyLabel}</span>;
+    }
+    return (
+      <div className="flex flex-wrap gap-1">
+        {items.map((tag) => (
+          <span
+            key={tag.id}
+            className="px-2 py-1 bg-blue-100 text-blue-800 text-xs rounded"
+          >
+            {tag.name}
+          </span>
+        ))}
+      </div>
+    );
+  };
+
+  if (loading && files.length === 0) {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="text-gray-500">載入中...</div>
@@ -136,6 +166,10 @@ export default function ManualOrganize() {
                 <div className="text-sm text-gray-500 truncate">
                   {file.file.path}
                 </div>
+                <div className="text-xs text-gray-400 mt-1">
+                  狀態: {file.file.status}
+                  {file.tags.length > 0 ? ` · 標籤 ${file.tags.length}` : ""}
+                </div>
               </div>
             ))}
           </div>
@@ -145,6 +179,18 @@ export default function ManualOrganize() {
             <div>
               <h3 className="text-lg font-semibold mb-2">編輯元資料</h3>
               <div className="bg-white rounded-lg shadow p-4 space-y-4">
+                <div className="text-sm text-gray-600">
+                  狀態:{" "}
+                  <span
+                    className={
+                      selectedFile.file.status === "scrape_failed"
+                        ? "text-red-600"
+                        : "text-gray-800"
+                    }
+                  >
+                    {selectedFile.file.status}
+                  </span>
+                </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-700 mb-1">
                     標題
@@ -215,6 +261,18 @@ export default function ManualOrganize() {
                     className="w-full px-3 py-2 border border-gray-300 rounded-md disabled:bg-gray-100"
                   />
                 </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    演員
+                  </label>
+                  {renderTagList(actorTags, "尚無演員")}
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">
+                    標籤
+                  </label>
+                  {renderTagList(otherTags, "尚無標籤")}
+                </div>
                 <div className="flex space-x-2">
                   {!editing ? (
                     <>
@@ -274,4 +332,3 @@ export default function ManualOrganize() {
     </div>
   );
 }
-

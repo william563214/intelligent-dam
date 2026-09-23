@@ -1,4 +1,4 @@
-use crate::database::{Database, FileWithMetadata, Metadata};
+use crate::database::{Database, FileWithMetadata, Metadata, Tag};
 use crate::ffmpeg;
 use crate::scanner;
 use crate::scraper::{scrape_metadata, to_database_metadata};
@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
+
+#[allow(non_upper_case_globals)]
+const status_ready: &str = "ready";
+#[allow(non_upper_case_globals)]
+const status_scrape_failed: &str = "scrape_failed";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanResult {
@@ -19,6 +24,7 @@ pub struct ScanResult {
 pub struct ScrapeResult {
     pub success: bool,
     pub metadata: Option<Metadata>,
+    pub tags: Option<Vec<Tag>>,
     pub error: Option<String>,
 }
 
@@ -147,26 +153,38 @@ pub async fn scrape_file_command(
         resolved_stashdb.as_deref(),
     ).await {
         Ok((scraped_meta, source_type)) => {
-            // 轉換為資料庫格式
-            let db_metadata = to_database_metadata(scraped_meta, file_id, source_type);
-            
-            // 儲存到資料庫（重新獲取鎖）
-            {
+            let db_metadata = to_database_metadata(&scraped_meta, file_id, source_type);
+
+            // 儲存 metadata + tags/actors 並將狀態恢復為 ready
+            let saved_tags = {
                 let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
                 db.update_metadata(&db_metadata)
                     .map_err(|e| format!("Failed to save metadata: {}", e))?;
-            }
-            
+                db.apply_scraped_tags(file_id, &scraped_meta.tags, &scraped_meta.actors)
+                    .map_err(|e| format!("Failed to save tags: {}", e))?;
+                db.update_file_status(file_id, status_ready)
+                    .map_err(|e| format!("Failed to update status: {}", e))?;
+                db.get_file_tags(file_id)
+                    .map_err(|e| format!("Failed to read tags: {}", e))?
+            };
+
             Ok(ScrapeResult {
                 success: true,
                 metadata: Some(db_metadata),
+                tags: Some(saved_tags),
                 error: None,
             })
         }
         Err(e) => {
+            // AVDC 與 StashDB 皆失敗時標記 scrape_failed
+            if let Ok(db) = db.lock() {
+                let _ = db.update_file_status(file_id, status_scrape_failed);
+            }
+
             Ok(ScrapeResult {
                 success: false,
                 metadata: None,
+                tags: None,
                 error: Some(e.to_string()),
             })
         }
