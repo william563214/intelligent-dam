@@ -3,6 +3,7 @@ mod file_stability;
 mod file_status;
 mod scanner;
 mod ffmpeg;
+mod path_suppression;
 mod path_template;
 mod phash;
 mod pipeline;

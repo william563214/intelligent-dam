@@ -7,6 +7,7 @@
 use crate::database::{Database, Metadata};
 use crate::ffmpeg;
 use crate::file_status;
+use crate::path_suppression::PathSuppression;
 use crate::path_template::{
     self, move_file, render_output_path, rollback_move, unique_destination, TemplateContext,
 };
@@ -15,6 +16,7 @@ use crate::settings::{AppSettings, SettingsStore};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -107,6 +109,57 @@ pub struct PipelineResult {
     pub preview_path: Option<String>,
     pub final_status: String,
     pub errors: Vec<String>,
+    pub aborted: bool,
+}
+
+fn stopped(stop_flag: Option<&AtomicBool>) -> bool {
+    stop_flag
+        .map(|f| f.load(Ordering::SeqCst))
+        .unwrap_or(false)
+}
+
+/// True when scrape already ran (success with source_type or scrape_failed)
+/// Used to skip re-scrape when a move lands back under the watch tree
+pub fn is_already_scraped(db: &Database, file_id: i64) -> Result<bool> {
+    let file = db.get_file_by_id(file_id)?;
+    if file.status == file_status::scrape_failed {
+        return Ok(true);
+    }
+    if let Some(meta) = db.get_metadata(file_id)? {
+        if meta
+            .source_type
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn has_sprite(db: &Database, file_id: i64) -> Result<bool> {
+    Ok(db
+        .get_metadata(file_id)?
+        .and_then(|m| m.sprite_sheet_path)
+        .map(|p| !p.trim().is_empty())
+        .unwrap_or(false))
+}
+
+/// Soften options for a file that is already organized under the watch tree
+pub fn options_for_existing_file(
+    db: &Database,
+    file_id: i64,
+    base: &PipelineOptions,
+) -> Result<PipelineOptions> {
+    let mut opts = base.clone();
+    if is_already_scraped(db, file_id)? {
+        opts.enable_scrape = false;
+    }
+    if has_sprite(db, file_id)? {
+        opts.enable_preview = false;
+    }
+    Ok(opts)
 }
 
 /// Run the full chain for one file Failure in one step does not abort the
@@ -116,6 +169,8 @@ pub fn run_for_file(
     db: &Arc<Mutex<Database>>,
     file_id: i64,
     options: &PipelineOptions,
+    stop_flag: Option<&AtomicBool>,
+    suppressions: Option<&PathSuppression>,
 ) -> PipelineResult {
     if options.is_noop() {
         return PipelineResult {
@@ -124,6 +179,7 @@ pub fn run_for_file(
             preview_path: None,
             final_status: String::new(),
             errors: Vec::new(),
+            aborted: false,
         };
     }
 
@@ -134,6 +190,7 @@ pub fn run_for_file(
         preview_path: None,
         final_status: String::new(),
         errors: Vec::new(),
+        aborted: false,
     };
 
     let initial_path = match current_path(db, file_id) {
@@ -154,6 +211,11 @@ pub fn run_for_file(
             return result;
         }
     };
+
+    if stopped(stop_flag) {
+        result.aborted = true;
+        return result;
+    }
 
     // --- scrape ---
     if options.enable_scrape {
@@ -229,6 +291,12 @@ pub fn run_for_file(
         );
     }
 
+    if stopped(stop_flag) {
+        result.aborted = true;
+        result.final_status = current_status(db, file_id).unwrap_or_default();
+        return result;
+    }
+
     // --- move (uses metadata when available even after scrape_failed) ---
     if options.enable_move {
         emit_progress(
@@ -242,7 +310,7 @@ pub fn run_for_file(
                 new_path: None,
             },
         );
-        match step_move(db, file_id, &settings) {
+        match step_move(db, file_id, &settings, suppressions) {
             Ok(Some(new_path)) => {
                 let new_str = new_path.to_string_lossy().to_string();
                 result.moved_to = Some(new_path);
@@ -298,6 +366,12 @@ pub fn run_for_file(
                 new_path: None,
             },
         );
+    }
+
+    if stopped(stop_flag) {
+        result.aborted = true;
+        result.final_status = current_status(db, file_id).unwrap_or_default();
+        return result;
     }
 
     // --- preview ---
@@ -497,6 +571,7 @@ fn step_move(
     db: &Arc<Mutex<Database>>,
     file_id: i64,
     settings: &AppSettings,
+    suppressions: Option<&PathSuppression>,
 ) -> Result<Option<PathBuf>> {
     let template = settings.output_template.trim();
     if template.is_empty() {
@@ -542,6 +617,11 @@ fn step_move(
     }
     let dest = unique_destination(&desired);
 
+    // Suppress before the rename so recursive watch events are ignored
+    if let Some(supp) = suppressions {
+        supp.suppress(&dest);
+    }
+
     // Filesystem work outside the mutex
     move_file(&source, &dest).with_context(|| {
         format!(
@@ -550,6 +630,10 @@ fn step_move(
             dest.display()
         )
     })?;
+
+    if let Some(supp) = suppressions {
+        supp.suppress(&dest);
+    }
 
     let new_path_str = dest
         .to_str()
@@ -745,7 +829,7 @@ mod tests {
             ..AppSettings::default()
         };
         let arc = Arc::new(Mutex::new(db));
-        let moved = step_move(&arc, file_id, &settings)
+        let moved = step_move(&arc, file_id, &settings, None)
             .expect("move ok")
             .expect("some path");
 
@@ -770,7 +854,7 @@ mod tests {
             ..AppSettings::default()
         };
         let arc = Arc::new(Mutex::new(db));
-        let err = step_move(&arc, file_id, &settings).expect_err("should fail");
+        let err = step_move(&arc, file_id, &settings, None).expect_err("should fail");
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("missing"),
@@ -804,7 +888,7 @@ mod tests {
             ..AppSettings::default()
         };
         let arc = Arc::new(Mutex::new(db));
-        let moved = step_move(&arc, file_id, &settings)
+        let moved = step_move(&arc, file_id, &settings, None)
             .expect("move with fallbacks")
             .expect("dest");
         assert!(moved
@@ -841,5 +925,100 @@ mod tests {
             dest,
             PathBuf::from("/library/Stu/Actor/ABC-1_Title.mp4")
         );
+    }
+
+    #[test]
+    fn move_under_watch_suppresses_destination_and_skips_rescrape() {
+        // Regression: relative template landing inside the watch tree must not
+        // re-run scrape (which could wipe ready → scrape_failed)
+        let watch = unique_temp_dir("watch_loop");
+        let src = watch.join("ABC-200.mp4");
+        fs::write(&src, b"video").unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 5, None)
+            .unwrap();
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Kept".to_string()),
+            studio: Some("StudioLoop".to_string()),
+            release_date: Some("2024-02-02".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: Some("/tmp/sprite.vtt".to_string()),
+            source_type: Some("scraped_avdc".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let suppressions = PathSuppression::new(std::time::Duration::from_secs(60));
+        let arc = Arc::new(Mutex::new(db));
+
+        let moved = step_move(&arc, file_id, &settings, Some(&suppressions))
+            .expect("move")
+            .expect("dest under watch");
+        assert!(moved.starts_with(&watch));
+        assert!(suppressions.is_suppressed(&moved));
+
+        let guard = arc.lock().unwrap();
+        assert!(is_already_scraped(&guard, file_id).unwrap());
+        let softened = options_for_existing_file(
+            &guard,
+            file_id,
+            &PipelineOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            !softened.enable_scrape,
+            "re-ingest must not re-scrape organized file"
+        );
+        assert!(
+            !softened.enable_preview,
+            "sprite already present so preview skipped"
+        );
+        assert_eq!(
+            guard.get_file_by_id(file_id).unwrap().status,
+            file_status::ready
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&watch);
+    }
+
+    #[test]
+    fn options_for_existing_file_keeps_scrape_failed_from_rescrape() {
+        let db = open_db();
+        let file_id = db
+            .insert_file("/tmp/idam-already-failed.mp4", 1, None)
+            .unwrap();
+        db.update_file_status(file_id, file_status::scrape_failed)
+            .unwrap();
+        let softened =
+            options_for_existing_file(&db, file_id, &PipelineOptions::default()).unwrap();
+        assert!(!softened.enable_scrape);
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::scrape_failed
+        );
+    }
+
+    #[test]
+    fn step_move_db_update_failure_rolls_file_back() {
+        let dir = unique_temp_dir("db_rb");
+        let src = dir.join("keep.mp4");
+        fs::write(&src, b"data").unwrap();
+        let dest = dir.join("StudioX").join("Title.mp4");
+
+        // Perform move then rollback as step_move does on DB failure
+        path_template::move_file(&src, &dest).unwrap();
+        assert!(!src.exists());
+        rollback_move(&dest, &src).unwrap();
+        assert!(src.exists());
+        assert!(!dest.exists());
+        assert_eq!(fs::read(&src).unwrap(), b"data");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

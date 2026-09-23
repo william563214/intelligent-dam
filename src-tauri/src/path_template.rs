@@ -234,6 +234,15 @@ pub fn unique_destination(desired: &Path) -> PathBuf {
 /// Move `source` to `dest` creating parent dirs
 /// Prefers rename falls back to copy+remove on cross-device errors
 pub fn move_file(source: &Path, dest: &Path) -> Result<()> {
+    move_file_inner(source, dest, false)
+}
+
+/// Test helper force the copy+remove fallback path (simulates cross-device rename)
+pub fn move_file_via_copy(source: &Path, dest: &Path) -> Result<()> {
+    move_file_inner(source, dest, true)
+}
+
+fn move_file_inner(source: &Path, dest: &Path, force_copy: bool) -> Result<()> {
     if source == dest {
         return Ok(());
     }
@@ -246,31 +255,45 @@ pub fn move_file(source: &Path, dest: &Path) -> Result<()> {
         })?;
     }
 
-    match fs::rename(source, dest) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            // Cross-device or other rename failure try copy then remove
-            fs::copy(source, dest).with_context(|| {
-                format!(
-                    "Rename failed ({}) and copy to {} also failed",
-                    rename_err,
-                    dest.display()
-                )
-            })?;
-            if let Err(remove_err) = fs::remove_file(source) {
-                // Best-effort cleanup of partial copy destination
-                let _ = fs::remove_file(dest);
-                return Err(remove_err).with_context(|| {
-                    format!(
-                        "Copied to {} but failed to remove source {}",
-                        dest.display(),
-                        source.display()
-                    )
-                });
+    if !force_copy {
+        match fs::rename(source, dest) {
+            Ok(()) => return Ok(()),
+            Err(rename_err) => {
+                return copy_then_remove(source, dest, Some(rename_err));
             }
-            Ok(())
         }
     }
+
+    copy_then_remove(source, dest, None)
+}
+
+fn copy_then_remove(
+    source: &Path,
+    dest: &Path,
+    rename_err: Option<std::io::Error>,
+) -> Result<()> {
+    fs::copy(source, dest).with_context(|| {
+        if let Some(err) = rename_err {
+            format!(
+                "Rename failed ({}) and copy to {} also failed",
+                err,
+                dest.display()
+            )
+        } else {
+            format!("Copy to {} failed", dest.display())
+        }
+    })?;
+    if let Err(remove_err) = fs::remove_file(source) {
+        let _ = fs::remove_file(dest);
+        return Err(remove_err).with_context(|| {
+            format!(
+                "Copied to {} but failed to remove source {}",
+                dest.display(),
+                source.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 /// Attempt to undo a move when DB update fails
@@ -420,5 +443,53 @@ mod tests {
         assert_eq!(ctx.number, "SSIS-001");
         assert_eq!(ctx.title, "SSIS-001_raw");
         assert_eq!(ctx.ext, "mp4");
+    }
+
+    #[test]
+    fn render_strips_path_traversal_segments() {
+        let ctx = TemplateContext {
+            studio: "S".to_string(),
+            date: "d".to_string(),
+            title: "t".to_string(),
+            number: "N".to_string(),
+            filename: "f.mp4".to_string(),
+            ext: "mp4".to_string(),
+            actor: String::new(),
+        };
+        let dest = render_output_path(
+            "{{studio}}/../../etc/{{title}}.{{ext}}",
+            &ctx,
+            Path::new("/library/inbox"),
+        )
+        .expect("render");
+        assert_eq!(dest, PathBuf::from("/library/inbox/S/etc/t.mp4"));
+        assert!(!dest.starts_with("/etc"));
+    }
+
+    #[test]
+    fn rollback_move_restores_source() {
+        let dir = unique_temp_dir("rollback");
+        let src = dir.join("orig.mp4");
+        let dest = dir.join("nested").join("moved.mp4");
+        fs::write(&src, b"payload").unwrap();
+        move_file(&src, &dest).unwrap();
+        assert!(!src.exists());
+        rollback_move(&dest, &src).unwrap();
+        assert!(src.exists());
+        assert!(!dest.exists());
+        assert_eq!(fs::read(&src).unwrap(), b"payload");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_file_via_copy_fallback_relocates() {
+        let dir = unique_temp_dir("copyfb");
+        let src = dir.join("a.mp4");
+        let dest = dir.join("b").join("c.mp4");
+        fs::write(&src, b"cross-device-sim").unwrap();
+        move_file_via_copy(&src, &dest).expect("copy move");
+        assert!(!src.exists());
+        assert_eq!(fs::read(&dest).unwrap(), b"cross-device-sim");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

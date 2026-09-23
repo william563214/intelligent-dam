@@ -15,7 +15,7 @@ const default_settings: AppSettings = {
   scanDirectories: [],
   avdcPath: "",
   stashdbUrl: "https://stashdb.org",
-  outputTemplate: "{{studio}}/{{date}}_{{title}}.mp4",
+  outputTemplate: "{{studio}}/{{date}}_{{title}}.{{ext}}",
 };
 
 const legacy_settings_key = "intelligent_dam_settings";
@@ -483,11 +483,13 @@ export default function Settings() {
             onChange={(e) =>
               setSettings({ ...settings, outputTemplate: e.target.value })
             }
-            placeholder="{{studio}}/{{date}}_{{title}}.mp4"
+            placeholder="{{studio}}/{{date}}_{{title}}.{{ext}}"
             className="w-full px-3 py-2 border border-gray-300 rounded-md"
           />
           <p className="mt-1 text-xs text-gray-500">
-            使用 Handlebars 語法，可用變數: studio, date, title, number 等
+            Handlebars 變數: studio date title number filename ext actor。
+            相對路徑以來源檔所在目錄為基準；搬回監控樹內時會抑制 notify
+            重入並略過已刮削檔。建議設定絕對圖書館根目錄以免與下載目錄重疊。
           </p>
         </div>
 

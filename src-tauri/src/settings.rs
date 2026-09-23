@@ -17,7 +17,10 @@ fn default_stashdb_url() -> String {
 }
 
 fn default_output_template() -> String {
-    "{{studio}}/{{date}}_{{title}}.mp4".to_string()
+    // Relative templates resolve against the source file's parent Prefer an
+    // absolute library root in Settings when possible Moves under a recursive
+    // watch tree are suppressed + skip-already-organized so loops are safe
+    "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -173,6 +176,11 @@ mod tests {
         let store = SettingsStore::new(&dir);
         let settings = store.load().unwrap();
         assert_eq!(settings, AppSettings::default());
+        assert!(
+            settings.output_template.contains("{{ext}}"),
+            "default template should use {{{{ext}}}} got {}",
+            settings.output_template
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
