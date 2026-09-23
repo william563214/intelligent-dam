@@ -345,6 +345,14 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_file_phash(&self, file_id: i64, phash: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE Files SET phash = ?1 WHERE id = ?2",
+            params![phash, file_id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_file_path(&self, file_id: i64, new_path: &str) -> SqliteResult<()> {
         self.conn.execute(
             "UPDATE Files SET path = ?1 WHERE id = ?2",

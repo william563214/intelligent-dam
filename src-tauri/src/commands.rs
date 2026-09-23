@@ -33,10 +33,33 @@ pub async fn scan_directory_command(
     path: String,
     db: State<'_, Mutex<Database>>,
 ) -> Result<ScanResult, String> {
-    let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
-    
-    let imported_ids = scanner::scan_and_import(&db, &path)
+    // Directory walk off the async runtime; no DB lock held.
+    let scanned = tokio::task::spawn_blocking(move || scanner::scan_directory(path))
+        .await
+        .map_err(|e| format!("Scan task join failed: {}", e))?
         .map_err(|e| format!("Scan failed: {}", e))?;
+
+    // Short lock: insert rows (null phash ok; COALESCE keeps existing).
+    let (imported_ids, jobs) = {
+        let db = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        scanner::import_files_pending_phash(&db, &scanned)
+            .map_err(|e| format!("Import failed: {}", e))?
+    };
+
+    // ffmpeg phash outside the mutex (~25 frames per file).
+    if !jobs.is_empty() {
+        let results = tokio::task::spawn_blocking(move || scanner::compute_phash_jobs(jobs))
+            .await
+            .map_err(|e| format!("Phash task join failed: {}", e))?;
+
+        let db = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        scanner::write_phashes(&db, &results)
+            .map_err(|e| format!("Failed to write phash: {}", e))?;
+    }
 
     Ok(ScanResult {
         imported_count: imported_ids.len(),
@@ -53,10 +76,29 @@ pub async fn scan_multiple_directories_command(
         return Err("No directories provided".to_string());
     }
 
-    let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
-    
-    let imported_ids = scanner::scan_multiple_directories(&db, paths)
-        .map_err(|e| format!("Scan failed: {}", e))?;
+    let scanned = tokio::task::spawn_blocking(move || scanner::scan_directories(&paths))
+        .await
+        .map_err(|e| format!("Scan task join failed: {}", e))?;
+
+    let (imported_ids, jobs) = {
+        let db = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        scanner::import_files_pending_phash(&db, &scanned)
+            .map_err(|e| format!("Import failed: {}", e))?
+    };
+
+    if !jobs.is_empty() {
+        let results = tokio::task::spawn_blocking(move || scanner::compute_phash_jobs(jobs))
+            .await
+            .map_err(|e| format!("Phash task join failed: {}", e))?;
+
+        let db = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        scanner::write_phashes(&db, &results)
+            .map_err(|e| format!("Failed to write phash: {}", e))?;
+    }
 
     Ok(ScanResult {
         imported_count: imported_ids.len(),
