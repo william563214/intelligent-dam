@@ -211,6 +211,23 @@ CREATE VIRTUAL TABLE Embeddings USING vss0(
 - 使用 Tauri 的 `tauri-plugin-store` 或簡單的 JSON 檔案
 - 儲存：掃描目錄、AV_Data_Capture 路徑、StashDB API URL、輸出模板
 
+### 8.4 檔案狀態機（Files.status）
+
+合法值：`processing` / `ready` / `scrape_failed` / `missing`。
+
+| 事件 | 轉換 |
+| --- | --- |
+| 刮削／預覽進行中 | → `processing` |
+| 刮削成功 | → `ready` |
+| 雙刮削失敗 | → `scrape_failed` |
+| 列表發現路徑不存在 | → `missing` |
+| 掃描需補 phash（非失敗態） | → `processing` → `ready` |
+| 掃描補 phash 且已是 `scrape_failed` | **維持** `scrape_failed`（不得因 phash 升為 ready） |
+
+**missing 復現**：路徑再次出現（reconcile／rescan）時回到 `ready`。此行為**不保留**先前的 `scrape_failed` 歷史；若檔案在 missing 前曾刮削失敗，復現後需重新刮削才會再進入 `scrape_failed`。
+
+寫入路徑透過轉換白名單拒絕非法跳轉（例如 `missing` → `processing`）。
+
 ## 9. 已知限制（第一階段 MVP）
 
 - 不包含自動監控（Watcher），需手動觸發掃描

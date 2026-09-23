@@ -122,11 +122,14 @@ pub fn import_files_pending_phash(
             .map(|h| h.trim().is_empty())
             .unwrap_or(true);
         if needs_phash {
-            if let Err(e) = db.update_file_status(record.id, file_status::processing) {
-                eprintln!(
-                    "Failed to mark processing for {}: {}",
-                    path_str, e
-                );
+            // scrape_failed 不可因算 phash 被洗成 processing→ready
+            if file_status::allows_transient_processing(&record.status) {
+                if let Err(e) = db.update_file_status(record.id, file_status::processing) {
+                    eprintln!(
+                        "Failed to mark processing for {}: {}",
+                        path_str, e
+                    );
+                }
             }
             jobs.push(PhashJob {
                 file_id: record.id,
@@ -158,7 +161,7 @@ pub fn compute_phash_jobs(jobs: Vec<PhashJob>) -> Vec<(i64, Option<String>)> {
 }
 
 /// Short-lock friendly write-back of computed phashes.
-/// 無論 phash 是否成功 結束 processing → ready（保留 scrape_failed）
+/// 僅清除 processing→ready 不會覆寫 scrape_failed
 pub fn write_phashes(db: &Database, results: &[(i64, Option<String>)]) -> Result<()> {
     for (file_id, phash) in results {
         if let Some(hash) = phash {
@@ -169,7 +172,8 @@ pub fn write_phashes(db: &Database, results: &[(i64, Option<String>)]) -> Result
         match db.get_file_by_id(*file_id) {
             Ok(file) => {
                 if file.status == file_status::processing {
-                    if let Err(e) = db.update_file_status(*file_id, file_status::ready) {
+                    let next = file_status::after_transient_work(file_status::processing);
+                    if let Err(e) = db.update_file_status(*file_id, next) {
                         eprintln!(
                             "Failed to clear processing for file_id {}: {}",
                             file_id, e
@@ -287,6 +291,45 @@ mod tests {
         record = db.get_file_by_id(ids[0]).expect("get file");
         assert!(record.phash.is_none());
         assert_eq!(record.status, crate::file_status::ready);
+    }
+
+    #[test]
+    fn scrape_failed_survives_full_import_phash_path() {
+        let db = open_memory_db();
+        let path = "/tmp/idam-scrape-failed-phash-rescan.mp4";
+        let file_id = db.insert_file(path, 10, None).expect("insert");
+        db.update_file_status(file_id, crate::file_status::scrape_failed)
+            .expect("mark scrape_failed");
+        // 模擬缺 phash 的失敗檔
+        assert!(db.get_file_by_id(file_id).unwrap().phash.is_none());
+
+        let scanned = vec![ScannedFile {
+            path: PathBuf::from(path),
+            size: 11,
+            phash: None,
+        }];
+        let (ids, jobs) = import_files_pending_phash(&db, &scanned).expect("import");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(jobs.len(), 1);
+
+        let mid = db.get_file_by_id(ids[0]).expect("mid");
+        assert_eq!(
+            mid.status,
+            crate::file_status::scrape_failed,
+            "must not enter processing solely for phash"
+        );
+
+        let results = compute_phash_jobs(jobs);
+        write_phashes(&db, &results).expect("write");
+
+        let after = db.get_file_by_id(ids[0]).expect("after");
+        assert_eq!(
+            after.status,
+            crate::file_status::scrape_failed,
+            "phash completion must not promote scrape_failed to ready"
+        );
+        assert!(after.phash.is_none(), "missing file yields no phash");
+        assert_eq!(after.size, 11);
     }
 
     #[test]

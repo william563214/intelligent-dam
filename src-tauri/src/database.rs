@@ -348,6 +348,19 @@ impl Database {
     }
 
     pub fn update_file_status(&self, file_id: i64, status: &str) -> SqliteResult<()> {
+        if !file_status::is_known(status) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "unknown file status: {}",
+                status
+            )));
+        }
+        let current = self.get_file_by_id(file_id)?.status;
+        if !file_status::can_transition(&current, status) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "illegal status transition: {} -> {}",
+                current, status
+            )));
+        }
         self.conn.execute(
             "UPDATE Files SET status = ?1 WHERE id = ?2",
             params![status, file_id],
@@ -591,6 +604,64 @@ mod tests {
             .expect("exists");
         assert_eq!(file.status, file_status::scrape_failed);
         assert_eq!(file.size, 9);
+    }
+
+    #[test]
+    fn update_file_status_rejects_unknown_and_illegal() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/illegal-status.mp4", 1, None)
+            .expect("insert");
+
+        let err = db
+            .update_file_status(file_id, "not_a_status")
+            .expect_err("unknown");
+        assert!(format!("{}", err).contains("unknown"));
+
+        db.update_file_status(file_id, file_status::missing)
+            .expect("to missing");
+        let err = db
+            .update_file_status(file_id, file_status::processing)
+            .expect_err("missing cannot jump to processing");
+        assert!(format!("{}", err).contains("illegal"));
+    }
+
+    #[test]
+    fn scrape_status_sequence_matches_command_transitions() {
+        // 模擬 scrape_file_command 的狀態步驟 無需 Tauri State
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/scrape-seq.mp4", 1, None)
+            .expect("insert");
+
+        db.update_file_status(file_id, file_status::processing)
+            .expect("start scrape");
+        db.update_file_status(file_id, file_status::scrape_failed)
+            .expect("dual fail");
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::scrape_failed
+        );
+
+        // 重試刮削
+        db.update_file_status(file_id, file_status::processing)
+            .expect("retry");
+        db.update_file_status(file_id, file_status::ready)
+            .expect("success");
+        assert_eq!(db.get_file_by_id(file_id).unwrap().status, file_status::ready);
+
+        // 預覽 after_transient_work 保留 scrape_failed
+        db.update_file_status(file_id, file_status::scrape_failed)
+            .expect("fail again");
+        let previous = file_status::scrape_failed;
+        db.update_file_status(file_id, file_status::processing)
+            .expect("preview start");
+        let next = file_status::after_transient_work(previous);
+        db.update_file_status(file_id, next).expect("preview end");
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::scrape_failed
+        );
     }
 
     #[test]
