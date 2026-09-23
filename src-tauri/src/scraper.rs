@@ -38,13 +38,8 @@ pub async fn scrape_with_avdc(
     let avdc_script = avdc_path
         .map(|p| PathBuf::from(p))
         .or_else(|| {
-            // 嘗試常見的路徑
-            let common_paths = vec![
-                "AV_Data_Capture.py",
-                "./AV_Data_Capture.py",
-                "python -m AV_Data_Capture",
-            ];
-            None // 簡化處理，需要配置
+            // 尚未設定時不猜測路徑 由呼叫端從 Settings 提供
+            None
         })
         .ok_or_else(|| anyhow::anyhow!("AV_Data_Capture path not configured"))?;
 
@@ -117,57 +112,45 @@ fn find_nfo_file(output_dir: &Path, file_stem: &str) -> Result<PathBuf> {
     anyhow::bail!("NFO file not found for {}", file_stem)
 }
 
-fn parse_nfo_file(nfo_path: &Path) -> Result<ScrapedMetadata> {
-    let content = fs::read_to_string(nfo_path)
-        .with_context(|| format!("Failed to read NFO file: {:?}", nfo_path))?;
+fn parse_nfo_content(content: &str) -> ScrapedMetadata {
+    let title = extract_xml_tag(content, "title");
+    let studio = extract_xml_tag(content, "studio");
+    let release_date = extract_xml_tag(content, "releasedate")
+        .or_else(|| extract_xml_tag(content, "premiered"));
+    let summary = extract_xml_tag(content, "plot");
+    let cover_image = extract_xml_tag(content, "thumb")
+        .or_else(|| extract_xml_tag(content, "poster"));
 
-    // 簡化的 XML 解析（使用正則表達式作為備選方案）
-    // 如果 quick-xml 有問題，可以使用簡單的字串匹配
-    let title = extract_xml_tag(&content, "title");
-    let studio = extract_xml_tag(&content, "studio");
-    let release_date = extract_xml_tag(&content, "releasedate");
-    let summary = extract_xml_tag(&content, "plot");
-    let mut cover_image = extract_xml_tag(&content, "thumb");
-    
     let mut tags = Vec::new();
-    // 提取所有 tag
-    if let Ok(tag_re) = Regex::new(r"<tag>(.*?)</tag>") {
-        for cap in tag_re.captures_iter(&content) {
-            if let Some(tag) = cap.get(1) {
-                tags.push(tag.as_str().to_string());
-            }
-        }
-    }
-    
-    let mut actors = Vec::new();
-    // 提取所有 actor/name
-    if let Ok(actor_re) = Regex::new(r"<actor>.*?<name>(.*?)</name>.*?</actor>") {
-        for cap in actor_re.captures_iter(&content) {
-            if let Some(actor) = cap.get(1) {
-                actors.push(actor.as_str().to_string());
-            }
-        }
-    }
-
-    // 如果找不到封面，嘗試在相同目錄查找圖片
-    if cover_image.is_none() {
-        let nfo_dir = nfo_path.parent().unwrap();
-        for entry in fs::read_dir(nfo_dir).unwrap_or_else(|_| {
-            fs::read_dir(".").unwrap()
-        }) {
-            if let Ok(entry) = entry {
-                let path = entry.path();
-                if let Some(ext) = path.extension() {
-                    if ["jpg", "jpeg", "png"].contains(&ext.to_str().unwrap_or("").to_lowercase().as_str()) {
-                        cover_image = Some(path.to_str().unwrap().to_string());
-                        break;
+    // AVDC NFO 常見為 <tag> 或 <genre>
+    for tag_name in ["tag", "genre"] {
+        let pattern = format!(r"(?is)<{}>(.*?)</{}>", tag_name, tag_name);
+        if let Ok(tag_re) = Regex::new(&pattern) {
+            for cap in tag_re.captures_iter(content) {
+                if let Some(tag) = cap.get(1) {
+                    let value = tag.as_str().trim().to_string();
+                    if !value.is_empty() && !tags.iter().any(|t| t == &value) {
+                        tags.push(value);
                     }
                 }
             }
         }
     }
 
-    Ok(ScrapedMetadata {
+    let mut actors = Vec::new();
+    // (?s) 讓 . 跨行 以解析多行 <actor><name>...</name></actor>
+    if let Ok(actor_re) = Regex::new(r"(?is)<actor>.*?<name>(.*?)</name>.*?</actor>") {
+        for cap in actor_re.captures_iter(content) {
+            if let Some(actor) = cap.get(1) {
+                let value = actor.as_str().trim().to_string();
+                if !value.is_empty() && !actors.iter().any(|a| a == &value) {
+                    actors.push(value);
+                }
+            }
+        }
+    }
+
+    ScrapedMetadata {
         title,
         studio,
         release_date,
@@ -175,7 +158,36 @@ fn parse_nfo_file(nfo_path: &Path) -> Result<ScrapedMetadata> {
         cover_image,
         tags,
         actors,
-    })
+    }
+}
+
+fn parse_nfo_file(nfo_path: &Path) -> Result<ScrapedMetadata> {
+    let content = fs::read_to_string(nfo_path)
+        .with_context(|| format!("Failed to read NFO file: {:?}", nfo_path))?;
+
+    let mut metadata = parse_nfo_content(&content);
+
+    // 如果找不到封面 嘗試在相同目錄查找圖片
+    if metadata.cover_image.is_none() {
+        if let Some(nfo_dir) = nfo_path.parent() {
+            if let Ok(entries) = fs::read_dir(nfo_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if let Some(ext) = path.extension() {
+                        let ext_lower = ext.to_str().unwrap_or("").to_lowercase();
+                        if ["jpg", "jpeg", "png"].contains(&ext_lower.as_str()) {
+                            if let Some(path_str) = path.to_str() {
+                                metadata.cover_image = Some(path_str.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(metadata)
 }
 
 // StashDB API 整合
@@ -261,43 +273,110 @@ pub async fn scrape_metadata(
     avdc_path: Option<&str>,
     stashdb_url: Option<&str>,
 ) -> Result<(ScrapedMetadata, String)> {
+    let mut errors: Vec<String> = Vec::new();
+
     // 優先嘗試 AV_Data_Capture
     match scrape_with_avdc(file_path, avdc_path).await {
         Ok(metadata) => return Ok((metadata, "scraped_avdc".to_string())),
         Err(e) => {
-            eprintln!("AV_Data_Capture failed: {}", e);
+            let msg = format!("AV_Data_Capture failed: {}", e);
+            eprintln!("{}", msg);
+            errors.push(msg);
         }
     }
 
-    // 如果 AV_Data_Capture 失敗，嘗試 StashDB（需要 phash）
-    if let Some(phash) = phash {
-        match scrape_with_stashdb(&phash, stashdb_url).await {
-            Ok(metadata) => return Ok((metadata, "scraped_stashdb".to_string())),
-            Err(e) => {
-                eprintln!("StashDB failed: {}", e);
+    // AVDC 失敗後 fallback 到 StashDB（需要 phash）
+    match &phash {
+        Some(hash) if !hash.trim().is_empty() => {
+            match scrape_with_stashdb(hash, stashdb_url).await {
+                Ok(metadata) => return Ok((metadata, "scraped_stashdb".to_string())),
+                Err(e) => {
+                    let msg = format!("StashDB failed: {}", e);
+                    eprintln!("{}", msg);
+                    errors.push(msg);
+                }
             }
         }
+        _ => {
+            let msg = "StashDB skipped: phash not available".to_string();
+            eprintln!("{}", msg);
+            errors.push(msg);
+        }
     }
 
-    // 都失敗了
-    anyhow::bail!("All scraping methods failed")
+    anyhow::bail!("All scraping methods failed: {}", errors.join("; "))
 }
 
-// 將 ScrapedMetadata 轉換為資料庫 Metadata
+/// 將 ScrapedMetadata 的純文字欄位轉成資料庫 Metadata
+/// tags / actors 需另外經 Database::apply_scraped_tags 寫入
 pub fn to_database_metadata(
-    scraped: ScrapedMetadata,
+    scraped: &ScrapedMetadata,
     file_id: i64,
     source_type: String,
 ) -> Metadata {
     Metadata {
         file_id,
-        title: scraped.title,
-        studio: scraped.studio,
-        release_date: scraped.release_date,
-        summary: scraped.summary,
-        cover_image: scraped.cover_image,
+        title: scraped.title.clone(),
+        studio: scraped.studio.clone(),
+        release_date: scraped.release_date.clone(),
+        summary: scraped.summary.clone(),
+        cover_image: scraped.cover_image.clone(),
         sprite_sheet_path: None,
         source_type: Some(source_type),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nfo_content_extracts_title_tags_and_actors() {
+        let nfo = r#"
+        <movie>
+            <title>Sample Title</title>
+            <studio>Demo Studio</studio>
+            <releasedate>2024-01-02</releasedate>
+            <plot>A short plot</plot>
+            <thumb>https://example.test/cover.jpg</thumb>
+            <genre>Outdoor</genre>
+            <tag>Beach</tag>
+            <actor>
+                <name>Alice</name>
+                <type>Actor</type>
+            </actor>
+            <actor>
+                <name>Bob</name>
+            </actor>
+        </movie>
+        "#;
+
+        let scraped = parse_nfo_content(nfo);
+        assert_eq!(scraped.title.as_deref(), Some("Sample Title"));
+        assert_eq!(scraped.studio.as_deref(), Some("Demo Studio"));
+        assert_eq!(scraped.release_date.as_deref(), Some("2024-01-02"));
+        assert_eq!(scraped.cover_image.as_deref(), Some("https://example.test/cover.jpg"));
+        assert!(scraped.tags.contains(&"Outdoor".to_string()));
+        assert!(scraped.tags.contains(&"Beach".to_string()));
+        assert_eq!(scraped.actors, vec!["Alice".to_string(), "Bob".to_string()]);
+    }
+
+    #[test]
+    fn to_database_metadata_keeps_core_fields() {
+        let scraped = ScrapedMetadata {
+            title: Some("T".to_string()),
+            studio: Some("S".to_string()),
+            release_date: Some("2020-01-01".to_string()),
+            summary: Some("Sum".to_string()),
+            cover_image: Some("cover.jpg".to_string()),
+            tags: vec!["t1".to_string()],
+            actors: vec!["a1".to_string()],
+        };
+        let meta = to_database_metadata(&scraped, 42, "scraped_avdc".to_string());
+        assert_eq!(meta.file_id, 42);
+        assert_eq!(meta.title.as_deref(), Some("T"));
+        assert_eq!(meta.source_type.as_deref(), Some("scraped_avdc"));
+        assert!(meta.sprite_sheet_path.is_none());
     }
 }
 

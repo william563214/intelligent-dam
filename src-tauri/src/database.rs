@@ -1,6 +1,5 @@
 use rusqlite::{Connection, Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -237,6 +236,50 @@ impl Database {
         Ok(())
     }
 
+    pub fn clear_file_tags(&self, file_id: i64) -> SqliteResult<()> {
+        self.conn.execute(
+            "DELETE FROM FileTags WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// 將刮削得到的 tags / actors 寫入 Tags + FileTags
+    /// actors 使用 category Actor tags 使用 category Tag
+    pub fn apply_scraped_tags(
+        &self,
+        file_id: i64,
+        tags: &[String],
+        actors: &[String],
+    ) -> SqliteResult<()> {
+        #[allow(non_upper_case_globals)]
+        const tag_category: &str = "Tag";
+        #[allow(non_upper_case_globals)]
+        const actor_category: &str = "Actor";
+
+        self.clear_file_tags(file_id)?;
+
+        for name in tags {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let tag_id = self.get_or_create_tag(trimmed, Some(tag_category.to_string()))?;
+            self.add_file_tag(file_id, tag_id, 1.0)?;
+        }
+
+        for name in actors {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let tag_id = self.get_or_create_tag(trimmed, Some(actor_category.to_string()))?;
+            self.add_file_tag(file_id, tag_id, 1.0)?;
+        }
+
+        Ok(())
+    }
+
     pub fn get_file_tags(&self, file_id: i64) -> SqliteResult<Vec<Tag>> {
         let mut stmt = self.conn.prepare(
             "SELECT t.id, t.name, t.category
@@ -305,6 +348,71 @@ impl Database {
             params![new_path, file_id],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_memory_db() -> Database {
+        Database::new(":memory:").expect("open memory db")
+    }
+
+    #[test]
+    fn apply_scraped_tags_writes_tags_and_actors() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/sample.mp4", 1024, None)
+            .expect("insert file");
+
+        db.apply_scraped_tags(
+            file_id,
+            &["Outdoor".to_string(), "Beach".to_string()],
+            &["Alice".to_string()],
+        )
+        .expect("apply tags");
+
+        let tags = db.get_file_tags(file_id).expect("get tags");
+        assert_eq!(tags.len(), 3);
+
+        let outdoor = tags.iter().find(|t| t.name == "Outdoor").expect("Outdoor");
+        assert_eq!(outdoor.category.as_deref(), Some("Tag"));
+
+        let alice = tags.iter().find(|t| t.name == "Alice").expect("Alice");
+        assert_eq!(alice.category.as_deref(), Some("Actor"));
+    }
+
+    #[test]
+    fn apply_scraped_tags_replaces_previous_links() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/replace.mp4", 2048, None)
+            .expect("insert file");
+
+        db.apply_scraped_tags(file_id, &["Old".to_string()], &[])
+            .expect("first apply");
+        db.apply_scraped_tags(file_id, &["New".to_string()], &["Bob".to_string()])
+            .expect("second apply");
+
+        let tags = db.get_file_tags(file_id).expect("get tags");
+        assert_eq!(tags.len(), 2);
+        assert!(tags.iter().any(|t| t.name == "New"));
+        assert!(tags.iter().any(|t| t.name == "Bob"));
+        assert!(!tags.iter().any(|t| t.name == "Old"));
+    }
+
+    #[test]
+    fn update_file_status_sets_scrape_failed() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/fail.mp4", 100, None)
+            .expect("insert file");
+
+        db.update_file_status(file_id, "scrape_failed")
+            .expect("update status");
+        let file = db.get_file_by_id(file_id).expect("get file");
+        assert_eq!(file.status, "scrape_failed");
     }
 }
 

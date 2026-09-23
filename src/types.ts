@@ -38,6 +38,7 @@ export interface ScanResult {
 export interface ScrapeResult {
   success: boolean;
   metadata: Metadata | null;
+  tags: Tag[] | null;
   error: string | null;
 }
 
