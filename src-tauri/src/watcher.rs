@@ -7,14 +7,17 @@
 //!
 //! # Events ignored (by design for this issue)
 //! - `Remove` / rename-from: left for later missing reconciliation
-//! - `Modify(Data)` / `Access`: write-stability / file-lock is a later issue
+//! - `Modify(Data)` / `Access`: size growth is handled by the stability gate
+//!   after Create/Moved, not as a separate ingest trigger
 //! - Non-video extensions: filtered before ingest
 //!
-//! New video paths are enqueued on an internal channel. A worker registers the
-//! file in the DB (short lock) and emits `watcher-file-detected` for the UI /
-//! later pipeline hooks. Full scrape → move → preview is out of scope.
+//! New video paths are enqueued on an internal channel. The worker waits for
+//! write stability (no DB lock), then registers the file (short lock) and
+//! emits `watcher-file-detected` for the UI / later pipeline hooks. Full
+//! scrape → move → preview is out of scope.
 
 use crate::database::Database;
+use crate::file_stability::{self, StabilityError, StabilityOptions};
 use crate::scanner::{self, ScannedFile};
 use anyhow::{Context, Result};
 use notify::event::{CreateKind, Event, EventKind, ModifyKind, RenameMode};
@@ -323,8 +326,11 @@ fn ingest_worker(
             continue;
         }
 
-        // I/O outside DB lock: confirm file and size
-        let scanned = match prepare_scanned_file(&detected.path) {
+        // I/O outside DB lock: wait for write stability then confirm size
+        let stop_for_wait = Arc::clone(&stop_flag);
+        let scanned = match prepare_scanned_file(&detected.path, move || {
+            stop_for_wait.load(Ordering::SeqCst)
+        }) {
             Ok(Some(s)) => s,
             Ok(None) => continue,
             Err(e) => {
@@ -404,26 +410,35 @@ fn ingest_worker(
     }
 }
 
-fn prepare_scanned_file(path: &Path) -> Result<Option<ScannedFile>> {
+fn prepare_scanned_file<F>(path: &Path, should_abort: F) -> Result<Option<ScannedFile>>
+where
+    F: FnMut() -> bool,
+{
     if !scanner::is_video_path(path) {
         return Ok(None);
     }
-    // Brief settle: downloads may still be opening the file; full lock wait is later
-    if !path.is_file() {
-        thread::sleep(Duration::from_millis(100));
-        if !path.is_file() {
-            return Ok(None);
+
+    let size = match file_stability::wait_until_stable(
+        path,
+        &StabilityOptions::default(),
+        should_abort,
+    ) {
+        Ok(size) => size,
+        Err(StabilityError::Aborted { .. }) => return Ok(None),
+        Err(StabilityError::Missing { .. }) => return Ok(None),
+        Err(e) => {
+            // TimedOut / Io: surface to caller for UI error emit; do not touch status
+            return Err(e.into());
         }
-    }
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("Failed to read metadata for {}", path.display()))?;
-    if meta.len() == 0 {
-        // Likely still being written; later write-stability issue will retry
+    };
+
+    if size == 0 {
         return Ok(None);
     }
+
     Ok(Some(ScannedFile {
         path: path.to_path_buf(),
-        size: meta.len(),
+        size,
         phash: None,
     }))
 }
