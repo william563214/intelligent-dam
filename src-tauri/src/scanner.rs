@@ -1,4 +1,5 @@
 use crate::database::Database;
+use crate::file_status;
 use crate::phash;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -121,6 +122,12 @@ pub fn import_files_pending_phash(
             .map(|h| h.trim().is_empty())
             .unwrap_or(true);
         if needs_phash {
+            if let Err(e) = db.update_file_status(record.id, file_status::processing) {
+                eprintln!(
+                    "Failed to mark processing for {}: {}",
+                    path_str, e
+                );
+            }
             jobs.push(PhashJob {
                 file_id: record.id,
                 path: file.path.clone(),
@@ -151,11 +158,27 @@ pub fn compute_phash_jobs(jobs: Vec<PhashJob>) -> Vec<(i64, Option<String>)> {
 }
 
 /// Short-lock friendly write-back of computed phashes.
+/// 無論 phash 是否成功 結束 processing → ready（保留 scrape_failed）
 pub fn write_phashes(db: &Database, results: &[(i64, Option<String>)]) -> Result<()> {
     for (file_id, phash) in results {
         if let Some(hash) = phash {
             if let Err(e) = db.update_file_phash(*file_id, hash) {
                 eprintln!("Failed to write phash for file_id {}: {}", file_id, e);
+            }
+        }
+        match db.get_file_by_id(*file_id) {
+            Ok(file) => {
+                if file.status == file_status::processing {
+                    if let Err(e) = db.update_file_status(*file_id, file_status::ready) {
+                        eprintln!(
+                            "Failed to clear processing for file_id {}: {}",
+                            file_id, e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Failed to read file_id {} after phash: {}", file_id, e);
             }
         }
     }
@@ -254,11 +277,16 @@ mod tests {
         assert_eq!(ids.len(), 1);
         assert_eq!(jobs.len(), 1);
 
+        let mut record = db.get_file_by_id(ids[0]).expect("get file");
+        assert!(record.phash.is_none());
+        assert_eq!(record.status, crate::file_status::processing);
+
         let results = compute_phash_jobs(jobs);
         write_phashes(&db, &results).expect("write");
 
-        let record = db.get_file_by_id(ids[0]).expect("get file");
+        record = db.get_file_by_id(ids[0]).expect("get file");
         assert!(record.phash.is_none());
+        assert_eq!(record.status, crate::file_status::ready);
     }
 
     #[test]

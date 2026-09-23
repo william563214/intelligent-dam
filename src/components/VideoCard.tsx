@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { MouseEvent } from "react";
 import type { FileWithMetadata } from "../types";
+import { status_badge_class, status_label } from "../utils/fileStatus";
 import {
   cue_at_progress,
   load_sprite_preview,
@@ -175,7 +176,15 @@ export default function VideoCard({ fileWithMetadata }: VideoCardProps) {
         )}
       </div>
       <div className="p-4">
-        <h3 className="font-semibold text-gray-900 truncate mb-1">{title}</h3>
+        <div className="flex items-start justify-between gap-2 mb-1">
+          <h3 className="font-semibold text-gray-900 truncate">{title}</h3>
+          <span
+            className={`shrink-0 px-2 py-0.5 text-xs rounded ${status_badge_class(file.status)}`}
+            title={file.status}
+          >
+            {status_label(file.status)}
+          </span>
+        </div>
         {metadata?.studio && (
           <p className="text-sm text-gray-600 truncate mb-1">
             {metadata.studio}

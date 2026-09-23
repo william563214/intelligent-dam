@@ -1,5 +1,6 @@
 use crate::database::{Database, FileWithMetadata, Metadata, Tag};
 use crate::ffmpeg;
+use crate::file_status;
 use crate::scanner;
 use crate::scraper::{scrape_metadata, to_database_metadata};
 use crate::settings::{AppSettings, SettingsStore};
@@ -8,11 +9,6 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
-
-#[allow(non_upper_case_globals)]
-const status_ready: &str = "ready";
-#[allow(non_upper_case_globals)]
-const status_scrape_failed: &str = "scrape_failed";
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ScanResult {
@@ -179,11 +175,23 @@ pub async fn scrape_file_command(
             }
         });
 
-    // 獲取檔案資訊（在 await 之前完成）
+    // 獲取檔案資訊並標為 processing（在 await 之前完成）
     let (file_path, phash, existing_sprite) = {
         let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
         let file = db.get_file_by_id(file_id)
             .map_err(|e| format!("File not found: {}", e))?;
+        if !std::path::Path::new(&file.path).exists() {
+            db.update_file_status(file_id, file_status::missing)
+                .map_err(|e| format!("Failed to mark missing: {}", e))?;
+            return Ok(ScrapeResult {
+                success: false,
+                metadata: None,
+                tags: None,
+                error: Some(format!("File missing on disk: {}", file.path)),
+            });
+        }
+        db.update_file_status(file_id, file_status::processing)
+            .map_err(|e| format!("Failed to mark processing: {}", e))?;
         let sprite = db
             .get_metadata(file_id)
             .map_err(|e| format!("Failed to read metadata: {}", e))?
@@ -213,7 +221,7 @@ pub async fn scrape_file_command(
                     &db_metadata,
                     &scraped_meta.tags,
                     &scraped_meta.actors,
-                    status_ready,
+                    file_status::ready,
                 )
                 .map_err(|e| format!("Failed to persist scrape result: {}", e))?
             };
@@ -235,7 +243,7 @@ pub async fn scrape_file_command(
                         scrape_error, lock_err
                     )
                 })?;
-                db.update_file_status(file_id, status_scrape_failed)
+                db.update_file_status(file_id, file_status::scrape_failed)
                     .map_err(|status_err| {
                         format!(
                             "Scrape failed ({}); also failed to mark scrape_failed: {}",
@@ -271,12 +279,20 @@ pub async fn generate_preview_command(
     file_id: i64,
     db: State<'_, Mutex<Database>>,
 ) -> Result<String, String> {
-    // 獲取檔案資訊（在 await 之前完成）
-    let file_path = {
+    // 獲取檔案資訊並標為 processing（在 await 之前完成）
+    let (file_path, previous_status) = {
         let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
         let file = db.get_file_by_id(file_id)
             .map_err(|e| format!("File not found: {}", e))?;
-        PathBuf::from(&file.path)
+        if !std::path::Path::new(&file.path).exists() {
+            db.update_file_status(file_id, file_status::missing)
+                .map_err(|e| format!("Failed to mark missing: {}", e))?;
+            return Err(format!("File missing on disk: {}", file.path));
+        }
+        let previous = file.status.clone();
+        db.update_file_status(file_id, file_status::processing)
+            .map_err(|e| format!("Failed to mark processing: {}", e))?;
+        (PathBuf::from(&file.path), previous)
     };
     
     // 生成輸出路徑
@@ -287,11 +303,28 @@ pub async fn generate_preview_command(
     let sprite_path = output_dir.join(format!("sprite_{}.jpg", file_id));
     
     // 生成 Sprite Sheet（不需要持有鎖）
-    let vtt_path_str = ffmpeg::generate_sprite_sheet(&file_path, &sprite_path, (10, 10))
-        .await
-        .map_err(|e| format!("Failed to generate sprite sheet: {}", e))?;
+    let vtt_path_str = match ffmpeg::generate_sprite_sheet(&file_path, &sprite_path, (10, 10)).await
+    {
+        Ok(path) => path,
+        Err(e) => {
+            let db = db.lock().map_err(|lock_err| {
+                format!(
+                    "Preview failed ({}); also failed to lock DB: {}",
+                    e, lock_err
+                )
+            })?;
+            db.update_file_status(file_id, &previous_status)
+                .map_err(|status_err| {
+                    format!(
+                        "Preview failed ({}); also failed to restore status: {}",
+                        e, status_err
+                    )
+                })?;
+            return Err(format!("Failed to generate sprite sheet: {}", e));
+        }
+    };
     
-    // 更新資料庫中的 sprite_sheet_path（重新獲取鎖）
+    // 更新資料庫中的 sprite_sheet_path 並結束 processing
     {
         let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
         if let Some(mut metadata) = db.get_metadata(file_id)
@@ -314,6 +347,9 @@ pub async fn generate_preview_command(
             db.update_metadata(&new_metadata)
                 .map_err(|e| format!("Failed to create metadata: {}", e))?;
         }
+        let next = file_status::after_transient_work(&previous_status);
+        db.update_file_status(file_id, next)
+            .map_err(|e| format!("Failed to update status after preview: {}", e))?;
     }
     
     Ok(vtt_path_str)

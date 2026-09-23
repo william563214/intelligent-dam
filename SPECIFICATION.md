@@ -75,7 +75,7 @@ CREATE TABLE Files (
     size INTEGER,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     phash TEXT,                 -- 感知雜湊 (用於偵測重複影片)
-    status TEXT DEFAULT 'ready'  -- 'processing', 'ready', 'missing'
+    status TEXT DEFAULT 'ready'  -- 'processing', 'ready', 'scrape_failed', 'missing'
 );
 
 -- 2. 元資料表 (邏輯層)
