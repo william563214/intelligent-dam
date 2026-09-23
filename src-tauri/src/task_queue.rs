@@ -7,10 +7,26 @@
 //! - **Same-file serial**: at most one running job per `file_id`. Pending jobs for
 //!   that file stay queued until the active one finishes (FIFO). This preserves
 //!   phash → pipeline ordering when both are enqueued for the same ingest.
+//! - **Dispatch**: each worker wake takes **exactly one** job via [`Scheduler::dispatch_one`].
+//!   Jobs are marked `Running` only when a worker actually claims them.
 //! - **Failures**: jobs are marked `Failed` with an error string and `retryable`
 //!   flag; errors are never swallowed. Callers may `retry` a failed job (new
 //!   attempt) without inventing success. Abort / stop_flag → `Cancelled`, not retry.
 //! - Pipeline still honors scrape_failed / PathSuppression / stop_flag from #19/#23.
+//!
+//! # `completed_with_errors` vs queue Failed / retry
+//! Pipeline step events may end with UI status `completed_with_errors` (chain ran
+//! to the end but some steps pushed into `PipelineResult.errors`, e.g. scrape
+//! failed then move/preview still attempted). The queue maps that to job state
+//! **`Failed` + `retryable`** so the operator can retry without inventing success.
+//! On each Pipeline run (including retry) options are re-softened from DB via
+//! [`pipeline::options_for_existing_file`] so already-scraped / already-previewed
+//! work is skipped (avoids wiping scrape_failed or re-running a finished scrape).
+//!
+//! # Durability
+//! The queue is **in-memory only** and is **not crash-safe** across process
+//! restart. Pending / running / failed job records are lost when the app exits;
+//! file `status` in SQLite remains the durable source of truth.
 
 use crate::database::Database;
 use crate::path_suppression::PathSuppression;
@@ -36,6 +52,10 @@ const default_concurrency: usize = 2;
 
 #[allow(non_upper_case_globals)]
 const default_max_attempts: u32 = 3;
+
+/// Cap retained terminal jobs (succeeded / failed / cancelled) to bound memory
+#[allow(non_upper_case_globals)]
+const max_terminal_jobs: usize = 200;
 
 /// What the queue can run
 #[derive(Debug, Clone)]
@@ -209,16 +229,19 @@ impl Scheduler {
             .collect()
     }
 
-    /// Mark up to `concurrency` eligible jobs as Running and return them.
-    /// Eligible = first pending whose file_id is not already running.
-    pub fn dispatch_ready(&mut self) -> Vec<JobRecord> {
-        let mut started = Vec::new();
-        let mut skipped = VecDeque::new();
+    /// Claim **exactly one** eligible job for a worker.
+    ///
+    /// Marks that job `Running` only when returned. Same-file-blocked jobs stay
+    /// `Queued` at the front of the pending list (never orphaned as Running).
+    pub fn dispatch_one(&mut self) -> Option<JobRecord> {
+        if self.running.len() >= self.concurrency {
+            return None;
+        }
 
-        while self.running.len() < self.concurrency {
-            let Some(id) = self.pending.pop_front() else {
-                break;
-            };
+        let mut skipped = VecDeque::new();
+        let mut chosen: Option<JobRecord> = None;
+
+        while let Some(id) = self.pending.pop_front() {
             let Some(job) = self.jobs.get(&id) else {
                 continue;
             };
@@ -236,8 +259,9 @@ impl Scheduler {
             job.attempts = job.attempts.saturating_add(1);
             self.running.insert(id);
             self.running_files.insert(file_id);
-            started.push(job.clone());
+            chosen = Some(job.clone());
             self.jobs.insert(id, job);
+            break;
         }
 
         // Preserve relative order of skipped (same-file blocked) at the front
@@ -245,7 +269,7 @@ impl Scheduler {
             self.pending.push_front(id);
         }
 
-        started
+        chosen
     }
 
     pub fn complete_success(&mut self, id: u64) -> Option<JobRecord> {
@@ -274,7 +298,32 @@ impl Scheduler {
         job.retryable = retryable;
         self.running.remove(&id);
         self.running_files.remove(&file_id);
-        Some(job.clone())
+        let out = job.clone();
+        self.prune_terminal_history();
+        Some(out)
+    }
+
+    /// Drop oldest terminal jobs when over [`max_terminal_jobs`]
+    fn prune_terminal_history(&mut self) {
+        let mut terminal: Vec<u64> = self
+            .jobs
+            .values()
+            .filter(|j| {
+                matches!(
+                    j.state,
+                    JobState::Succeeded | JobState::Failed | JobState::Cancelled
+                )
+            })
+            .map(|j| j.id)
+            .collect();
+        if terminal.len() <= max_terminal_jobs {
+            return;
+        }
+        terminal.sort_unstable();
+        let remove_count = terminal.len() - max_terminal_jobs;
+        for id in terminal.into_iter().take(remove_count) {
+            self.jobs.remove(&id);
+        }
     }
 
     /// Re-queue a failed job if attempts remain
@@ -600,13 +649,13 @@ fn worker_loop(
     suppressions: Arc<Mutex<Arc<PathSuppression>>>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
+        // Claim exactly one job — never mark more Running than this worker will run
         let job = {
             let mut guard = match inner.lock() {
                 Ok(g) => g,
                 Err(_) => break,
             };
-            let mut started = guard.scheduler.dispatch_ready();
-            started.pop()
+            guard.scheduler.dispatch_one()
         };
 
         let Some(job) = job else {
@@ -676,12 +725,23 @@ fn execute_job(
 
     match &job.kind {
         JobKind::Pipeline { file_id, options } => {
+            // Re-soften from DB on every run (including retry) so scrape_failed /
+            // already-moved / already-previewed rows do not re-run the full chain
+            let effective = match db.lock() {
+                Ok(guard) => pipeline::options_for_existing_file(&guard, *file_id, options)
+                    .unwrap_or_else(|_| options.clone()),
+                Err(_) => options.clone(),
+            };
+            if effective.is_noop() {
+                return ExecOutcome::Success;
+            }
+
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pipeline::run_for_file(
                     app,
                     db,
                     *file_id,
-                    options,
+                    &effective,
                     job.stop_flag.as_deref(),
                     Some(suppressions),
                 )
@@ -693,8 +753,10 @@ fn execute_job(
                             message: Some("aborted by stop_flag".to_string()),
                         }
                     } else if r.errors.is_empty() {
+                        // Pipeline UI may still have emitted step skips; empty errors = ok
                         ExecOutcome::Success
                     } else {
+                        // Maps pipeline `completed_with_errors` onto Failed+retryable
                         ExecOutcome::Failed {
                             error: r.errors.join("; "),
                             retryable: true,
@@ -785,28 +847,47 @@ mod tests {
     }
 
     #[test]
-    fn concurrency_limit_caps_dispatch() {
+    fn concurrency_limit_caps_dispatch_one() {
         let mut s = Scheduler::new(2);
         s.enqueue(pipeline_kind(10), None, 3);
         s.enqueue(pipeline_kind(20), None, 3);
         s.enqueue(pipeline_kind(30), None, 3);
 
-        let started = s.dispatch_ready();
-        assert_eq!(started.len(), 2);
+        let a = s.dispatch_one().expect("first");
+        let b = s.dispatch_one().expect("second");
         assert_eq!(s.running_len(), 2);
         assert_eq!(s.pending_len(), 1);
+        assert!(s.dispatch_one().is_none());
 
-        let more = s.dispatch_ready();
-        assert!(more.is_empty());
-
-        s.complete_success(started[0].id);
-        let next = s.dispatch_ready();
-        assert_eq!(next.len(), 1);
-        assert_eq!(next[0].kind.file_id(), 30);
+        s.complete_success(a.id);
+        let next = s.dispatch_one().expect("third");
+        assert_eq!(next.kind.file_id(), 30);
+        let _ = b;
     }
 
     #[test]
-    fn same_file_jobs_run_serially_in_fifo_order() {
+    fn dispatch_one_marks_only_the_claimed_job_running() {
+        // Regression: old dispatch_ready marked concurrency jobs Running while a
+        // worker only executed one — orphans stayed Running forever.
+        let mut s = Scheduler::new(2);
+        let a = s.enqueue(pipeline_kind(1), None, 3);
+        let b = s.enqueue(pipeline_kind(2), None, 3);
+        let c = s.enqueue(pipeline_kind(3), None, 3);
+
+        let taken = s.dispatch_one().expect("claim one");
+        assert_eq!(taken.id, a);
+        assert_eq!(s.running_len(), 1);
+        assert_eq!(s.get(b).unwrap().state, JobState::Queued);
+        assert_eq!(s.get(c).unwrap().state, JobState::Queued);
+
+        let taken2 = s.dispatch_one().expect("second worker");
+        assert_eq!(taken2.id, b);
+        assert_eq!(s.running_len(), 2);
+        assert_eq!(s.get(c).unwrap().state, JobState::Queued);
+    }
+
+    #[test]
+    fn same_file_blocked_job_stays_queued_not_running() {
         let mut s = Scheduler::new(4);
         let j1 = s.enqueue(
             JobKind::Phash {
@@ -819,28 +900,28 @@ mod tests {
         let j2 = s.enqueue(pipeline_kind(7), None, 3);
         let j3 = s.enqueue(pipeline_kind(8), None, 3);
 
-        let started = s.dispatch_ready();
-        assert_eq!(started.len(), 2);
-        let ids: Vec<u64> = started.iter().map(|j| j.id).collect();
-        assert!(ids.contains(&j1));
-        assert!(ids.contains(&j3));
-        assert!(!ids.contains(&j2));
+        let t1 = s.dispatch_one().expect("phash 7");
+        let t2 = s.dispatch_one().expect("pipeline 8");
+        assert_eq!(t1.id, j1);
+        assert_eq!(t2.id, j3);
+        // Sibling for file 7 must remain Queued (not orphan Running holding the lock)
+        assert_eq!(s.get(j2).unwrap().state, JobState::Queued);
         assert_eq!(s.pending_len(), 1);
+        assert_eq!(s.running_len(), 2);
 
         s.complete_success(j1);
-        let next = s.dispatch_ready();
-        assert_eq!(next.len(), 1);
-        assert_eq!(next[0].id, j2);
-        assert_eq!(next[0].kind.file_id(), 7);
+        let t3 = s.dispatch_one().expect("pipeline 7 after unlock");
+        assert_eq!(t3.id, j2);
+        assert_eq!(t3.kind.file_id(), 7);
     }
 
     #[test]
     fn failed_jobs_are_marked_and_retryable() {
         let mut s = Scheduler::new(1);
         let id = s.enqueue(pipeline_kind(1), None, 3);
-        let started = s.dispatch_ready();
-        assert_eq!(started[0].id, id);
-        assert_eq!(started[0].attempts, 1);
+        let started = s.dispatch_one().expect("run");
+        assert_eq!(started.id, id);
+        assert_eq!(started.attempts, 1);
 
         s.complete_failed(id, "scrape boom".to_string(), true);
         let job = s.get(id).unwrap();
@@ -853,21 +934,21 @@ mod tests {
         assert_eq!(s.get(id).unwrap().state, JobState::Queued);
         assert_eq!(s.pending_len(), 1);
 
-        let again = s.dispatch_ready();
-        assert_eq!(again[0].attempts, 2);
+        let again = s.dispatch_one().expect("retry run");
+        assert_eq!(again.attempts, 2);
     }
 
     #[test]
     fn retry_respects_max_attempts_and_non_retryable() {
         let mut s = Scheduler::new(1);
         let id = s.enqueue(pipeline_kind(1), None, 1);
-        let _ = s.dispatch_ready();
+        let _ = s.dispatch_one();
         s.complete_failed(id, "once".to_string(), true);
         let err = s.retry(id).unwrap_err();
         assert!(err.contains("exhausted"), "{}", err);
 
         let id2 = s.enqueue(pipeline_kind(2), None, 3);
-        let _ = s.dispatch_ready();
+        let _ = s.dispatch_one();
         s.complete_failed(id2, "fatal".to_string(), false);
         let err = s.retry(id2).unwrap_err();
         assert!(err.contains("not retryable"), "{}", err);
@@ -877,7 +958,7 @@ mod tests {
     fn cancelled_jobs_are_not_failed() {
         let mut s = Scheduler::new(1);
         let id = s.enqueue(pipeline_kind(1), None, 3);
-        let _ = s.dispatch_ready();
+        let _ = s.dispatch_one();
         s.complete_cancelled(id, Some("stop".into()));
         assert_eq!(s.get(id).unwrap().state, JobState::Cancelled);
         assert!(s.failed_ids().is_empty());
@@ -889,7 +970,8 @@ mod tests {
         let mut s = Scheduler::new(2);
         let a = s.enqueue(pipeline_kind(1), None, 3);
         let b = s.enqueue(pipeline_kind(2), None, 3);
-        let _ = s.dispatch_ready();
+        let _ = s.dispatch_one();
+        let _ = s.dispatch_one();
         s.complete_failed(a, "x".into(), true);
         s.complete_success(b);
         let snap = s.status_snapshot();
@@ -898,6 +980,121 @@ mod tests {
         assert_eq!(snap.succeeded, 1);
         assert_eq!(snap.running, 0);
         assert_eq!(snap.jobs.len(), 2);
+    }
+
+    #[test]
+    fn terminal_history_is_pruned_to_bound() {
+        let mut s = Scheduler::new(1);
+        for i in 0..(max_terminal_jobs as i64 + 25) {
+            let id = s.enqueue(pipeline_kind(i + 1), None, 3);
+            let _ = s.dispatch_one();
+            s.complete_success(id);
+        }
+        let terminal = s
+            .jobs
+            .values()
+            .filter(|j| j.state == JobState::Succeeded)
+            .count();
+        assert_eq!(terminal, max_terminal_jobs);
+        // Oldest ids pruned
+        assert!(s.get(1).is_none());
+        assert!(s.get(25).is_none());
+        assert!(s.get(26).is_some());
+    }
+
+    /// Integration-style: concurrency≥2 workers each claim via dispatch_one
+    /// (mirrors worker_loop). Proves no job stuck Running and same-file lock
+    /// is released so siblings eventually run.
+    #[test]
+    fn concurrent_workers_never_orphan_running_or_hold_file_lock() {
+        let sched = Arc::new(Mutex::new(Scheduler::new(2)));
+        let barrier = Arc::new(Barrier::new(3));
+        let mut handles = Vec::new();
+
+        {
+            let mut s = sched.lock().unwrap();
+            for i in 0..8 {
+                s.enqueue(pipeline_kind(200 + i), None, 3);
+            }
+            // Same-file pair: second must wait for first (serial), not stick Running
+            s.enqueue(
+                JobKind::Phash {
+                    file_id: 999,
+                    path: PathBuf::from("/tmp/x.mp4"),
+                },
+                None,
+                3,
+            );
+            s.enqueue(pipeline_kind(999), None, 3);
+        }
+
+        for _ in 0..2 {
+            let sched = Arc::clone(&sched);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                loop {
+                    let job = {
+                        let mut s = sched.lock().unwrap();
+                        // Invariant while claiming: every Running job is owned
+                        // by some worker that will complete it (dispatch_one only)
+                        let running_before = s.running_len();
+                        assert!(running_before <= 2);
+                        s.dispatch_one()
+                    };
+                    let Some(job) = job else {
+                        // Drain check: if pending remains but we got None, either
+                        // at concurrency or same-file blocked — wait briefly
+                        let (pending, running) = {
+                            let s = sched.lock().unwrap();
+                            (s.pending_len(), s.running_len())
+                        };
+                        if pending == 0 && running == 0 {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                        continue;
+                    };
+                    thread::sleep(Duration::from_millis(3));
+                    let mut s = sched.lock().unwrap();
+                    s.complete_success(job.id);
+                }
+            }));
+        }
+
+        barrier.wait();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let s = sched.lock().unwrap();
+        assert_eq!(s.running_len(), 0, "no orphan Running jobs");
+        assert_eq!(
+            s.pending_len(),
+            0,
+            "all work drained including same-file sibling"
+        );
+        for job in s.jobs.values() {
+            assert_ne!(
+                job.state,
+                JobState::Running,
+                "job {} stuck Running",
+                job.id
+            );
+            assert!(
+                matches!(job.state, JobState::Succeeded),
+                "job {} unexpected {:?}",
+                job.id,
+                job.state
+            );
+        }
+        // Both jobs for file 999 completed (lock was released)
+        let file_999: Vec<_> = s
+            .jobs
+            .values()
+            .filter(|j| j.kind.file_id() == 999)
+            .collect();
+        assert_eq!(file_999.len(), 2);
     }
 
     #[test]
@@ -919,13 +1116,14 @@ mod tests {
             handles.push(thread::spawn(move || {
                 barrier.wait();
                 for _ in 0..10 {
-                    let started = {
+                    let job = {
                         let mut s = sched.lock().unwrap();
-                        s.dispatch_ready()
+                        s.dispatch_one()
                     };
-                    for job in started {
+                    if let Some(job) = job {
                         thread::sleep(Duration::from_millis(1));
                         let mut s = sched.lock().unwrap();
+                        assert!(s.running_len() <= 2);
                         s.complete_success(job.id);
                     }
                 }
@@ -934,6 +1132,19 @@ mod tests {
 
         for h in handles {
             h.join().unwrap();
+        }
+
+        // Drain any leftover under the mutex with sequential takes
+        loop {
+            let job = {
+                let mut s = sched.lock().unwrap();
+                s.dispatch_one()
+            };
+            let Some(job) = job else {
+                break;
+            };
+            let mut s = sched.lock().unwrap();
+            s.complete_success(job.id);
         }
 
         let s = sched.lock().unwrap();
