@@ -7,6 +7,13 @@
 //!
 //! Stored as lowercase hex (`{:016x}`) for StashDB `?phash=` lookups.
 //! Frame extraction failure must not abort import callers should treat Err as skip.
+//!
+//! # Near-duplicate policy (MVP / issue #11)
+//!
+//! Hamming distance on the 64-bit value. Two hashes are near-identical when
+//! `hamming_distance <= near_phash_max_distance` (default **8**, Stash-style).
+//! Ingest strategy: **skip with log + keep the existing Files row** (delete the
+//! provisional newer row). No duplicate-link UX in Phase 1.
 
 use anyhow::{bail, Context, Result};
 use image::{imageops, DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgba};
@@ -25,6 +32,43 @@ const sprite_rows: u32 = 5;
 const dct_size: usize = 64;
 #[allow(non_upper_case_globals)]
 const hash_size: usize = 8;
+
+/// Max Hamming distance treated as the same / near-identical video (MVP).
+#[allow(non_upper_case_globals)]
+pub const near_phash_max_distance: u32 = 8;
+
+/// Parse a 16-char hex phash into a u64. Accepts optional `0x` prefix.
+pub fn parse_phash_hex(hex: &str) -> Option<u64> {
+    let trimmed = hex.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let body = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if body.len() != 16 || !body.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(body, 16).ok()
+}
+
+/// Bitwise Hamming distance between two 64-bit hashes.
+pub fn hamming_distance(a: u64, b: u64) -> u32 {
+    (a ^ b).count_ones()
+}
+
+/// True when distance is within the MVP near-duplicate threshold.
+pub fn is_near_duplicate(a: u64, b: u64) -> bool {
+    hamming_distance(a, b) <= near_phash_max_distance
+}
+
+/// Compare two hex phash strings. Returns None if either fails to parse.
+pub fn hex_hamming_distance(a: &str, b: &str) -> Option<u32> {
+    let left = parse_phash_hex(a)?;
+    let right = parse_phash_hex(b)?;
+    Some(hamming_distance(left, right))
+}
 
 /// Compute a Stash-style video phash for `file_path`.
 pub fn calculate_video_phash(file_path: &Path) -> Result<String> {
@@ -283,5 +327,44 @@ mod tests {
         let err = calculate_video_phash(&missing).expect_err("should fail");
         let msg = format!("{:#}", err);
         assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn hamming_distance_counts_bit_differences() {
+        assert_eq!(hamming_distance(0, 0), 0);
+        assert_eq!(hamming_distance(0b1111, 0b0000), 4);
+        assert_eq!(hamming_distance(0xffff_ffff_ffff_ffff, 0), 64);
+        let a = 0x0123_4567_89ab_cdef;
+        assert_eq!(hamming_distance(a, a), 0);
+        assert_eq!(hamming_distance(a, a ^ 0b111), 3);
+    }
+
+    #[test]
+    fn parse_phash_hex_accepts_16_hex_digits() {
+        assert_eq!(
+            parse_phash_hex("0123456789abcdef"),
+            Some(0x0123_4567_89ab_cdef)
+        );
+        assert_eq!(
+            parse_phash_hex("0x0123456789ABCDEF"),
+            Some(0x0123_4567_89ab_cdef)
+        );
+        assert!(parse_phash_hex("short").is_none());
+        assert!(parse_phash_hex("").is_none());
+        assert!(parse_phash_hex("gggggggggggggggg").is_none());
+    }
+
+    #[test]
+    fn near_duplicate_threshold_is_eight() {
+        assert_eq!(near_phash_max_distance, 8);
+        let base = 0u64;
+        // Flip 8 bits → still near
+        let near = 0b1111_1111u64;
+        assert!(is_near_duplicate(base, near));
+        // Flip 9 bits → not near
+        let far = 0b1_1111_1111u64;
+        assert!(!is_near_duplicate(base, far));
+        assert_eq!(hex_hamming_distance("0000000000000000", "00000000000000ff"), Some(8));
+        assert_eq!(hex_hamming_distance("0000000000000000", "00000000000001ff"), Some(9));
     }
 }

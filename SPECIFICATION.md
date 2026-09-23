@@ -228,6 +228,15 @@ CREATE VIRTUAL TABLE Embeddings USING vss0(
 
 寫入路徑透過轉換白名單拒絕非法跳轉（例如 `missing` → `processing`）。
 
+### 8.5 去重策略（path／phash，issue #11）
+
+| 維度 | 策略 |
+| --- | --- |
+| **Path** | `Files.path` 為 `UNIQUE`。掃描與 Watcher ingest 皆走 upsert：同路徑不會產生第二列；更新 size、`COALESCE` 保留既有 phash；`missing` → `ready`。Watcher 對「既有路徑且無需補 phash」不再 enqueue pipeline。 |
+| **Phash** | 64-bit hex；Hamming distance ≤ **8**（`near_phash_max_distance`）視為相同／近重複。MVP：**略過 ingest + log，保留既有列**（刪除暫存列及其 Metadata／FileTags）。不建立 duplicate 連結、不另開 UX。 |
+| **套用點** | (1) import 時若已帶 precomputed phash；(2) `write_phashes` 寫回計算結果後。後續 pipeline 若發現 file_id 已刪則 soft-skip。 |
+| **非目標** | Phase 2 重複檔 UI（#12）、手動合併／連結列。 |
+
 ## 9. 已知限制（第一階段 MVP）
 
 - 不包含自動監控（Watcher），需手動觸發掃描
