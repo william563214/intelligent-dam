@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AppSettings,
   FileWithMetadata,
   ScanResult,
   ScrapeResult,
@@ -50,5 +51,13 @@ export async function generateThumbnail(
 
 export async function checkFFmpegAvailable(): Promise<boolean> {
   return await invoke("check_ffmpeg_available_command");
+}
+
+export async function getSettings(): Promise<AppSettings> {
+  return await invoke("get_settings_command");
+}
+
+export async function saveSettings(settings: AppSettings): Promise<void> {
+  return await invoke("save_settings_command", { settings });
 }
 

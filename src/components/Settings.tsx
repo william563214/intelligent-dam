@@ -1,46 +1,100 @@
 import { useState, useEffect } from "react";
-import { scanMultipleDirectories, checkFFmpegAvailable } from "../api";
+import {
+  scanMultipleDirectories,
+  checkFFmpegAvailable,
+  getSettings,
+  saveSettings,
+} from "../api";
+import type { AppSettings } from "../types";
 
-interface SettingsData {
-  scanDirectories: string[];
-  avdcPath: string;
-  stashdbUrl: string;
-  outputTemplate: string;
-}
+const default_settings: AppSettings = {
+  scanDirectories: [],
+  avdcPath: "",
+  stashdbUrl: "https://stashdb.org",
+  outputTemplate: "{{studio}}/{{date}}_{{title}}.mp4",
+};
+
+const legacy_settings_key = "intelligent_dam_settings";
 
 export default function Settings() {
-  const [settings, setSettings] = useState<SettingsData>({
-    scanDirectories: [],
-    avdcPath: "",
-    stashdbUrl: "https://stashdb.org",
-    outputTemplate: "{{studio}}/{{date}}_{{title}}.mp4",
-  });
+  const [settings, setSettings] = useState<AppSettings>(default_settings);
   const [newDirectory, setNewDirectory] = useState("");
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<string | null>(null);
   const [ffmpegAvailable, setFFmpegAvailable] = useState<boolean | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     loadSettings();
     checkFFmpeg();
   }, []);
 
-  const loadSettings = () => {
-    // 從 localStorage 載入設定
-    const saved = localStorage.getItem("intelligent_dam_settings");
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        setSettings({ ...settings, ...parsed });
-      } catch (e) {
-        console.error("Failed to parse settings:", e);
+  const migrateLegacySettings = async (
+    current: AppSettings
+  ): Promise<AppSettings> => {
+    const saved = localStorage.getItem(legacy_settings_key);
+    if (!saved) {
+      return current;
+    }
+
+    try {
+      const parsed = JSON.parse(saved) as Partial<AppSettings>;
+      const hasPersistedData =
+        current.scanDirectories.length > 0 ||
+        current.avdcPath.trim() !== "" ||
+        (current.stashdbUrl.trim() !== "" &&
+          current.stashdbUrl !== default_settings.stashdbUrl) ||
+        (current.outputTemplate.trim() !== "" &&
+          current.outputTemplate !== default_settings.outputTemplate);
+
+      if (hasPersistedData) {
+        localStorage.removeItem(legacy_settings_key);
+        return current;
       }
+
+      const migrated: AppSettings = {
+        ...default_settings,
+        ...current,
+        ...parsed,
+        scanDirectories:
+          parsed.scanDirectories ??
+          current.scanDirectories ??
+          default_settings.scanDirectories,
+      };
+      await saveSettings(migrated);
+      localStorage.removeItem(legacy_settings_key);
+      return migrated;
+    } catch (e) {
+      console.error("Failed to migrate legacy settings:", e);
+      return current;
     }
   };
 
-  const saveSettings = () => {
-    localStorage.setItem("intelligent_dam_settings", JSON.stringify(settings));
-    alert("設定已儲存！");
+  const loadSettings = async () => {
+    try {
+      setLoading(true);
+      const loaded = await getSettings();
+      const resolved = await migrateLegacySettings(loaded);
+      setSettings({ ...default_settings, ...resolved });
+    } catch (e) {
+      console.error("Failed to load settings:", e);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSaveSettings = async () => {
+    try {
+      setSaving(true);
+      await saveSettings(settings);
+      localStorage.removeItem(legacy_settings_key);
+      alert("設定已儲存！");
+    } catch (e) {
+      alert(`儲存失敗: ${e instanceof Error ? e.message : "未知錯誤"}`);
+    } finally {
+      setSaving(false);
+    }
   };
 
   const checkFFmpeg = async () => {
@@ -79,6 +133,7 @@ export default function Settings() {
     try {
       setScanning(true);
       setScanResult(null);
+      await saveSettings(settings);
       const result = await scanMultipleDirectories(settings.scanDirectories);
       setScanResult(
         `掃描完成！成功匯入 ${result.imported_count} 個檔案。`
@@ -91,6 +146,15 @@ export default function Settings() {
       setScanning(false);
     }
   };
+
+  if (loading) {
+    return (
+      <div className="p-6">
+        <h2 className="text-2xl font-bold text-gray-900 mb-4">設定</h2>
+        <p className="text-gray-500">載入設定中...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="p-6">
@@ -243,14 +307,14 @@ export default function Settings() {
 
         <div className="pt-4 border-t">
           <button
-            onClick={saveSettings}
-            className="px-6 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+            onClick={handleSaveSettings}
+            disabled={saving}
+            className="px-6 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400"
           >
-            儲存設定
+            {saving ? "儲存中..." : "儲存設定"}
           </button>
         </div>
       </div>
     </div>
   );
 }
-
