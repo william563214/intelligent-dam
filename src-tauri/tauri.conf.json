@@ -19,7 +19,11 @@
       "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost; img-src 'self' asset: http://asset.localhost blob: data: https:; media-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'",
       "assetProtocol": {
         "enable": true,
-        "scope": ["$TEMP/**", "$APPDATA/**", "$APPLOCALDATA/**", "$HOME/**"]
+        "scope": [
+          "$TEMP/intelligent_dam/**",
+          "$APPLOCALDATA/**",
+          "$APPDATA/**"
+        ]
       }
     }
   },
