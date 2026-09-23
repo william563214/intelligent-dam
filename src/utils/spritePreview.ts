@@ -171,9 +171,11 @@ export function cue_at_progress(preview: sprite_preview, progress: number): spri
   const duration = preview.cues[preview.cues.length - 1].end;
   if (duration > 0 && preview.cues[0].start === 0 && duration !== preview.cues.length) {
     const time = clamped * duration;
+    if (time >= duration) return preview.cues[preview.cues.length - 1];
     for (const cue of preview.cues) {
       if (time >= cue.start && time < cue.end) return cue;
     }
+    return preview.cues[preview.cues.length - 1];
   }
 
   const index = Math.min(
