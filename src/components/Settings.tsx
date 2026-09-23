@@ -24,6 +24,7 @@ export default function Settings() {
   const [ffmpegAvailable, setFFmpegAvailable] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings();
@@ -74,17 +75,25 @@ export default function Settings() {
   const loadSettings = async () => {
     try {
       setLoading(true);
+      setLoadError(null);
       const loaded = await getSettings();
       const resolved = await migrateLegacySettings(loaded);
       setSettings({ ...default_settings, ...resolved });
     } catch (e) {
       console.error("Failed to load settings:", e);
+      const message =
+        e instanceof Error ? e.message : typeof e === "string" ? e : "未知錯誤";
+      setLoadError(message);
+      // 不把預設值當成已載入成功 避免用空預設覆寫磁碟上的設定
     } finally {
       setLoading(false);
     }
   };
 
   const handleSaveSettings = async () => {
+    if (loadError) {
+      return;
+    }
     try {
       setSaving(true);
       await saveSettings(settings);
@@ -125,6 +134,10 @@ export default function Settings() {
   };
 
   const handleScan = async () => {
+    if (loadError) {
+      alert("設定載入失敗 無法儲存或掃描 請先重新載入");
+      return;
+    }
     if (settings.scanDirectories.length === 0) {
       alert("請先添加至少一個掃描目錄");
       return;
@@ -159,6 +172,22 @@ export default function Settings() {
   return (
     <div className="p-6">
       <h2 className="text-2xl font-bold text-gray-900 mb-4">設定</h2>
+      {loadError && (
+        <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+          <p className="font-medium">載入設定失敗</p>
+          <p className="mt-1">{loadError}</p>
+          <p className="mt-2 text-red-600">
+            已停用儲存 避免用空白預設覆寫磁碟上的設定。
+          </p>
+          <button
+            type="button"
+            onClick={loadSettings}
+            className="mt-3 px-3 py-1 text-sm bg-red-100 rounded hover:bg-red-200"
+          >
+            重新載入
+          </button>
+        </div>
+      )}
       <div className="bg-white rounded-lg shadow p-6 space-y-6">
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">
@@ -208,7 +237,11 @@ export default function Settings() {
             )}
             <button
               onClick={handleScan}
-              disabled={scanning || settings.scanDirectories.length === 0}
+              disabled={
+                scanning ||
+                !!loadError ||
+                settings.scanDirectories.length === 0
+              }
               className="w-full px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400"
             >
               {scanning ? "掃描中..." : `掃描 ${settings.scanDirectories.length} 個目錄`}
@@ -308,7 +341,7 @@ export default function Settings() {
         <div className="pt-4 border-t">
           <button
             onClick={handleSaveSettings}
-            disabled={saving}
+            disabled={saving || !!loadError}
             className="px-6 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:bg-gray-400"
           >
             {saving ? "儲存中..." : "儲存設定"}
