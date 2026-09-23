@@ -144,11 +144,11 @@ william_video/
 
 ## 開發路線圖
 
-- **第一階段（當前）**: MVP 基礎建設 ✅
+- **第一階段**: MVP 基礎建設 ✅（收尾項目與進行中 PR 見 ROADMAP）
 - **第二階段**: 自動化與監控（Watcher Service）
 - **第三階段**: AI 整合（ONNX Runtime + CLIP 模型）
 
-詳細缺口、建議優先序與 checklist 見 **[ROADMAP.md](./ROADMAP.md)**。
+詳細缺口、階段對照、建議優先序與 checklist 見 **[ROADMAP.md](./ROADMAP.md)**。
 
 ## 授權
 
