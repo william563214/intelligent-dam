@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { getAllFiles, scrapeFile, updateFileMetadata, generatePreview } from "../api";
 import type { FileWithMetadata, Metadata, Tag } from "../types";
+import { status_badge_class, status_label } from "../utils/fileStatus";
 
 export default function ManualOrganize() {
   const [files, setFiles] = useState<FileWithMetadata[]>([]);
@@ -166,9 +167,16 @@ export default function ManualOrganize() {
                 <div className="text-sm text-gray-500 truncate">
                   {file.file.path}
                 </div>
-                <div className="text-xs text-gray-400 mt-1">
-                  狀態: {file.file.status}
-                  {file.tags.length > 0 ? ` · 標籤 ${file.tags.length}` : ""}
+                <div className="text-xs text-gray-400 mt-1 flex items-center gap-2">
+                  <span
+                    className={`px-2 py-0.5 rounded ${status_badge_class(file.file.status)}`}
+                    title={file.file.status}
+                  >
+                    {status_label(file.file.status)}
+                  </span>
+                  {file.tags.length > 0 ? (
+                    <span>標籤 {file.tags.length}</span>
+                  ) : null}
                 </div>
               </div>
             ))}
@@ -179,16 +187,15 @@ export default function ManualOrganize() {
             <div>
               <h3 className="text-lg font-semibold mb-2">編輯元資料</h3>
               <div className="bg-white rounded-lg shadow p-4 space-y-4">
-                <div className="text-sm text-gray-600">
-                  狀態:{" "}
+                <div className="text-sm text-gray-600 flex items-center gap-2">
+                  <span>狀態:</span>
                   <span
-                    className={
-                      selectedFile.file.status === "scrape_failed"
-                        ? "text-red-600"
-                        : "text-gray-800"
-                    }
+                    className={`px-2 py-0.5 text-xs rounded ${status_badge_class(
+                      selectedFile.file.status
+                    )}`}
+                    title={selectedFile.file.status}
                   >
-                    {selectedFile.file.status}
+                    {status_label(selectedFile.file.status)}
                   </span>
                 </div>
                 <div>

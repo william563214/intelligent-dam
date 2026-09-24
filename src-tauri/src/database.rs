@@ -1,5 +1,7 @@
+use crate::file_status;
 use rusqlite::{Connection, Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -60,7 +62,7 @@ impl Database {
                 size INTEGER,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 phash TEXT,
-                status TEXT DEFAULT 'ready'
+                status TEXT DEFAULT 'ready'  -- processing ready scrape_failed missing
             )",
             [],
         )?;
@@ -113,12 +115,17 @@ impl Database {
         size: u64,
         phash: Option<String>,
     ) -> SqliteResult<i64> {
+        // 掃描再次找到檔案時 若先前為 missing 則恢復 ready
         self.conn.execute(
-            "INSERT INTO Files (path, size, phash, status) VALUES (?1, ?2, ?3, 'ready')
+            "INSERT INTO Files (path, size, phash, status) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(path) DO UPDATE SET
                size = excluded.size,
-               phash = COALESCE(excluded.phash, Files.phash)",
-            params![path, size as i64, phash],
+               phash = COALESCE(excluded.phash, Files.phash),
+               status = CASE
+                 WHEN Files.status = ?5 THEN ?4
+                 ELSE Files.status
+               END",
+            params![path, size as i64, phash, file_status::ready, file_status::missing],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -307,6 +314,9 @@ impl Database {
     }
 
     pub fn get_files_with_metadata(&self) -> SqliteResult<Vec<FileWithMetadata>> {
+        // 列表時輕量核對磁碟路徑 缺檔 → missing 復現 → ready
+        self.reconcile_missing_files()?;
+
         let mut stmt = self.conn.prepare(
             "SELECT id, path, size, created_at, phash, status FROM Files ORDER BY created_at DESC",
         )?;
@@ -338,11 +348,53 @@ impl Database {
     }
 
     pub fn update_file_status(&self, file_id: i64, status: &str) -> SqliteResult<()> {
+        if !file_status::is_known(status) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "unknown file status: {}",
+                status
+            )));
+        }
+        let current = self.get_file_by_id(file_id)?.status;
+        if !file_status::can_transition(&current, status) {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "illegal status transition: {} -> {}",
+                current, status
+            )));
+        }
         self.conn.execute(
             "UPDATE Files SET status = ?1 WHERE id = ?2",
             params![status, file_id],
         )?;
         Ok(())
+    }
+
+    /// 依磁碟路徑存在與否調整 missing / ready
+    /// 不覆寫 processing 或 scrape_failed 除非路徑已消失
+    pub fn reconcile_missing_files(&self) -> SqliteResult<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, status FROM Files",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+
+        let mut changed = 0usize;
+        for row in rows {
+            let (id, path, status) = row?;
+            let exists = Path::new(&path).exists();
+            if !exists && status != file_status::missing {
+                self.update_file_status(id, file_status::missing)?;
+                changed += 1;
+            } else if exists && status == file_status::missing {
+                self.update_file_status(id, file_status::ready)?;
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     pub fn update_file_phash(&self, file_id: i64, phash: &str) -> SqliteResult<()> {
@@ -447,10 +499,169 @@ mod tests {
             .insert_file("/tmp/fail.mp4", 100, None)
             .expect("insert file");
 
-        db.update_file_status(file_id, "scrape_failed")
+        db.update_file_status(file_id, file_status::scrape_failed)
             .expect("update status");
         let file = db.get_file_by_id(file_id).expect("get file");
-        assert_eq!(file.status, "scrape_failed");
+        assert_eq!(file.status, file_status::scrape_failed);
+    }
+
+    #[test]
+    fn reconcile_marks_absent_path_missing_and_restores_ready() {
+        let db = open_memory_db();
+        let dir = std::env::temp_dir().join(format!(
+            "idam-status-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("present.mp4");
+        std::fs::write(&path, b"x").expect("touch");
+        let path_str = path.to_str().expect("utf8");
+
+        let file_id = db.insert_file(path_str, 1, None).expect("insert");
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::ready
+        );
+
+        std::fs::remove_file(&path).expect("unlink");
+        let changed = db.reconcile_missing_files().expect("reconcile");
+        assert_eq!(changed, 1);
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::missing
+        );
+
+        std::fs::write(&path, b"x").expect("restore");
+        let changed = db.reconcile_missing_files().expect("reconcile again");
+        assert_eq!(changed, 1);
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::ready
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_overrides_processing_when_path_gone() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/idam-never-exists-status-xyz.mp4", 1, None)
+            .expect("insert");
+        db.update_file_status(file_id, file_status::processing)
+            .expect("processing");
+        let changed = db.reconcile_missing_files().expect("reconcile");
+        assert_eq!(changed, 1);
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::missing
+        );
+    }
+
+    #[test]
+    fn insert_conflict_clears_missing_when_rescanned() {
+        let db = open_memory_db();
+        let dir = std::env::temp_dir().join(format!(
+            "idam-rescan-status-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("back.mp4");
+        std::fs::write(&path, b"y").expect("touch");
+        let path_str = path.to_str().expect("utf8");
+
+        let file_id = db.insert_file(path_str, 1, None).expect("insert");
+        db.update_file_status(file_id, file_status::missing)
+            .expect("mark missing");
+
+        db.insert_file(path_str, 2, None).expect("rescan");
+        let file = db.get_file_by_path(path_str).expect("get").expect("exists");
+        assert_eq!(file.status, file_status::ready);
+        assert_eq!(file.size, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn insert_conflict_preserves_scrape_failed() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/keep-failed.mp4", 1, None)
+            .expect("insert");
+        db.update_file_status(file_id, file_status::scrape_failed)
+            .expect("fail");
+        db.insert_file("/tmp/keep-failed.mp4", 9, None)
+            .expect("rescan");
+        let file = db
+            .get_file_by_path("/tmp/keep-failed.mp4")
+            .expect("get")
+            .expect("exists");
+        assert_eq!(file.status, file_status::scrape_failed);
+        assert_eq!(file.size, 9);
+    }
+
+    #[test]
+    fn update_file_status_rejects_unknown_and_illegal() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/illegal-status.mp4", 1, None)
+            .expect("insert");
+
+        let err = db
+            .update_file_status(file_id, "not_a_status")
+            .expect_err("unknown");
+        assert!(format!("{}", err).contains("unknown"));
+
+        db.update_file_status(file_id, file_status::missing)
+            .expect("to missing");
+        let err = db
+            .update_file_status(file_id, file_status::processing)
+            .expect_err("missing cannot jump to processing");
+        assert!(format!("{}", err).contains("illegal"));
+    }
+
+    #[test]
+    fn scrape_status_sequence_matches_command_transitions() {
+        // 模擬 scrape_file_command 的狀態步驟 無需 Tauri State
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/scrape-seq.mp4", 1, None)
+            .expect("insert");
+
+        db.update_file_status(file_id, file_status::processing)
+            .expect("start scrape");
+        db.update_file_status(file_id, file_status::scrape_failed)
+            .expect("dual fail");
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::scrape_failed
+        );
+
+        // 重試刮削
+        db.update_file_status(file_id, file_status::processing)
+            .expect("retry");
+        db.update_file_status(file_id, file_status::ready)
+            .expect("success");
+        assert_eq!(db.get_file_by_id(file_id).unwrap().status, file_status::ready);
+
+        // 預覽 after_transient_work 保留 scrape_failed
+        db.update_file_status(file_id, file_status::scrape_failed)
+            .expect("fail again");
+        let previous = file_status::scrape_failed;
+        db.update_file_status(file_id, file_status::processing)
+            .expect("preview start");
+        let next = file_status::after_transient_work(previous);
+        db.update_file_status(file_id, next).expect("preview end");
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::scrape_failed
+        );
     }
 
     #[test]
