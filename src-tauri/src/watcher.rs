@@ -17,6 +17,7 @@
 //! [`TaskQueue`] (bounded concurrency, same-file serial). Destinations produced
 //! by the pipeline are suppressed so recursive watch trees do not re-ingest them;
 //! already-scraped library rows skip scrape on any residual events.
+//! Path UNIQUE upsert + phash near-dedup (issue #11) prevent duplicate Files rows.
 
 use crate::database::Database;
 use crate::file_stability::{self, StabilityError, StabilityOptions};
@@ -393,7 +394,7 @@ fn ingest_worker(
         };
 
         // Short lock: register only
-        let (file_id, jobs) = {
+        let (imported, jobs) = {
             let db_guard = match db.lock() {
                 Ok(g) => g,
                 Err(e) => {
@@ -401,8 +402,8 @@ fn ingest_worker(
                     continue;
                 }
             };
-            match scanner::import_files_pending_phash(&db_guard, &[scanned]) {
-                Ok((ids, jobs)) => (ids.first().copied(), jobs),
+            match scanner::import_files_pending_phash(&db_guard, &[scanned], Some(&suppressions)) {
+                Ok((entries, jobs)) => (entries.into_iter().next(), jobs),
                 Err(e) => {
                     eprintln!("watcher: import failed for {}: {:#}", path_str, e);
                     let _ = emit_event(
@@ -419,81 +420,110 @@ fn ingest_worker(
             }
         };
 
+        // Phash near-dedup may have removed the provisional row during import
+        let Some(entry) = imported else {
+            eprintln!(
+                "watcher: skip ingest for {} (phash near-duplicate of existing row)",
+                path_str
+            );
+            let _ = emit_event(
+                &app,
+                WatcherFileEvent {
+                    path: path_str,
+                    kind: detected.kind.to_string(),
+                    file_id: None,
+                    error: Some("skipped: phash near-duplicate".to_string()),
+                },
+            );
+            continue;
+        };
+
+        let file_id = entry.file_id;
+        let is_new = entry.is_new;
+
         let _ = emit_event(
             &app,
             WatcherFileEvent {
                 path: path_str,
                 kind: detected.kind.to_string(),
-                file_id,
+                file_id: Some(file_id),
                 error: None,
             },
         );
 
+        // Path already known and no phash work: do not re-enqueue pipeline
+        // (documented: known path with no phash job -> don't enqueue)
+        if !is_new && jobs.is_empty() {
+            eprintln!(
+                "watcher: path dedup skip queue for existing file_id {}",
+                file_id
+            );
+            continue;
+        }
+
         // Submit phash then pipeline to the shared queue (same-file serial FIFO)
-        if let Some(id) = file_id {
-            if stop_flag.load(Ordering::SeqCst) {
-                break;
-            }
+        if stop_flag.load(Ordering::SeqCst) {
+            break;
+        }
 
-            for job in jobs {
-                match queue.enqueue_phash(job, Some(Arc::clone(&stop_flag))) {
-                    Ok(job_id) => {
-                        eprintln!("watcher: enqueued phash job {} for file {}", job_id, id);
-                    }
-                    Err(e) => {
-                        eprintln!("watcher: failed to enqueue phash for file {}: {}", id, e);
-                    }
-                }
-            }
-
-            let base_options = PipelineOptions::from_env();
-            if base_options.is_noop() {
-                continue;
-            }
-
-            // Soften options when this path is an already-organized library row
-            // (e.g. move landed under watch and suppress window missed)
-            let options = {
-                let db_guard = match db.lock() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        eprintln!("watcher: db lock error before pipeline enqueue: {}", e);
-                        continue;
-                    }
-                };
-                match pipeline::options_for_existing_file(&db_guard, id, &base_options) {
-                    Ok(opts) => opts,
-                    Err(e) => {
-                        eprintln!(
-                            "watcher: options_for_existing_file failed for {}: {:#}",
-                            id, e
-                        );
-                        base_options
-                    }
-                }
-            };
-
-            if options.is_noop() {
-                eprintln!(
-                    "watcher: skip pipeline enqueue for already-organized file {}",
-                    id
-                );
-                continue;
-            }
-
-            match queue.enqueue_pipeline(id, options, Some(Arc::clone(&stop_flag))) {
+        for job in jobs {
+            match queue.enqueue_phash(job, Some(Arc::clone(&stop_flag))) {
                 Ok(job_id) => {
-                    eprintln!(
-                        "watcher: enqueued pipeline job {} for file {}",
-                        job_id, id
-                    );
+                    eprintln!("watcher: enqueued phash job {} for file {}", job_id, file_id);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "watcher: failed to enqueue pipeline for file {}: {}",
-                        id, e
-                    );
+                    eprintln!("watcher: failed to enqueue phash for file {}: {}", file_id, e);
                 }
+            }
+        }
+
+        let base_options = PipelineOptions::from_env();
+        if base_options.is_noop() {
+            continue;
+        }
+
+        // Soften options when this path is an already-organized library row
+        // (e.g. move landed under watch and suppress window missed)
+        let options = {
+            let db_guard = match db.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("watcher: db lock error before pipeline enqueue: {}", e);
+                    continue;
+                }
+            };
+            match pipeline::options_for_existing_file(&db_guard, file_id, &base_options) {
+                Ok(opts) => opts,
+                Err(e) => {
+                    eprintln!(
+                        "watcher: options_for_existing_file failed for {}: {:#}",
+                        file_id, e
+                    );
+                    base_options
+                }
+            }
+        };
+
+        if options.is_noop() {
+            eprintln!(
+                "watcher: skip pipeline enqueue for already-organized file {}",
+                file_id
+            );
+            continue;
+        }
+
+        match queue.enqueue_pipeline(file_id, options, Some(Arc::clone(&stop_flag))) {
+            Ok(job_id) => {
+                eprintln!(
+                    "watcher: enqueued pipeline job {} for file {}",
+                    job_id, file_id
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "watcher: failed to enqueue pipeline for file {}: {}",
+                    file_id, e
+                );
             }
         }
     }

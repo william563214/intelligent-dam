@@ -228,6 +228,16 @@ CREATE VIRTUAL TABLE Embeddings USING vss0(
 
 寫入路徑透過轉換白名單拒絕非法跳轉（例如 `missing` → `processing`）。
 
+### 8.5 去重策略（path／phash，issue #11）
+
+| 維度 | 策略 |
+| --- | --- |
+| **Path** | `Files.path` 為 `UNIQUE`。掃描與 Watcher ingest 皆走 upsert：同路徑不會產生第二列；更新 size、`COALESCE` 保留既有 phash；`missing` → `ready`。**Known path with no phash job**（`!is_new` 且本輪無 phash job）：Watcher **不 enqueue** pipeline。 |
+| **Phash** | 64-bit hex；Hamming distance ≤ **`near_phash_max_distance()`**（預設 **8**，可用環境變數 `IDAM_NEAR_PHASH_MAX_DISTANCE` 覆寫）視為相同／近重複。≤8 時視覺相近但不同的片可能 **false-positive**（略過時會 log）。MVP：**略過 ingest + log，保留既有列**（刪除暫存列及其 Metadata／FileTags）。 |
+| **Orphan / 迴圈** | 刪暫存列後磁碟檔仍在。立即對該 path 做 **PathSuppress（TTL，預設約 90s，與 pipeline 搬運共用）**；Watcher／scan 在 TTL 內略過該 path，避免 ingest→phash→delete→再 notify 迴圈。TTL 過後可再入庫（需明確操作或重新掃描）；非永久隔離。 |
+| **套用點** | (1) import 時若已帶 precomputed phash；(2) `write_phashes` 寫回計算結果後。後續 pipeline 若發現 file_id 已刪則 soft-skip。 |
+| **非目標** | Phase 2 重複檔 UI（#12）、手動合併／連結列、永久 quarantine UI。 |
+
 ## 9. 已知限制（第一階段 MVP）
 
 - 不包含自動監控（Watcher），需手動觸發掃描

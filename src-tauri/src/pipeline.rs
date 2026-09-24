@@ -196,7 +196,27 @@ pub fn run_for_file(
     let initial_path = match current_path(db, file_id) {
         Ok(p) => p,
         Err(e) => {
-            result.errors.push(e.to_string());
+            // Phash near-dedup may have removed the provisional row before pipeline runs
+            let msg = e.to_string();
+            if msg.contains("not found") || msg.contains("QueryReturnedNoRows") {
+                eprintln!(
+                    "pipeline: soft-skip missing file_id {} (likely phash dedup): {}",
+                    file_id, msg
+                );
+                emit_progress(
+                    app,
+                    PipelineProgressEvent {
+                        file_id,
+                        path: String::new(),
+                        step: "pipeline".to_string(),
+                        status: "skipped".to_string(),
+                        message: Some("skipped: file removed (phash near-duplicate)".to_string()),
+                        new_path: None,
+                    },
+                );
+                return result;
+            }
+            result.errors.push(msg);
             emit_progress(
                 app,
                 PipelineProgressEvent {
@@ -474,10 +494,13 @@ fn current_path(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<String> {
     let guard = db
         .lock()
         .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
-    let file = guard
-        .get_file_by_id(file_id)
-        .with_context(|| format!("File id {} not found", file_id))?;
-    Ok(file.path)
+    match guard.get_file_by_id(file_id) {
+        Ok(file) => Ok(file.path),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            anyhow::bail!("File id {} not found", file_id)
+        }
+        Err(e) => Err(e).with_context(|| format!("File id {} lookup failed", file_id)),
+    }
 }
 
 fn current_status(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<String> {
