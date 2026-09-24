@@ -36,13 +36,22 @@ pub async fn generate_sprite_sheet(
     output_path: &Path,
     grid_size: (u32, u32),
 ) -> Result<String> {
+    generate_sprite_sheet_blocking(video_path, output_path, grid_size)
+}
+
+/// Sync sprite sheet generation for watcher / pipeline worker threads
+pub fn generate_sprite_sheet_blocking(
+    video_path: &Path,
+    output_path: &Path,
+    grid_size: (u32, u32),
+) -> Result<String> {
     let (cols, rows) = grid_size;
     let total_frames = cols * rows;
-    
+
     // 先獲取影片時長
     let duration = get_video_duration(video_path)?;
     let fps = total_frames as f64 / duration;
-    
+
     // 生成 Sprite Sheet
     let filter = format!(
         "fps={},scale=160:90,tile={}x{}",
