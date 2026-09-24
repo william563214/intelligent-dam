@@ -484,6 +484,7 @@ fn ingest_worker(
 
         // Soften options when this path is an already-organized library row
         // (e.g. move landed under watch and suppress window missed)
+        let settings = pipeline::load_settings(&app);
         let options = {
             let db_guard = match db.lock() {
                 Ok(g) => g,
@@ -492,7 +493,12 @@ fn ingest_worker(
                     continue;
                 }
             };
-            match pipeline::options_for_existing_file(&db_guard, file_id, &base_options) {
+            match pipeline::options_for_existing_file(
+                &db_guard,
+                file_id,
+                &base_options,
+                Some(&settings),
+            ) {
                 Ok(opts) => opts,
                 Err(e) => {
                     eprintln!(
@@ -510,6 +516,20 @@ fn ingest_worker(
                 file_id
             );
             continue;
+        }
+
+        match queue.has_active_pipeline(file_id) {
+            Ok(true) => {
+                eprintln!(
+                    "watcher: skip pipeline enqueue file {} already queued/running",
+                    file_id
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("watcher: has_active_pipeline check failed: {}", e);
+            }
         }
 
         match queue.enqueue_pipeline(file_id, options, Some(Arc::clone(&stop_flag))) {

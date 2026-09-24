@@ -1,6 +1,7 @@
 //! Settings connectivity / availability checks (issue #12)
 //!
 //! FFmpeg binary on PATH AVDC script path exists StashDB URL reachable
+//! StashDB check is async so the Tauri command does not block the UI runtime
 
 use crate::ffmpeg;
 use crate::settings::AppSettings;
@@ -23,11 +24,11 @@ pub struct ConnectivityReport {
     pub stashdb: ConnectivityCheck,
 }
 
-pub fn check_all(settings: &AppSettings) -> ConnectivityReport {
+pub async fn check_all(settings: &AppSettings) -> ConnectivityReport {
     ConnectivityReport {
         ffmpeg: check_ffmpeg(),
         avdc: check_avdc(&settings.avdc_path),
-        stashdb: check_stashdb_blocking(&settings.stashdb_url),
+        stashdb: check_stashdb(&settings.stashdb_url).await,
     }
 }
 
@@ -73,7 +74,7 @@ pub fn check_avdc(avdc_path: &str) -> ConnectivityCheck {
 }
 
 /// Best-effort HTTP reachability for the configured StashDB base URL
-pub fn check_stashdb_blocking(stashdb_url: &str) -> ConnectivityCheck {
+pub async fn check_stashdb(stashdb_url: &str) -> ConnectivityCheck {
     let trimmed = stashdb_url.trim();
     if trimmed.is_empty() {
         return ConnectivityCheck {
@@ -82,8 +83,8 @@ pub fn check_stashdb_blocking(stashdb_url: &str) -> ConnectivityCheck {
         };
     }
 
-    let url = trimmed.trim_end_matches('/');
-    let client = match reqwest::blocking::Client::builder()
+    let url = trimmed.trim_end_matches('/').to_string();
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
     {
@@ -97,7 +98,7 @@ pub fn check_stashdb_blocking(stashdb_url: &str) -> ConnectivityCheck {
     };
 
     // Prefer a light GET on the base URL any 2xx/3xx/4xx means host is reachable
-    match client.get(url).send() {
+    match client.get(&url).send().await {
         Ok(resp) => {
             let status = resp.status();
             if status.is_server_error() {
@@ -157,7 +158,11 @@ mod tests {
 
     #[test]
     fn stashdb_empty_url_fails() {
-        let r = check_stashdb_blocking("  ");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let r = rt.block_on(check_stashdb("  "));
         assert!(!r.ok);
     }
 }

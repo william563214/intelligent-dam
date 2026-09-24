@@ -229,6 +229,19 @@ impl Scheduler {
             .collect()
     }
 
+    /// True when a pipeline job for this file is already Queued or Running
+    pub fn has_active_pipeline(&self, file_id: i64) -> bool {
+        self.jobs.values().any(|j| {
+            matches!(
+                &j.kind,
+                JobKind::Pipeline {
+                    file_id: fid,
+                    ..
+                } if *fid == file_id
+            ) && (j.state == JobState::Queued || j.state == JobState::Running)
+        })
+    }
+
     /// Claim **exactly one** eligible job for a worker.
     ///
     /// Marks that job `Running` only when returned. Same-file-blocked jobs stay
@@ -545,6 +558,15 @@ impl TaskQueue {
         self.enqueue(JobKind::Pipeline { file_id, options }, stop_flag)
     }
 
+    /// Skip enqueue when the same file already has a Queued/Running pipeline job
+    pub fn has_active_pipeline(&self, file_id: i64) -> Result<bool, String> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("queue lock: {}", e))?;
+        Ok(guard.scheduler.has_active_pipeline(file_id))
+    }
+
     pub fn enqueue_phash(
         &self,
         job: PhashJob,
@@ -735,10 +757,18 @@ fn execute_job(
         JobKind::Pipeline { file_id, options } => {
             // Re-soften from DB on every run (including retry) so scrape_failed /
             // already-moved / already-previewed rows do not re-run the full chain
-            let effective = match db.lock() {
-                Ok(guard) => pipeline::options_for_existing_file(&guard, *file_id, options)
+            let effective = {
+                let settings = pipeline::load_settings(app);
+                match db.lock() {
+                    Ok(guard) => pipeline::options_for_existing_file(
+                        &guard,
+                        *file_id,
+                        options,
+                        Some(&settings),
+                    )
                     .unwrap_or_else(|_| options.clone()),
-                Err(_) => options.clone(),
+                    Err(_) => options.clone(),
+                }
             };
             if effective.is_noop() {
                 return ExecOutcome::Success;
@@ -863,6 +893,20 @@ mod tests {
         let b = s.enqueue(pipeline_kind(2), None, 3);
         assert_eq!(a, 1);
         assert_eq!(b, 2);
+    }
+
+    #[test]
+    fn has_active_pipeline_detects_queued_and_running() {
+        let mut s = Scheduler::new(2);
+        assert!(!s.has_active_pipeline(7));
+        let id = s.enqueue(pipeline_kind(7), None, 3);
+        assert!(s.has_active_pipeline(7));
+        assert!(!s.has_active_pipeline(8));
+        let job = s.dispatch_one().expect("run");
+        assert_eq!(job.id, id);
+        assert!(s.has_active_pipeline(7));
+        s.complete_success(id);
+        assert!(!s.has_active_pipeline(7));
     }
 
     #[test]

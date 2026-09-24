@@ -12,6 +12,7 @@ import {
   getTaskQueueStatus,
   retryTask,
   testConnectivity,
+  canonicalizePath,
 } from "../api";
 import type {
   AppSettings,
@@ -302,14 +303,30 @@ export default function Settings() {
     }
   };
 
-  const handleAddDirectory = () => {
-    if (newDirectory.trim() && !settings.scanDirectories.includes(newDirectory.trim())) {
-      setSettings({
-        ...settings,
-        scanDirectories: [...settings.scanDirectories, newDirectory.trim()],
-      });
-      setNewDirectory("");
+  const handleAddDirectory = async () => {
+    const raw = newDirectory.trim();
+    if (!raw) {
+      return;
     }
+    let path = raw;
+    try {
+      path = await canonicalizePath(raw);
+    } catch (err) {
+      console.error("canonicalize failed", err);
+    }
+    if (!path) {
+      return;
+    }
+    if (settings.scanDirectories.includes(path)) {
+      alert("此目錄已在清單中");
+      setNewDirectory("");
+      return;
+    }
+    setSettings({
+      ...settings,
+      scanDirectories: [...settings.scanDirectories, path],
+    });
+    setNewDirectory("");
   };
 
   const handlePickDirectory = async () => {
@@ -322,9 +339,15 @@ export default function Settings() {
       if (selected == null) {
         return;
       }
-      const path = typeof selected === "string" ? selected : String(selected);
-      if (!path.trim()) {
+      const raw = typeof selected === "string" ? selected : String(selected);
+      if (!raw.trim()) {
         return;
+      }
+      let path = raw;
+      try {
+        path = await canonicalizePath(raw);
+      } catch (err) {
+        console.error("canonicalize failed", err);
       }
       if (settings.scanDirectories.includes(path)) {
         alert("此目錄已在清單中");
@@ -354,7 +377,13 @@ export default function Settings() {
       if (selected == null) {
         return;
       }
-      const path = typeof selected === "string" ? selected : String(selected);
+      const raw = typeof selected === "string" ? selected : String(selected);
+      let path = raw;
+      try {
+        path = await canonicalizePath(raw);
+      } catch (err) {
+        console.error("canonicalize failed", err);
+      }
       setSettings({ ...settings, avdcPath: path });
     } catch (err) {
       alert(
@@ -457,7 +486,7 @@ export default function Settings() {
                 onChange={(e) => setNewDirectory(e.target.value)}
                 onKeyPress={(e) => {
                   if (e.key === "Enter") {
-                    handleAddDirectory();
+                    void handleAddDirectory();
                   }
                 }}
                 placeholder="例如: C:/Videos 或 /Users/username/Videos"

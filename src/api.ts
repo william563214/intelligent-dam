@@ -109,3 +109,7 @@ export async function enqueuePipelineJobs(
 export async function organizeEligibleFiles(): Promise<EnqueueResult> {
   return await invoke("organize_eligible_files_command");
 }
+
+export async function canonicalizePath(path: string): Promise<string> {
+  return await invoke("canonicalize_path_command", { path });
+}

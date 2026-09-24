@@ -54,6 +54,50 @@ pub struct EnqueueResult {
     pub skipped: usize,
 }
 
+/// Cap one-click / batch enqueue size to avoid unbounded queue growth
+#[allow(non_upper_case_globals)]
+const max_batch_enqueue: usize = 500;
+
+#[allow(non_upper_case_globals)]
+const env_max_batch_enqueue: &str = "IDAM_MAX_BATCH_ENQUEUE";
+
+fn batch_enqueue_limit() -> usize {
+    match std::env::var(env_max_batch_enqueue) {
+        Ok(v) => v.trim().parse::<usize>().unwrap_or(max_batch_enqueue).max(1),
+        Err(_) => max_batch_enqueue,
+    }
+}
+
+/// Resolve a user-picked path to an absolute canonical form when possible
+pub fn canonicalize_user_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match std::path::Path::new(trimmed).canonicalize() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => trimmed.to_string(),
+    }
+}
+
+fn normalize_scan_directories(dirs: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let canon = canonicalize_user_path(dir);
+        if canon.is_empty() {
+            continue;
+        }
+        if out.iter().any(|existing: &String| {
+            existing == &canon
+                || std::path::Path::new(existing) == std::path::Path::new(&canon)
+        }) {
+            continue;
+        }
+        out.push(canon);
+    }
+    out
+}
+
 fn ensure_queue_ready(
     queue: &TaskQueue,
     app: &AppHandle,
@@ -212,13 +256,18 @@ pub fn get_settings_command(
 
 #[tauri::command]
 pub async fn save_settings_command(
-    settings: AppSettings,
+    mut settings: AppSettings,
     settings_store: State<'_, Mutex<SettingsStore>>,
     watcher: State<'_, WatcherManager>,
     queue: State<'_, Arc<TaskQueue>>,
     app: AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<(), String> {
+    settings.scan_directories = normalize_scan_directories(&settings.scan_directories);
+    if !settings.avdc_path.trim().is_empty() {
+        settings.avdc_path = canonicalize_user_path(&settings.avdc_path);
+    }
+
     {
         let store = settings_store
             .lock()
@@ -586,7 +635,7 @@ pub fn check_ffmpeg_available_command() -> bool {
 }
 
 #[tauri::command]
-pub fn test_connectivity_command(
+pub async fn test_connectivity_command(
     settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<ConnectivityReport, String> {
     let settings = {
@@ -597,7 +646,12 @@ pub fn test_connectivity_command(
             .load()
             .map_err(|e| format!("Failed to load settings: {}", e))?
     };
-    Ok(connectivity::check_all(&settings))
+    Ok(connectivity::check_all(&settings).await)
+}
+
+#[tauri::command]
+pub fn canonicalize_path_command(path: String) -> String {
+    canonicalize_user_path(&path)
 }
 
 #[tauri::command]
@@ -631,6 +685,7 @@ pub fn enqueue_pipeline_jobs_command(
     app: AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
     queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<EnqueueResult, String> {
     let base = options
         .unwrap_or(PipelineOptionsInput {
@@ -639,7 +694,15 @@ pub fn enqueue_pipeline_jobs_command(
             enable_preview: Some(true),
         })
         .into_options();
-    enqueue_pipeline_jobs_inner(&app, &db, &queue, file_ids, base)
+    let settings = {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .load()
+            .map_err(|e| format!("Failed to load settings: {}", e))?
+    };
+    enqueue_pipeline_jobs_inner(&app, &db, &queue, &settings, file_ids, base)
 }
 
 /// One-click organize: enqueue full pipeline for all non-missing library files
@@ -648,7 +711,16 @@ pub fn organize_eligible_files_command(
     app: AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
     queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<EnqueueResult, String> {
+    let settings = {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .load()
+            .map_err(|e| format!("Failed to load settings: {}", e))?
+    };
     let file_ids = {
         let guard = db
             .lock()
@@ -662,6 +734,7 @@ pub fn organize_eligible_files_command(
         &app,
         &db,
         &queue,
+        &settings,
         file_ids,
         PipelineOptions::default(),
     )
@@ -671,6 +744,7 @@ fn enqueue_pipeline_jobs_inner(
     app: &AppHandle,
     db: &Arc<Mutex<Database>>,
     queue: &Arc<TaskQueue>,
+    settings: &AppSettings,
     file_ids: Vec<i64>,
     base: PipelineOptions,
 ) -> Result<EnqueueResult, String> {
@@ -688,10 +762,16 @@ fn enqueue_pipeline_jobs_inner(
         return Err("Pipeline options disable all steps".to_string());
     }
 
+    let limit = batch_enqueue_limit();
     let mut job_ids = Vec::new();
     let mut skipped = 0usize;
 
     for file_id in file_ids {
+        if job_ids.len() >= limit {
+            skipped += 1;
+            continue;
+        }
+
         let options = {
             let guard = db
                 .lock()
@@ -707,8 +787,13 @@ fn enqueue_pipeline_jobs_inner(
                         skipped += 1;
                         continue;
                     }
-                    crate::pipeline::options_for_existing_file(&guard, file_id, &base)
-                        .unwrap_or_else(|_| base.clone())
+                    crate::pipeline::options_for_existing_file(
+                        &guard,
+                        file_id,
+                        &base,
+                        Some(settings),
+                    )
+                    .unwrap_or_else(|_| base.clone())
                 }
                 Err(_) => {
                     skipped += 1;
@@ -720,6 +805,25 @@ fn enqueue_pipeline_jobs_inner(
         if options.is_noop() {
             skipped += 1;
             continue;
+        }
+
+        match queue.has_active_pipeline(file_id) {
+            Ok(true) => {
+                skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log_command_error(
+                    db,
+                    "queue",
+                    Some(file_id),
+                    None,
+                    &format!("active pipeline check failed: {}", e),
+                );
+                skipped += 1;
+                continue;
+            }
         }
 
         match queue.enqueue_pipeline(file_id, options, None) {
@@ -742,5 +846,37 @@ fn enqueue_pipeline_jobs_inner(
         skipped,
         job_ids,
     })
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{canonicalize_user_path, normalize_scan_directories};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn normalize_dedupes_canonical_paths() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "idam_canon_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let canon = canonicalize_user_path(dir.to_str().unwrap());
+        assert!(!canon.is_empty());
+        let dirs = vec![
+            dir.to_string_lossy().to_string(),
+            canon.clone(),
+            format!("{}/.", dir.display()),
+        ];
+        let normalized = normalize_scan_directories(&dirs);
+        assert_eq!(normalized.len(), 1, "{:?}", normalized);
+        assert_eq!(normalized[0], canon);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
