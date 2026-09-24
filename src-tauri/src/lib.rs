@@ -5,12 +5,14 @@ mod ffmpeg;
 mod phash;
 mod scraper;
 mod settings;
+mod watcher;
 mod commands;
 
 use database::Database;
 use settings::SettingsStore;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
+use watcher::WatcherManager;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
@@ -23,13 +25,15 @@ pub fn run() {
             let app_data_dir = app.path().app_data_dir().unwrap();
             std::fs::create_dir_all(&app_data_dir).unwrap();
             let db_path = app_data_dir.join("intelligent_dam.db");
-            
+
             let db = Database::new(db_path.to_str().unwrap())
                 .expect("Failed to initialize database");
             let settings_store = SettingsStore::new(&app_data_dir);
-            
-            app.manage(Mutex::new(db));
+
+            // Arc so Watcher ingest worker can share the same mutex
+            app.manage(Arc::new(Mutex::new(db)));
             app.manage(Mutex::new(settings_store));
+            app.manage(WatcherManager::new());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -43,6 +47,9 @@ pub fn run() {
             commands::check_ffmpeg_available_command,
             commands::get_settings_command,
             commands::save_settings_command,
+            commands::start_watcher_command,
+            commands::stop_watcher_command,
+            commands::get_watcher_status_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

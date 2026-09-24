@@ -50,3 +50,15 @@ export interface AppSettings {
   outputTemplate: string;
 }
 
+export interface WatcherStatus {
+  running: boolean;
+  watchedPaths: string[];
+}
+
+export interface WatcherFileEvent {
+  path: string;
+  kind: string;
+  fileId: number | null;
+  error: string | null;
+}
+
