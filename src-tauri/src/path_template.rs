@@ -186,6 +186,12 @@ fn is_absolute_rendered(rendered: &str) -> bool {
     rendered.starts_with('/') || windows_drive_prefix(rendered).is_some()
 }
 
+/// True when the template string itself is absolute (not relative to source parent)
+pub fn is_absolute_template(template: &str) -> bool {
+    let trimmed = template.trim().replace('\\', "/");
+    is_absolute_rendered(&trimmed)
+}
+
 fn windows_drive_prefix(rendered: &str) -> Option<char> {
     let mut chars = rendered.chars();
     let drive = chars.next()?;

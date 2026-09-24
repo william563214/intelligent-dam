@@ -81,10 +81,12 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 
 ### UX polish
 
-- [ ] 一鍵整理（對齊手動整理流程的批次入口）
-- [ ] 批次操作（多選刮削／預覽／搬運等）
-- [ ] 錯誤日誌（刮削／FFmpeg／搬運失敗可查）
-- [ ] Settings：資料夾選擇器 + 連線／可用性測試（FFmpeg、AVDC、StashDB 等）
+- [x] **一鍵整理** — 影片庫「一鍵整理」對可整理檔 enqueue 既有 scrape→move→preview 佇列（`organize_eligible_files_command`）
+- [x] **批次操作** — 影片庫多選 + 批量刮削／預覽／整理（`enqueue_pipeline_jobs_command`）
+- [x] **錯誤日誌** — SQLite `ErrorLog` +「錯誤日誌」分頁；pipeline／手動刮削／FFmpeg 失敗入庫
+- [x] **Settings：資料夾選擇器 + 連線／可用性測試** — `tauri-plugin-dialog` 選掃描／AVDC；FFmpeg／AVDC／StashDB 測試（`test_connectivity_command`）
+
+追蹤：Issue #12。
 
 ### Deferred / Later（第三階段 — 明確延後，現階段不要開工）
 

@@ -42,6 +42,18 @@ pub struct FileWithMetadata {
     pub tags: Vec<Tag>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorLogEntry {
+    pub id: i64,
+    pub created_at: String,
+    pub category: String,
+    pub file_id: Option<i64>,
+    pub path: Option<String>,
+    pub message: String,
+    pub detail: Option<String>,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -103,6 +115,20 @@ impl Database {
                 PRIMARY KEY (file_id, tag_id),
                 FOREIGN KEY(file_id) REFERENCES Files(id),
                 FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            )",
+            [],
+        )?;
+
+        // 錯誤日誌 scrape ffmpeg move 等失敗可查
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
             )",
             [],
         )?;
@@ -440,6 +466,67 @@ impl Database {
             });
         }
         Ok(result)
+    }
+
+    /// Persist a scrape / ffmpeg / move failure for the error log UI
+    pub fn insert_error_log(
+        &self,
+        category: &str,
+        file_id: Option<i64>,
+        path: Option<&str>,
+        message: &str,
+        detail: Option<&str>,
+    ) -> SqliteResult<i64> {
+        self.conn.execute(
+            "INSERT INTO ErrorLog (category, file_id, path, message, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![category, file_id, path, message, detail],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn list_error_logs(&self, limit: i64) -> SqliteResult<Vec<ErrorLogEntry>> {
+        let limit = limit.clamp(1, 500);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, created_at, category, file_id, path, message, detail
+             FROM ErrorLog
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(ErrorLogEntry {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                category: row.get(2)?,
+                file_id: row.get(3)?,
+                path: row.get(4)?,
+                message: row.get(5)?,
+                detail: row.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn clear_error_logs(&self) -> SqliteResult<usize> {
+        let n = self.conn.execute("DELETE FROM ErrorLog", [])?;
+        Ok(n)
+    }
+
+    /// File ids eligible for one-click / batch organize (not missing)
+    pub fn list_organizable_file_ids(&self) -> SqliteResult<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM Files WHERE status != ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![file_status::missing], |row| row.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn update_file_status(&self, file_id: i64, status: &str) -> SqliteResult<()> {
@@ -949,6 +1036,40 @@ mod tests {
         db.delete_file_record(id).expect("delete");
         assert_eq!(db.count_files().expect("count"), 0);
         assert!(db.get_metadata(id).expect("meta").is_none());
+    }
+
+    #[test]
+    fn error_log_insert_list_and_clear() {
+        let db = open_memory_db();
+        let id = db.insert_file("/tmp/err.mp4", 1, None).expect("insert");
+        db.insert_error_log(
+            "scrape",
+            Some(id),
+            Some("/tmp/err.mp4"),
+            "scrape failed",
+            Some("detail line"),
+        )
+        .expect("log");
+        db.insert_error_log("ffmpeg", None, None, "ffmpeg missing", None)
+            .expect("log2");
+        let logs = db.list_error_logs(10).expect("list");
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0].category, "ffmpeg");
+        assert_eq!(logs[1].category, "scrape");
+        assert_eq!(logs[1].file_id, Some(id));
+        let cleared = db.clear_error_logs().expect("clear");
+        assert_eq!(cleared, 2);
+        assert!(db.list_error_logs(10).expect("list2").is_empty());
+    }
+
+    #[test]
+    fn list_organizable_skips_missing() {
+        let db = open_memory_db();
+        let a = db.insert_file("/tmp/a.mp4", 1, None).expect("a");
+        let b = db.insert_file("/tmp/b.mp4", 1, None).expect("b");
+        db.update_file_status(b, file_status::missing).expect("miss");
+        let ids = db.list_organizable_file_ids().expect("list");
+        assert_eq!(ids, vec![a]);
     }
 }
 
