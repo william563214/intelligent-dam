@@ -1,6 +1,7 @@
 mod database;
 mod scanner;
 mod ffmpeg;
+mod phash;
 mod scraper;
 mod settings;
 mod commands;

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 pub async fn generate_thumbnail(
@@ -73,7 +73,7 @@ pub async fn generate_sprite_sheet(
     Ok(vtt_path.to_str().unwrap().to_string())
 }
 
-fn get_video_duration(video_path: &Path) -> Result<f64> {
+pub fn get_video_duration(video_path: &Path) -> Result<f64> {
     let output = Command::new("ffprobe")
         .arg("-v")
         .arg("error")
@@ -96,6 +96,41 @@ fn get_video_duration(video_path: &Path) -> Result<f64> {
         .with_context(|| format!("Failed to parse duration: {}", duration_str))?;
 
     Ok(duration)
+}
+
+/// Extract a single scaled frame at `timestamp` seconds (accurate seek).
+pub fn extract_frame_at(
+    video_path: &Path,
+    output_path: &Path,
+    timestamp: f64,
+    width: u32,
+) -> Result<()> {
+    let timestamp_str = format!("{:.3}", timestamp.max(0.0));
+    let scale = format!("scale={}:-1", width);
+
+    let output = Command::new("ffmpeg")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-ss")
+        .arg(&timestamp_str)
+        .arg("-i")
+        .arg(video_path.to_str().unwrap())
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-vf")
+        .arg(&scale)
+        .arg("-y")
+        .arg(output_path.to_str().unwrap())
+        .output()
+        .with_context(|| "Failed to execute ffmpeg for frame extract")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("FFmpeg frame extract failed: {}", stderr);
+    }
+
+    Ok(())
 }
 
 fn generate_vtt_file(

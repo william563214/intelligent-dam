@@ -1,4 +1,5 @@
-use crate::database::{Database, FileRecord};
+use crate::database::Database;
+use crate::phash;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -10,11 +11,20 @@ pub struct ScannedFile {
     pub phash: Option<String>,
 }
 
+/// File row that still needs ffmpeg phash (computed outside DB lock).
+#[derive(Debug, Clone)]
+pub struct PhashJob {
+    pub file_id: i64,
+    pub path: PathBuf,
+}
+
 // 支援的影片副檔名
-const VIDEO_EXTENSIONS: &[&str] = &[
+#[allow(non_upper_case_globals)]
+const video_extensions: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg",
 ];
 
+/// Walk a directory and collect video files. No DB and no ffmpeg.
 pub fn scan_directory<P: AsRef<Path>>(path: P) -> Result<Vec<ScannedFile>> {
     let mut files = Vec::new();
 
@@ -24,18 +34,17 @@ pub fn scan_directory<P: AsRef<Path>>(path: P) -> Result<Vec<ScannedFile>> {
         .filter(|e| e.file_type().is_file())
     {
         let path = entry.path();
-        
-        // 檢查是否為影片檔案
+
         if let Some(ext) = path.extension() {
             if let Some(ext_str) = ext.to_str() {
-                if VIDEO_EXTENSIONS.contains(&ext_str.to_lowercase().as_str()) {
+                if video_extensions.contains(&ext_str.to_lowercase().as_str()) {
                     let metadata = std::fs::metadata(path)
                         .with_context(|| format!("Failed to read metadata for {:?}", path))?;
-                    
+
                     files.push(ScannedFile {
                         path: path.to_path_buf(),
                         size: metadata.len(),
-                        phash: None, // 將在後續步驟計算
+                        phash: None,
                     });
                 }
             }
@@ -45,84 +54,302 @@ pub fn scan_directory<P: AsRef<Path>>(path: P) -> Result<Vec<ScannedFile>> {
     Ok(files)
 }
 
-pub fn calculate_phash(file_path: &Path) -> Result<String> {
-    // 使用簡單的檔案大小和修改時間作為快速 Hash
-    // 未來可以整合真正的感知 Hash 庫
-    let metadata = std::fs::metadata(file_path)
-        .with_context(|| format!("Failed to read metadata for {:?}", file_path))?;
-    
-    let modified = metadata.modified()
-        .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    
-    // 簡單的 Hash：size + modified_time
-    let hash_input = format!("{}_{}", metadata.len(), modified);
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    hash_input.hash(&mut hasher);
-    Ok(format!("{:x}", hasher.finish()))
-}
-
-pub fn import_files(db: &Database, files: Vec<ScannedFile>) -> Result<Vec<i64>> {
-    let mut imported_ids = Vec::new();
-
-    for file in files {
-        // 計算 Hash（如果還沒有）
-        let phash = if file.phash.is_none() {
-            calculate_phash(&file.path).ok()
-        } else {
-            file.phash.clone()
-        };
-
-        // 插入資料庫
-        match db.insert_file(
-            file.path.to_str().unwrap(),
-            file.size,
-            phash,
-        ) {
-            Ok(id) => {
-                imported_ids.push(id);
-            }
-            Err(e) => {
-                eprintln!("Failed to import file {:?}: {}", file.path, e);
-                // 繼續處理其他檔案
-            }
-        }
-    }
-
-    Ok(imported_ids)
-}
-
-pub fn scan_and_import<P: AsRef<Path>>(
-    db: &Database,
-    path: P,
-) -> Result<Vec<i64>> {
-    let scanned_files = scan_directory(path)?;
-    import_files(db, scanned_files)
-}
-
-/// 掃描多個目錄並匯入
-pub fn scan_multiple_directories(
-    db: &Database,
-    paths: Vec<String>,
-) -> Result<Vec<i64>> {
-    let mut all_imported_ids = Vec::new();
-
+/// Walk multiple directories. Continues on per-directory errors.
+pub fn scan_directories(paths: &[String]) -> Vec<ScannedFile> {
+    let mut all = Vec::new();
     for path in paths {
-        match scan_and_import(db, &path) {
-            Ok(ids) => {
-                all_imported_ids.extend(ids);
-            }
+        match scan_directory(path) {
+            Ok(files) => all.extend(files),
             Err(e) => {
                 eprintln!("Failed to scan directory {}: {}", path, e);
-                // 繼續掃描其他目錄，不中斷整個流程
             }
         }
     }
-
-    Ok(all_imported_ids)
+    all
 }
 
+/// Compute perceptual hash for a video file (ffmpeg). Safe outside DB lock.
+pub fn calculate_phash(file_path: &Path) -> Result<String> {
+    phash::calculate_video_phash(file_path)
+}
+
+/// Short-lock friendly insert: write rows without waiting on ffmpeg.
+/// Returns imported ids and jobs for files that still lack a phash.
+pub fn import_files_pending_phash(
+    db: &Database,
+    files: &[ScannedFile],
+) -> Result<(Vec<i64>, Vec<PhashJob>)> {
+    let mut imported_ids = Vec::new();
+    let mut jobs = Vec::new();
+
+    for file in files {
+        let path_str = match file.path.to_str() {
+            Some(s) => s,
+            None => {
+                eprintln!("Failed to import file {:?}: non-utf8 path", file.path);
+                continue;
+            }
+        };
+
+        let insert_phash = file
+            .phash
+            .clone()
+            .filter(|h| !h.trim().is_empty());
+
+        if let Err(e) = db.insert_file(path_str, file.size, insert_phash) {
+            eprintln!("Failed to import file {:?}: {}", file.path, e);
+            continue;
+        }
+
+        let record = match db.get_file_by_path(path_str) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                eprintln!("Failed to read back imported file {}", path_str);
+                continue;
+            }
+            Err(e) => {
+                eprintln!("Failed to read back imported file {}: {}", path_str, e);
+                continue;
+            }
+        };
+
+        imported_ids.push(record.id);
+
+        let needs_phash = record
+            .phash
+            .as_ref()
+            .map(|h| h.trim().is_empty())
+            .unwrap_or(true);
+        if needs_phash {
+            jobs.push(PhashJob {
+                file_id: record.id,
+                path: file.path.clone(),
+            });
+        }
+    }
+
+    Ok((imported_ids, jobs))
+}
+
+/// Run ffmpeg phash for pending jobs. No DB access.
+pub fn compute_phash_jobs(jobs: Vec<PhashJob>) -> Vec<(i64, Option<String>)> {
+    let mut results = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let hash = match calculate_phash(&job.path) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                eprintln!(
+                    "phash skipped for {:?}: {:#} (import continues without phash)",
+                    job.path, e
+                );
+                None
+            }
+        };
+        results.push((job.file_id, hash));
+    }
+    results
+}
+
+/// Short-lock friendly write-back of computed phashes.
+pub fn write_phashes(db: &Database, results: &[(i64, Option<String>)]) -> Result<()> {
+    for (file_id, phash) in results {
+        if let Some(hash) = phash {
+            if let Err(e) = db.update_file_phash(*file_id, hash) {
+                eprintln!("Failed to write phash for file_id {}: {}", file_id, e);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn open_memory_db() -> Database {
+        Database::new(":memory:").expect("open memory db")
+    }
+
+    fn make_test_clip(dir: &Path) -> PathBuf {
+        let video = dir.join("sample.mp4");
+        let status = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=10",
+                "-t",
+                "2",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&video)
+            .status()
+            .expect("spawn ffmpeg");
+        assert!(status.success());
+        video
+    }
+
+    #[test]
+    fn import_records_phash_when_computable() {
+        if !crate::ffmpeg::check_ffmpeg_available() {
+            eprintln!("skip: ffmpeg unavailable");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "idam-scan-phash-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let video = make_test_clip(&dir);
+
+        let db = open_memory_db();
+        let size = fs::metadata(&video).unwrap().len();
+        let scanned = vec![ScannedFile {
+            path: video.clone(),
+            size,
+            phash: None,
+        }];
+
+        let (ids, jobs) = import_files_pending_phash(&db, &scanned).expect("import");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(jobs.len(), 1);
+
+        let results = compute_phash_jobs(jobs);
+        write_phashes(&db, &results).expect("write");
+
+        let record = db.get_file_by_id(ids[0]).expect("get file");
+        let hash = record.phash.expect("phash should be set");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_continues_when_phash_fails() {
+        let db = open_memory_db();
+        let missing = PathBuf::from("/tmp/idam-missing-for-phash-scan.mp4");
+        let scanned = vec![ScannedFile {
+            path: missing,
+            size: 1,
+            phash: None,
+        }];
+
+        let (ids, jobs) = import_files_pending_phash(&db, &scanned).expect("import");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(jobs.len(), 1);
+
+        let results = compute_phash_jobs(jobs);
+        write_phashes(&db, &results).expect("write");
+
+        let record = db.get_file_by_id(ids[0]).expect("get file");
+        assert!(record.phash.is_none());
+    }
+
+    #[test]
+    fn import_preserves_precomputed_phash() {
+        let db = open_memory_db();
+        let scanned = vec![ScannedFile {
+            path: PathBuf::from("/tmp/prehashed.mp4"),
+            size: 42,
+            phash: Some("abcdef0123456789".to_string()),
+        }];
+        let (ids, jobs) = import_files_pending_phash(&db, &scanned).expect("import");
+        assert!(jobs.is_empty());
+        let record = db.get_file_by_id(ids[0]).expect("get");
+        assert_eq!(record.phash.as_deref(), Some("abcdef0123456789"));
+    }
+
+    #[test]
+    fn rescan_skips_phash_job_when_hash_already_stored() {
+        let db = open_memory_db();
+        db.insert_file("/tmp/already.mp4", 10, Some("1122334455667788".into()))
+            .expect("seed");
+
+        let scanned = vec![ScannedFile {
+            path: PathBuf::from("/tmp/already.mp4"),
+            size: 11,
+            phash: None,
+        }];
+        let (ids, jobs) = import_files_pending_phash(&db, &scanned).expect("import");
+        assert_eq!(ids.len(), 1);
+        assert!(jobs.is_empty());
+        let record = db.get_file_by_id(ids[0]).expect("get");
+        assert_eq!(record.phash.as_deref(), Some("1122334455667788"));
+    }
+
+    /// Guardrail: pending import + write-back must not hold the DB mutex across ffmpeg.
+    #[test]
+    fn phash_compute_does_not_require_db_lock() {
+        if !crate::ffmpeg::check_ffmpeg_available() {
+            eprintln!("skip: ffmpeg unavailable");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "idam-scan-unlock-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let video = make_test_clip(&dir);
+        let size = fs::metadata(&video).unwrap().len();
+
+        let db = Arc::new(Mutex::new(open_memory_db()));
+        let scanned = vec![ScannedFile {
+            path: video,
+            size,
+            phash: None,
+        }];
+
+        let (ids, jobs) = {
+            let guard = db.lock().expect("lock");
+            import_files_pending_phash(&guard, &scanned).expect("import")
+        };
+        assert_eq!(jobs.len(), 1);
+
+        // Hold the lock on another "thread" of execution while phash runs.
+        // If compute_phash_jobs needed the mutex it would block forever.
+        let db_held = Arc::clone(&db);
+        let hold = std::thread::spawn(move || {
+            let _guard = db_held.lock().expect("hold lock");
+            std::thread::sleep(Duration::from_millis(200));
+        });
+
+        // Give the holder a moment to acquire
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        let results = compute_phash_jobs(jobs);
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "phash must not block on DB mutex"
+        );
+        hold.join().expect("holder");
+
+        {
+            let guard = db.lock().expect("lock");
+            write_phashes(&guard, &results).expect("write");
+            let record = guard.get_file_by_id(ids[0]).expect("get");
+            assert!(record.phash.is_some());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
