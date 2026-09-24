@@ -13,9 +13,9 @@
 //!
 //! New video paths are enqueued on an internal channel. The worker waits for
 //! write stability (no DB lock), then registers the file (short lock), emits
-//! `watcher-file-detected`, and runs the automatic pipeline
-//! (scrape → Handlebars move → preview) when enabled. Destinations produced by
-//! the pipeline are suppressed so recursive watch trees do not re-ingest them;
+//! `watcher-file-detected`, and submits phash / pipeline work to the shared
+//! [`TaskQueue`] (bounded concurrency, same-file serial). Destinations produced
+//! by the pipeline are suppressed so recursive watch trees do not re-ingest them;
 //! already-scraped library rows skip scrape on any residual events.
 
 use crate::database::Database;
@@ -23,6 +23,7 @@ use crate::file_stability::{self, StabilityError, StabilityOptions};
 use crate::path_suppression::PathSuppression;
 use crate::pipeline::{self, PipelineOptions};
 use crate::scanner::{self, ScannedFile};
+use crate::task_queue::TaskQueue;
 use anyhow::{Context, Result};
 use notify::event::{CreateKind, Event, EventKind, ModifyKind, RenameMode};
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
@@ -241,6 +242,7 @@ impl WatcherManager {
         paths: Vec<PathBuf>,
         app: AppHandle,
         db: Arc<Mutex<Database>>,
+        queue: Arc<TaskQueue>,
     ) -> Result<WatcherStatus> {
         if paths.is_empty() {
             anyhow::bail!("No valid watch directories (configure scan directories in settings)");
@@ -276,10 +278,17 @@ impl WatcherManager {
 
         let worker_stop = Arc::clone(&stop_flag);
         let suppressions = Arc::new(PathSuppression::default());
+        queue
+            .bind_and_start(app.clone(), Arc::clone(&db), Arc::clone(&suppressions))
+            .map_err(|e| anyhow::anyhow!("Failed to bind task queue: {}", e))?;
+
         let worker_suppressions = Arc::clone(&suppressions);
+        let worker_queue = Arc::clone(&queue);
         let worker = thread::Builder::new()
             .name("dam-watcher-ingest".into())
-            .spawn(move || ingest_worker(rx, worker_stop, app, db, worker_suppressions))
+            .spawn(move || {
+                ingest_worker(rx, worker_stop, app, db, worker_suppressions, worker_queue)
+            })
             .context("Failed to spawn watcher ingest worker")?;
 
         let mut guard = self
@@ -314,6 +323,7 @@ fn ingest_worker(
     app: AppHandle,
     db: Arc<Mutex<Database>>,
     suppressions: Arc<PathSuppression>,
+    queue: Arc<TaskQueue>,
 ) {
     let mut recent: VecDeque<(String, Instant)> = VecDeque::new();
 
@@ -419,25 +429,23 @@ fn ingest_worker(
             },
         );
 
-        // Optional lightweight phash outside the mutex (same pattern as scan)
-        if !jobs.is_empty() {
-            if stop_flag.load(Ordering::SeqCst) {
-                break;
-            }
-            let results = scanner::compute_phash_jobs(jobs);
-            if stop_flag.load(Ordering::SeqCst) {
-                break;
-            }
-            if let Ok(db_guard) = db.lock() {
-                let _ = scanner::write_phashes(&db_guard, &results);
-            }
-        }
-
-        // Automatic pipeline scrape → move → preview (isolated failures)
+        // Submit phash then pipeline to the shared queue (same-file serial FIFO)
         if let Some(id) = file_id {
             if stop_flag.load(Ordering::SeqCst) {
                 break;
             }
+
+            for job in jobs {
+                match queue.enqueue_phash(job, Some(Arc::clone(&stop_flag))) {
+                    Ok(job_id) => {
+                        eprintln!("watcher: enqueued phash job {} for file {}", job_id, id);
+                    }
+                    Err(e) => {
+                        eprintln!("watcher: failed to enqueue phash for file {}: {}", id, e);
+                    }
+                }
+            }
+
             let base_options = PipelineOptions::from_env();
             if base_options.is_noop() {
                 continue;
@@ -449,7 +457,7 @@ fn ingest_worker(
                 let db_guard = match db.lock() {
                     Ok(g) => g,
                     Err(e) => {
-                        eprintln!("watcher: db lock error before pipeline: {}", e);
+                        eprintln!("watcher: db lock error before pipeline enqueue: {}", e);
                         continue;
                     }
                 };
@@ -467,41 +475,23 @@ fn ingest_worker(
 
             if options.is_noop() {
                 eprintln!(
-                    "watcher: skip pipeline for already-organized file {}",
+                    "watcher: skip pipeline enqueue for already-organized file {}",
                     id
                 );
                 continue;
             }
 
-            // Catch panics / errors so one file cannot kill the worker
-            let pipeline_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pipeline::run_for_file(
-                    &app,
-                    &db,
-                    id,
-                    &options,
-                    Some(&stop_flag),
-                    Some(suppressions.as_ref()),
-                )
-            }));
-            match pipeline_result {
-                Ok(result) => {
-                    if result.aborted {
-                        eprintln!("watcher: pipeline aborted by stop for file {}", id);
-                        break;
-                    }
-                    if !result.errors.is_empty() {
-                        eprintln!(
-                            "watcher: pipeline completed with errors for file {}: {}",
-                            id,
-                            result.errors.join("; ")
-                        );
-                    }
-                }
-                Err(panic_payload) => {
+            match queue.enqueue_pipeline(id, options, Some(Arc::clone(&stop_flag))) {
+                Ok(job_id) => {
                     eprintln!(
-                        "watcher: pipeline panicked for file {}: {:?}",
-                        id, panic_payload
+                        "watcher: enqueued pipeline job {} for file {}",
+                        job_id, id
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "watcher: failed to enqueue pipeline for file {}: {}",
+                        id, e
                     );
                 }
             }

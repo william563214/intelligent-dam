@@ -74,3 +74,36 @@ export interface PipelineProgressEvent {
   newPath: string | null;
 }
 
+/** Progress from background task queue (phash / pipeline jobs) */
+export interface TaskQueueProgressEvent {
+  jobId: number;
+  fileId: number;
+  /** pipeline | phash */
+  kind: string;
+  /** queued | running | succeeded | failed | cancelled */
+  state: string;
+  attempt: number;
+  message: string | null;
+  retryable: boolean;
+}
+
+export interface TaskQueueJobView {
+  jobId: number;
+  fileId: number;
+  kind: string;
+  state: string;
+  attempt: number;
+  maxAttempts: number;
+  error: string | null;
+  retryable: boolean;
+}
+
+export interface TaskQueueStatus {
+  concurrency: number;
+  pending: number;
+  running: number;
+  failed: number;
+  succeeded: number;
+  jobs: TaskQueueJobView[];
+}
+
