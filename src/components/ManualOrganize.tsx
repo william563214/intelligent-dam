@@ -48,21 +48,8 @@ export default function ManualOrganize() {
 
     try {
       setScraping(true);
-      // 從 localStorage 讀取設定
-      const saved = localStorage.getItem("intelligent_dam_settings");
-      let avdcPath: string | undefined;
-      let stashdbUrl: string | undefined;
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved);
-          avdcPath = parsed.avdcPath || undefined;
-          stashdbUrl = parsed.stashdbUrl || undefined;
-        } catch (e) {
-          console.error("Failed to parse settings:", e);
-        }
-      }
-      
-      const result = await scrapeFile(selectedFile.file.id, avdcPath, stashdbUrl);
+      // 由 Rust 端讀取持久化設定（AVDC / StashDB）
+      const result = await scrapeFile(selectedFile.file.id);
       if (result.success && result.metadata) {
         setFormData(result.metadata);
         await loadFiles();

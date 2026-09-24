@@ -2,6 +2,7 @@ use crate::database::{Database, FileWithMetadata, Metadata};
 use crate::ffmpeg;
 use crate::scanner;
 use crate::scraper::{scrape_metadata, to_database_metadata};
+use crate::settings::{AppSettings, SettingsStore};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -68,12 +69,68 @@ pub async fn get_all_files_command(
 }
 
 #[tauri::command]
+pub fn get_settings_command(
+    settings_store: State<'_, Mutex<SettingsStore>>,
+) -> Result<AppSettings, String> {
+    let store = settings_store
+        .lock()
+        .map_err(|e| format!("Settings lock error: {}", e))?;
+    store
+        .load()
+        .map_err(|e| format!("Failed to load settings: {}", e))
+}
+
+#[tauri::command]
+pub fn save_settings_command(
+    settings: AppSettings,
+    settings_store: State<'_, Mutex<SettingsStore>>,
+) -> Result<(), String> {
+    let store = settings_store
+        .lock()
+        .map_err(|e| format!("Settings lock error: {}", e))?;
+    store
+        .save(&settings)
+        .map_err(|e| format!("Failed to save settings: {}", e))
+}
+
+#[tauri::command]
 pub async fn scrape_file_command(
     file_id: i64,
     avdc_path: Option<String>,
     stashdb_url: Option<String>,
     db: State<'_, Mutex<Database>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<ScrapeResult, String> {
+    // 未傳入時改讀持久化設定 讓 Rust 端可取得完整設定
+    let persisted = {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .load()
+            .map_err(|e| format!("Failed to load settings: {}", e))?
+    };
+    let resolved_avdc = avdc_path
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let path = persisted.avdc_path.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        });
+    let resolved_stashdb = stashdb_url
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            let url = persisted.stashdb_url.trim();
+            if url.is_empty() {
+                None
+            } else {
+                Some(url.to_string())
+            }
+        });
+
     // 獲取檔案資訊（在 await 之前完成）
     let (file_path, phash) = {
         let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
@@ -86,8 +143,8 @@ pub async fn scrape_file_command(
     match scrape_metadata(
         &file_path,
         phash,
-        avdc_path.as_deref(),
-        stashdb_url.as_deref(),
+        resolved_avdc.as_deref(),
+        resolved_stashdb.as_deref(),
     ).await {
         Ok((scraped_meta, source_type)) => {
             // 轉換為資料庫格式
