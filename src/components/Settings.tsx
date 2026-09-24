@@ -1,11 +1,15 @@
 import { useState, useEffect } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   scanMultipleDirectories,
   checkFFmpegAvailable,
   getSettings,
   saveSettings,
+  startWatcher,
+  stopWatcher,
+  getWatcherStatus,
 } from "../api";
-import type { AppSettings } from "../types";
+import type { AppSettings, WatcherFileEvent, WatcherStatus } from "../types";
 
 const default_settings: AppSettings = {
   scanDirectories: [],
@@ -25,10 +29,43 @@ export default function Settings() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [watcherStatus, setWatcherStatus] = useState<WatcherStatus>({
+    running: false,
+    watchedPaths: [],
+  });
+  const [watcherBusy, setWatcherBusy] = useState(false);
+  const [watcherMessage, setWatcherMessage] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings();
     checkFFmpeg();
+    refreshWatcherStatus();
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<WatcherFileEvent>("watcher-file-detected", (event) => {
+      const payload = event.payload;
+      if (payload.error) {
+        setWatcherMessage(`偵測失敗: ${payload.path} (${payload.error})`);
+        return;
+      }
+      setWatcherMessage(
+        `偵測到新檔 (${payload.kind}): ${payload.path}` +
+          (payload.fileId != null ? ` #${payload.fileId}` : "")
+      );
+    })
+      .then((fn) => {
+        unlisten = fn;
+      })
+      .catch((err) => {
+        console.error("Failed to listen watcher events:", err);
+      });
+    return () => {
+      if (unlisten) {
+        unlisten();
+      }
+    };
   }, []);
 
   const migrateLegacySettings = async (
@@ -98,6 +135,7 @@ export default function Settings() {
       setSaving(true);
       await saveSettings(settings);
       localStorage.removeItem(legacy_settings_key);
+      await refreshWatcherStatus();
       alert("設定已儲存！");
     } catch (e) {
       alert(`儲存失敗: ${e instanceof Error ? e.message : "未知錯誤"}`);
@@ -113,6 +151,57 @@ export default function Settings() {
     } catch (err) {
       console.error("Failed to check FFmpeg:", err);
       setFFmpegAvailable(false);
+    }
+  };
+
+  const refreshWatcherStatus = async () => {
+    try {
+      const status = await getWatcherStatus();
+      setWatcherStatus(status);
+    } catch (err) {
+      console.error("Failed to get watcher status:", err);
+    }
+  };
+
+  const handleStartWatcher = async () => {
+    if (loadError) {
+      alert("設定載入失敗 請先重新載入");
+      return;
+    }
+    if (settings.scanDirectories.length === 0) {
+      alert("請先添加至少一個掃描目錄");
+      return;
+    }
+    try {
+      setWatcherBusy(true);
+      setWatcherMessage(null);
+      await saveSettings(settings);
+      const status = await startWatcher();
+      setWatcherStatus(status);
+      setWatcherMessage(
+        `監控已啟動 (${status.watchedPaths.length} 個目錄)`
+      );
+    } catch (err) {
+      setWatcherMessage(
+        `啟動失敗: ${err instanceof Error ? err.message : String(err)}`
+      );
+    } finally {
+      setWatcherBusy(false);
+    }
+  };
+
+  const handleStopWatcher = async () => {
+    try {
+      setWatcherBusy(true);
+      const status = await stopWatcher();
+      setWatcherStatus(status);
+      setWatcherMessage("監控已停止");
+    } catch (err) {
+      setWatcherMessage(
+        `停止失敗: ${err instanceof Error ? err.message : String(err)}`
+      );
+    } finally {
+      setWatcherBusy(false);
     }
   };
 
@@ -258,6 +347,69 @@ export default function Settings() {
           )}
           <p className="mt-1 text-xs text-gray-500">
             可以添加多個目錄，系統會遞迴掃描每個目錄及其所有子資料夾
+          </p>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            目錄監控 (Watcher)
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleStartWatcher}
+              disabled={
+                watcherBusy ||
+                !!loadError ||
+                watcherStatus.running ||
+                settings.scanDirectories.length === 0
+              }
+              className="px-4 py-2 bg-emerald-600 text-white rounded hover:bg-emerald-700 disabled:bg-gray-400"
+            >
+              {watcherBusy && !watcherStatus.running
+                ? "啟動中..."
+                : "開始監控"}
+            </button>
+            <button
+              type="button"
+              onClick={handleStopWatcher}
+              disabled={watcherBusy || !watcherStatus.running}
+              className="px-4 py-2 bg-gray-700 text-white rounded hover:bg-gray-800 disabled:bg-gray-400"
+            >
+              {watcherBusy && watcherStatus.running ? "停止中..." : "停止監控"}
+            </button>
+            <button
+              type="button"
+              onClick={refreshWatcherStatus}
+              className="px-3 py-2 text-sm bg-gray-200 rounded hover:bg-gray-300"
+            >
+              重新整理狀態
+            </button>
+            <span
+              className={`text-sm ${
+                watcherStatus.running ? "text-emerald-600" : "text-gray-500"
+              }`}
+            >
+              {watcherStatus.running
+                ? `監控中 (${watcherStatus.watchedPaths.length})`
+                : "未監控"}
+            </span>
+          </div>
+          {watcherStatus.running && watcherStatus.watchedPaths.length > 0 && (
+            <ul className="mt-2 space-y-1 text-xs text-gray-600">
+              {watcherStatus.watchedPaths.map((dir) => (
+                <li key={dir} className="truncate">
+                  {dir}
+                </li>
+              ))}
+            </ul>
+          )}
+          {watcherMessage && (
+            <p className="mt-2 text-sm text-gray-700">{watcherMessage}</p>
+          )}
+          <p className="mt-1 text-xs text-gray-500">
+            使用設定中的掃描目錄；偵測 Created / Moved 的影片後會入庫並送出
+            watcher-file-detected 事件（完整刮削搬運流程另案實作）
           </p>
         </div>
 
