@@ -1,7 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppSettings,
+  ConnectivityReport,
+  EnqueueResult,
+  ErrorLogEntry,
   FileWithMetadata,
+  PipelineOptionsInput,
   ScanResult,
   ScrapeResult,
   Metadata,
@@ -83,3 +87,29 @@ export async function retryTask(jobId: number): Promise<number> {
   return await invoke("retry_task_command", { jobId });
 }
 
+export async function testConnectivity(): Promise<ConnectivityReport> {
+  return await invoke("test_connectivity_command");
+}
+
+export async function getErrorLogs(limit?: number): Promise<ErrorLogEntry[]> {
+  return await invoke("get_error_logs_command", { limit });
+}
+
+export async function clearErrorLogs(): Promise<number> {
+  return await invoke("clear_error_logs_command");
+}
+
+export async function enqueuePipelineJobs(
+  fileIds: number[],
+  options?: PipelineOptionsInput
+): Promise<EnqueueResult> {
+  return await invoke("enqueue_pipeline_jobs_command", { fileIds, options });
+}
+
+export async function organizeEligibleFiles(): Promise<EnqueueResult> {
+  return await invoke("organize_eligible_files_command");
+}
+
+export async function canonicalizePath(path: string): Promise<string> {
+  return await invoke("canonicalize_path_command", { path });
+}

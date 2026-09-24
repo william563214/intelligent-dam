@@ -1,11 +1,13 @@
-use crate::database::{Database, FileWithMetadata, Metadata, Tag};
+use crate::connectivity::{self, ConnectivityReport};
+use crate::database::{Database, ErrorLogEntry, FileWithMetadata, Metadata, Tag};
 use crate::ffmpeg;
 use crate::file_status;
+use crate::pipeline::PipelineOptions;
 use crate::scanner;
 use crate::scraper::{scrape_metadata, to_database_metadata};
 use crate::settings::{AppSettings, SettingsStore};
-use crate::watcher::{self, WatcherManager, WatcherStatus};
 use crate::task_queue::{TaskQueue, TaskQueueStatus};
+use crate::watcher::{self, WatcherManager, WatcherStatus};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -24,6 +26,99 @@ pub struct ScrapeResult {
     pub metadata: Option<Metadata>,
     pub tags: Option<Vec<Tag>>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineOptionsInput {
+    pub enable_scrape: Option<bool>,
+    pub enable_move: Option<bool>,
+    pub enable_preview: Option<bool>,
+}
+
+impl PipelineOptionsInput {
+    fn into_options(self) -> PipelineOptions {
+        PipelineOptions {
+            enable_scrape: self.enable_scrape.unwrap_or(true),
+            enable_move: self.enable_move.unwrap_or(true),
+            enable_preview: self.enable_preview.unwrap_or(true),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueResult {
+    pub job_ids: Vec<u64>,
+    pub enqueued: usize,
+    pub skipped: usize,
+}
+
+/// Cap one-click / batch enqueue size to avoid unbounded queue growth
+#[allow(non_upper_case_globals)]
+const max_batch_enqueue: usize = 500;
+
+#[allow(non_upper_case_globals)]
+const env_max_batch_enqueue: &str = "IDAM_MAX_BATCH_ENQUEUE";
+
+fn batch_enqueue_limit() -> usize {
+    match std::env::var(env_max_batch_enqueue) {
+        Ok(v) => v.trim().parse::<usize>().unwrap_or(max_batch_enqueue).max(1),
+        Err(_) => max_batch_enqueue,
+    }
+}
+
+/// Resolve a user-picked path to an absolute canonical form when possible
+pub fn canonicalize_user_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    match std::path::Path::new(trimmed).canonicalize() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => trimmed.to_string(),
+    }
+}
+
+fn normalize_scan_directories(dirs: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let canon = canonicalize_user_path(dir);
+        if canon.is_empty() {
+            continue;
+        }
+        if out.iter().any(|existing: &String| {
+            existing == &canon
+                || std::path::Path::new(existing) == std::path::Path::new(&canon)
+        }) {
+            continue;
+        }
+        out.push(canon);
+    }
+    out
+}
+
+fn ensure_queue_ready(
+    queue: &TaskQueue,
+    app: &AppHandle,
+    db: &Arc<Mutex<Database>>,
+) -> Result<(), String> {
+    let suppressions = queue.path_suppressions()?;
+    queue.bind_and_start(app.clone(), Arc::clone(db), suppressions)
+}
+
+fn log_command_error(
+    db: &Arc<Mutex<Database>>,
+    category: &str,
+    file_id: Option<i64>,
+    path: Option<&str>,
+    message: &str,
+) {
+    if let Ok(guard) = db.lock() {
+        if let Err(e) = guard.insert_error_log(category, file_id, path, message, None) {
+            eprintln!("commands: failed to write ErrorLog: {}", e);
+        }
+    }
 }
 
 #[tauri::command]
@@ -161,13 +256,18 @@ pub fn get_settings_command(
 
 #[tauri::command]
 pub async fn save_settings_command(
-    settings: AppSettings,
+    mut settings: AppSettings,
     settings_store: State<'_, Mutex<SettingsStore>>,
     watcher: State<'_, WatcherManager>,
     queue: State<'_, Arc<TaskQueue>>,
     app: AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<(), String> {
+    settings.scan_directories = normalize_scan_directories(&settings.scan_directories);
+    if !settings.avdc_path.trim().is_empty() {
+        settings.avdc_path = canonicalize_user_path(&settings.avdc_path);
+    }
+
     {
         let store = settings_store
             .lock()
@@ -378,6 +478,13 @@ pub async fn scrape_file_command(
                             scrape_error, status_err
                         )
                     })?;
+                let _ = db.insert_error_log(
+                    "scrape",
+                    Some(file_id),
+                    Some(&file_path.to_string_lossy()),
+                    &scrape_error,
+                    None,
+                );
             }
 
             Ok(ScrapeResult {
@@ -392,7 +499,7 @@ pub async fn scrape_file_command(
 
 #[tauri::command]
 pub async fn update_file_metadata_command(
-    file_id: i64,
+    _file_id: i64,
     metadata: Metadata,
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<(), String> {
@@ -435,20 +542,30 @@ pub async fn generate_preview_command(
     {
         Ok(path) => path,
         Err(e) => {
-            let db = db.lock().map_err(|lock_err| {
-                format!(
-                    "Preview failed ({}); also failed to lock DB: {}",
-                    e, lock_err
-                )
-            })?;
-            db.update_file_status(file_id, &previous_status)
-                .map_err(|status_err| {
+            let err_msg = format!("Failed to generate sprite sheet: {}", e);
+            {
+                let db = db.lock().map_err(|lock_err| {
                     format!(
-                        "Preview failed ({}); also failed to restore status: {}",
-                        e, status_err
+                        "Preview failed ({}); also failed to lock DB: {}",
+                        e, lock_err
                     )
                 })?;
-            return Err(format!("Failed to generate sprite sheet: {}", e));
+                db.update_file_status(file_id, &previous_status)
+                    .map_err(|status_err| {
+                        format!(
+                            "Preview failed ({}); also failed to restore status: {}",
+                            e, status_err
+                        )
+                    })?;
+                let _ = db.insert_error_log(
+                    "ffmpeg",
+                    Some(file_id),
+                    Some(&file_path.to_string_lossy()),
+                    &err_msg,
+                    None,
+                );
+            }
+            return Err(err_msg);
         }
     };
     
@@ -515,5 +632,251 @@ pub async fn generate_thumbnail_command(
 #[tauri::command]
 pub fn check_ffmpeg_available_command() -> bool {
     ffmpeg::check_ffmpeg_available()
+}
+
+#[tauri::command]
+pub async fn test_connectivity_command(
+    settings_store: State<'_, Mutex<SettingsStore>>,
+) -> Result<ConnectivityReport, String> {
+    let settings = {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .load()
+            .map_err(|e| format!("Failed to load settings: {}", e))?
+    };
+    Ok(connectivity::check_all(&settings).await)
+}
+
+#[tauri::command]
+pub fn canonicalize_path_command(path: String) -> String {
+    canonicalize_user_path(&path)
+}
+
+#[tauri::command]
+pub fn get_error_logs_command(
+    limit: Option<i64>,
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Vec<ErrorLogEntry>, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.list_error_logs(limit.unwrap_or(100))
+        .map_err(|e| format!("Failed to list error logs: {}", e))
+}
+
+#[tauri::command]
+pub fn clear_error_logs_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<usize, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.clear_error_logs()
+        .map_err(|e| format!("Failed to clear error logs: {}", e))
+}
+
+/// Enqueue pipeline jobs for selected files through the existing task queue
+#[tauri::command]
+pub fn enqueue_pipeline_jobs_command(
+    file_ids: Vec<i64>,
+    options: Option<PipelineOptionsInput>,
+    app: AppHandle,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
+) -> Result<EnqueueResult, String> {
+    let base = options
+        .unwrap_or(PipelineOptionsInput {
+            enable_scrape: Some(true),
+            enable_move: Some(true),
+            enable_preview: Some(true),
+        })
+        .into_options();
+    let settings = {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .load()
+            .map_err(|e| format!("Failed to load settings: {}", e))?
+    };
+    enqueue_pipeline_jobs_inner(&app, &db, &queue, &settings, file_ids, base)
+}
+
+/// One-click organize: enqueue full pipeline for all non-missing library files
+#[tauri::command]
+pub fn organize_eligible_files_command(
+    app: AppHandle,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
+) -> Result<EnqueueResult, String> {
+    let settings = {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .load()
+            .map_err(|e| format!("Failed to load settings: {}", e))?
+    };
+    let file_ids = {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        guard
+            .list_organizable_file_ids()
+            .map_err(|e| format!("Failed to list files: {}", e))?
+    };
+
+    enqueue_pipeline_jobs_inner(
+        &app,
+        &db,
+        &queue,
+        &settings,
+        file_ids,
+        PipelineOptions::default(),
+    )
+}
+
+fn enqueue_pipeline_jobs_inner(
+    app: &AppHandle,
+    db: &Arc<Mutex<Database>>,
+    queue: &Arc<TaskQueue>,
+    settings: &AppSettings,
+    file_ids: Vec<i64>,
+    base: PipelineOptions,
+) -> Result<EnqueueResult, String> {
+    if file_ids.is_empty() {
+        return Ok(EnqueueResult {
+            job_ids: Vec::new(),
+            enqueued: 0,
+            skipped: 0,
+        });
+    }
+
+    ensure_queue_ready(queue, app, db)?;
+
+    if base.is_noop() {
+        return Err("Pipeline options disable all steps".to_string());
+    }
+
+    let limit = batch_enqueue_limit();
+    let mut job_ids = Vec::new();
+    let mut skipped = 0usize;
+
+    for file_id in file_ids {
+        if job_ids.len() >= limit {
+            skipped += 1;
+            continue;
+        }
+
+        let options = {
+            let guard = db
+                .lock()
+                .map_err(|e| format!("Database lock error: {}", e))?;
+            match guard.get_file_by_id(file_id) {
+                Ok(file) => {
+                    if file.status == file_status::missing {
+                        skipped += 1;
+                        continue;
+                    }
+                    if !std::path::Path::new(&file.path).exists() {
+                        let _ = guard.update_file_status(file_id, file_status::missing);
+                        skipped += 1;
+                        continue;
+                    }
+                    crate::pipeline::options_for_existing_file(
+                        &guard,
+                        file_id,
+                        &base,
+                        Some(settings),
+                    )
+                    .unwrap_or_else(|_| base.clone())
+                }
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        };
+
+        if options.is_noop() {
+            skipped += 1;
+            continue;
+        }
+
+        match queue.has_active_pipeline(file_id) {
+            Ok(true) => {
+                skipped += 1;
+                continue;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                log_command_error(
+                    db,
+                    "queue",
+                    Some(file_id),
+                    None,
+                    &format!("active pipeline check failed: {}", e),
+                );
+                skipped += 1;
+                continue;
+            }
+        }
+
+        match queue.enqueue_pipeline(file_id, options, None) {
+            Ok(id) => job_ids.push(id),
+            Err(e) => {
+                log_command_error(
+                    db,
+                    "queue",
+                    Some(file_id),
+                    None,
+                    &format!("enqueue failed: {}", e),
+                );
+                skipped += 1;
+            }
+        }
+    }
+
+    Ok(EnqueueResult {
+        enqueued: job_ids.len(),
+        skipped,
+        job_ids,
+    })
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{canonicalize_user_path, normalize_scan_directories};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn normalize_dedupes_canonical_paths() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "idam_canon_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let canon = canonicalize_user_path(dir.to_str().unwrap());
+        assert!(!canon.is_empty());
+        let dirs = vec![
+            dir.to_string_lossy().to_string(),
+            canon.clone(),
+            format!("{}/.", dir.display()),
+        ];
+        let normalized = normalize_scan_directories(&dirs);
+        assert_eq!(normalized.len(), 1, "{:?}", normalized);
+        assert_eq!(normalized[0], canon);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 

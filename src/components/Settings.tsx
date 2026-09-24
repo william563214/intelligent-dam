@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   scanMultipleDirectories,
   checkFFmpegAvailable,
@@ -10,9 +11,12 @@ import {
   getWatcherStatus,
   getTaskQueueStatus,
   retryTask,
+  testConnectivity,
+  canonicalizePath,
 } from "../api";
 import type {
   AppSettings,
+  ConnectivityReport,
   PipelineProgressEvent,
   TaskQueueProgressEvent,
   TaskQueueStatus,
@@ -46,6 +50,10 @@ export default function Settings() {
   const [watcherMessage, setWatcherMessage] = useState<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<TaskQueueStatus | null>(null);
   const [queueMessage, setQueueMessage] = useState<string | null>(null);
+  const [connectivity, setConnectivity] = useState<ConnectivityReport | null>(
+    null
+  );
+  const [connectivityBusy, setConnectivityBusy] = useState(false);
 
   useEffect(() => {
     loadSettings();
@@ -295,13 +303,111 @@ export default function Settings() {
     }
   };
 
-  const handleAddDirectory = () => {
-    if (newDirectory.trim() && !settings.scanDirectories.includes(newDirectory.trim())) {
+  const handleAddDirectory = async () => {
+    const raw = newDirectory.trim();
+    if (!raw) {
+      return;
+    }
+    let path = raw;
+    try {
+      path = await canonicalizePath(raw);
+    } catch (err) {
+      console.error("canonicalize failed", err);
+    }
+    if (!path) {
+      return;
+    }
+    if (settings.scanDirectories.includes(path)) {
+      alert("此目錄已在清單中");
+      setNewDirectory("");
+      return;
+    }
+    setSettings({
+      ...settings,
+      scanDirectories: [...settings.scanDirectories, path],
+    });
+    setNewDirectory("");
+  };
+
+  const handlePickDirectory = async () => {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "選擇掃描／監控目錄",
+      });
+      if (selected == null) {
+        return;
+      }
+      const raw = typeof selected === "string" ? selected : String(selected);
+      if (!raw.trim()) {
+        return;
+      }
+      let path = raw;
+      try {
+        path = await canonicalizePath(raw);
+      } catch (err) {
+        console.error("canonicalize failed", err);
+      }
+      if (settings.scanDirectories.includes(path)) {
+        alert("此目錄已在清單中");
+        return;
+      }
       setSettings({
         ...settings,
-        scanDirectories: [...settings.scanDirectories, newDirectory.trim()],
+        scanDirectories: [...settings.scanDirectories, path],
       });
-      setNewDirectory("");
+    } catch (err) {
+      alert(
+        `選擇資料夾失敗: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  };
+
+  const handlePickAvdc = async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        title: "選擇 AV_Data_Capture 腳本",
+        filters: [
+          { name: "Python", extensions: ["py"] },
+          { name: "All", extensions: ["*"] },
+        ],
+      });
+      if (selected == null) {
+        return;
+      }
+      const raw = typeof selected === "string" ? selected : String(selected);
+      let path = raw;
+      try {
+        path = await canonicalizePath(raw);
+      } catch (err) {
+        console.error("canonicalize failed", err);
+      }
+      setSettings({ ...settings, avdcPath: path });
+    } catch (err) {
+      alert(
+        `選擇檔案失敗: ${err instanceof Error ? err.message : String(err)}`
+      );
+    }
+  };
+
+  const handleTestConnectivity = async () => {
+    try {
+      setConnectivityBusy(true);
+      // 先把目前表單寫入 讓測試讀到最新路徑／URL
+      if (!loadError) {
+        await saveSettings(settings);
+      }
+      const report = await testConnectivity();
+      setConnectivity(report);
+      setFFmpegAvailable(report.ffmpeg.ok);
+    } catch (err) {
+      alert(
+        `連線測試失敗: ${err instanceof Error ? err.message : String(err)}`
+      );
+    } finally {
+      setConnectivityBusy(false);
     }
   };
 
@@ -380,12 +486,19 @@ export default function Settings() {
                 onChange={(e) => setNewDirectory(e.target.value)}
                 onKeyPress={(e) => {
                   if (e.key === "Enter") {
-                    handleAddDirectory();
+                    void handleAddDirectory();
                   }
                 }}
                 placeholder="例如: C:/Videos 或 /Users/username/Videos"
                 className="flex-1 px-3 py-2 border border-gray-300 rounded-md"
               />
+              <button
+                type="button"
+                onClick={() => void handlePickDirectory()}
+                className="px-4 py-2 bg-slate-600 text-white rounded hover:bg-slate-700"
+              >
+                瀏覽…
+              </button>
               <button
                 onClick={handleAddDirectory}
                 disabled={!newDirectory.trim()}
@@ -539,15 +652,24 @@ export default function Settings() {
           <label className="block text-sm font-medium text-gray-700 mb-2">
             AV_Data_Capture 路徑
           </label>
-          <input
-            type="text"
-            value={settings.avdcPath}
-            onChange={(e) =>
-              setSettings({ ...settings, avdcPath: e.target.value })
-            }
-            placeholder="例如: C:/AV_Data_Capture/AV_Data_Capture.py"
-            className="w-full px-3 py-2 border border-gray-300 rounded-md"
-          />
+          <div className="flex space-x-2">
+            <input
+              type="text"
+              value={settings.avdcPath}
+              onChange={(e) =>
+                setSettings({ ...settings, avdcPath: e.target.value })
+              }
+              placeholder="例如: C:/AV_Data_Capture/AV_Data_Capture.py"
+              className="flex-1 px-3 py-2 border border-gray-300 rounded-md"
+            />
+            <button
+              type="button"
+              onClick={() => void handlePickAvdc()}
+              className="px-4 py-2 bg-slate-600 text-white rounded hover:bg-slate-700"
+            >
+              瀏覽…
+            </button>
+          </div>
           <p className="mt-1 text-xs text-gray-500">
             設定 AV_Data_Capture Python 腳本的完整路徑
           </p>
@@ -593,25 +715,92 @@ export default function Settings() {
 
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-2">
-            FFmpeg 狀態
+            連線／可用性測試
           </label>
-          <div className="flex items-center space-x-2">
-            {ffmpegAvailable === null ? (
-              <span className="text-gray-500">檢查中...</span>
-            ) : ffmpegAvailable ? (
-              <span className="text-green-500">✓ FFmpeg 已安裝並可用</span>
-            ) : (
-              <span className="text-red-500">
-                ✗ FFmpeg 未安裝或不可用
-              </span>
-            )}
+          <div className="flex flex-wrap items-center gap-2 mb-3">
             <button
+              type="button"
+              onClick={() => void handleTestConnectivity()}
+              disabled={connectivityBusy}
+              className="px-4 py-2 bg-teal-600 text-white rounded hover:bg-teal-700 disabled:bg-gray-400"
+            >
+              {connectivityBusy ? "測試中..." : "測試 FFmpeg／AVDC／StashDB"}
+            </button>
+            <button
+              type="button"
               onClick={checkFFmpeg}
               className="px-3 py-1 text-sm bg-gray-200 rounded hover:bg-gray-300"
             >
-              重新檢查
+              僅檢查 FFmpeg
             </button>
           </div>
+          <ul className="space-y-2 text-sm">
+            <li className="flex items-start gap-2">
+              <span
+                className={
+                  ffmpegAvailable === null
+                    ? "text-gray-500"
+                    : ffmpegAvailable
+                      ? "text-green-600"
+                      : "text-red-600"
+                }
+              >
+                {ffmpegAvailable === null
+                  ? "FFmpeg: 檢查中..."
+                  : ffmpegAvailable
+                    ? "✓ FFmpeg"
+                    : "✗ FFmpeg"}
+              </span>
+              <span className="text-gray-600">
+                {connectivity?.ffmpeg.message ||
+                  (ffmpegAvailable
+                    ? "已安裝並可用"
+                    : ffmpegAvailable === false
+                      ? "未安裝或不可用"
+                      : "")}
+              </span>
+            </li>
+            <li className="flex items-start gap-2">
+              <span
+                className={
+                  connectivity == null
+                    ? "text-gray-500"
+                    : connectivity.avdc.ok
+                      ? "text-green-600"
+                      : "text-red-600"
+                }
+              >
+                {connectivity == null
+                  ? "AVDC: 尚未測試"
+                  : connectivity.avdc.ok
+                    ? "✓ AVDC"
+                    : "✗ AVDC"}
+              </span>
+              <span className="text-gray-600">
+                {connectivity?.avdc.message || "按上方按鈕測試腳本路徑"}
+              </span>
+            </li>
+            <li className="flex items-start gap-2">
+              <span
+                className={
+                  connectivity == null
+                    ? "text-gray-500"
+                    : connectivity.stashdb.ok
+                      ? "text-green-600"
+                      : "text-red-600"
+                }
+              >
+                {connectivity == null
+                  ? "StashDB: 尚未測試"
+                  : connectivity.stashdb.ok
+                    ? "✓ StashDB"
+                    : "✗ StashDB"}
+              </span>
+              <span className="text-gray-600">
+                {connectivity?.stashdb.message || "按上方按鈕測試 URL 可達性"}
+              </span>
+            </li>
+          </ul>
         </div>
 
         <div className="pt-4 border-t">

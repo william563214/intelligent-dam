@@ -1,4 +1,5 @@
 mod database;
+mod connectivity;
 mod file_stability;
 mod file_status;
 mod scanner;
@@ -26,6 +27,7 @@ use watcher::WatcherManager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // 初始化資料庫與設定儲存（同屬 app data dir）
             let app_data_dir = app.path().app_data_dir().unwrap();
@@ -59,6 +61,12 @@ pub fn run() {
             commands::get_watcher_status_command,
             commands::get_task_queue_status_command,
             commands::retry_task_command,
+            commands::test_connectivity_command,
+            commands::canonicalize_path_command,
+            commands::get_error_logs_command,
+            commands::clear_error_logs_command,
+            commands::enqueue_pipeline_jobs_command,
+            commands::organize_eligible_files_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
