@@ -1,11 +1,13 @@
-use crate::database::{Database, FileWithMetadata, Metadata, Tag};
+use crate::connectivity::{self, ConnectivityReport};
+use crate::database::{Database, ErrorLogEntry, FileWithMetadata, Metadata, Tag};
 use crate::ffmpeg;
 use crate::file_status;
+use crate::pipeline::PipelineOptions;
 use crate::scanner;
 use crate::scraper::{scrape_metadata, to_database_metadata};
 use crate::settings::{AppSettings, SettingsStore};
-use crate::watcher::{self, WatcherManager, WatcherStatus};
 use crate::task_queue::{TaskQueue, TaskQueueStatus};
+use crate::watcher::{self, WatcherManager, WatcherStatus};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -24,6 +26,55 @@ pub struct ScrapeResult {
     pub metadata: Option<Metadata>,
     pub tags: Option<Vec<Tag>>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineOptionsInput {
+    pub enable_scrape: Option<bool>,
+    pub enable_move: Option<bool>,
+    pub enable_preview: Option<bool>,
+}
+
+impl PipelineOptionsInput {
+    fn into_options(self) -> PipelineOptions {
+        PipelineOptions {
+            enable_scrape: self.enable_scrape.unwrap_or(true),
+            enable_move: self.enable_move.unwrap_or(true),
+            enable_preview: self.enable_preview.unwrap_or(true),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnqueueResult {
+    pub job_ids: Vec<u64>,
+    pub enqueued: usize,
+    pub skipped: usize,
+}
+
+fn ensure_queue_ready(
+    queue: &TaskQueue,
+    app: &AppHandle,
+    db: &Arc<Mutex<Database>>,
+) -> Result<(), String> {
+    let suppressions = queue.path_suppressions()?;
+    queue.bind_and_start(app.clone(), Arc::clone(db), suppressions)
+}
+
+fn log_command_error(
+    db: &Arc<Mutex<Database>>,
+    category: &str,
+    file_id: Option<i64>,
+    path: Option<&str>,
+    message: &str,
+) {
+    if let Ok(guard) = db.lock() {
+        if let Err(e) = guard.insert_error_log(category, file_id, path, message, None) {
+            eprintln!("commands: failed to write ErrorLog: {}", e);
+        }
+    }
 }
 
 #[tauri::command]
@@ -378,6 +429,13 @@ pub async fn scrape_file_command(
                             scrape_error, status_err
                         )
                     })?;
+                let _ = db.insert_error_log(
+                    "scrape",
+                    Some(file_id),
+                    Some(&file_path.to_string_lossy()),
+                    &scrape_error,
+                    None,
+                );
             }
 
             Ok(ScrapeResult {
@@ -392,7 +450,7 @@ pub async fn scrape_file_command(
 
 #[tauri::command]
 pub async fn update_file_metadata_command(
-    file_id: i64,
+    _file_id: i64,
     metadata: Metadata,
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<(), String> {
@@ -435,20 +493,30 @@ pub async fn generate_preview_command(
     {
         Ok(path) => path,
         Err(e) => {
-            let db = db.lock().map_err(|lock_err| {
-                format!(
-                    "Preview failed ({}); also failed to lock DB: {}",
-                    e, lock_err
-                )
-            })?;
-            db.update_file_status(file_id, &previous_status)
-                .map_err(|status_err| {
+            let err_msg = format!("Failed to generate sprite sheet: {}", e);
+            {
+                let db = db.lock().map_err(|lock_err| {
                     format!(
-                        "Preview failed ({}); also failed to restore status: {}",
-                        e, status_err
+                        "Preview failed ({}); also failed to lock DB: {}",
+                        e, lock_err
                     )
                 })?;
-            return Err(format!("Failed to generate sprite sheet: {}", e));
+                db.update_file_status(file_id, &previous_status)
+                    .map_err(|status_err| {
+                        format!(
+                            "Preview failed ({}); also failed to restore status: {}",
+                            e, status_err
+                        )
+                    })?;
+                let _ = db.insert_error_log(
+                    "ffmpeg",
+                    Some(file_id),
+                    Some(&file_path.to_string_lossy()),
+                    &err_msg,
+                    None,
+                );
+            }
+            return Err(err_msg);
         }
     };
     
@@ -515,5 +583,164 @@ pub async fn generate_thumbnail_command(
 #[tauri::command]
 pub fn check_ffmpeg_available_command() -> bool {
     ffmpeg::check_ffmpeg_available()
+}
+
+#[tauri::command]
+pub fn test_connectivity_command(
+    settings_store: State<'_, Mutex<SettingsStore>>,
+) -> Result<ConnectivityReport, String> {
+    let settings = {
+        let store = settings_store
+            .lock()
+            .map_err(|e| format!("Settings lock error: {}", e))?;
+        store
+            .load()
+            .map_err(|e| format!("Failed to load settings: {}", e))?
+    };
+    Ok(connectivity::check_all(&settings))
+}
+
+#[tauri::command]
+pub fn get_error_logs_command(
+    limit: Option<i64>,
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Vec<ErrorLogEntry>, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.list_error_logs(limit.unwrap_or(100))
+        .map_err(|e| format!("Failed to list error logs: {}", e))
+}
+
+#[tauri::command]
+pub fn clear_error_logs_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<usize, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.clear_error_logs()
+        .map_err(|e| format!("Failed to clear error logs: {}", e))
+}
+
+/// Enqueue pipeline jobs for selected files through the existing task queue
+#[tauri::command]
+pub fn enqueue_pipeline_jobs_command(
+    file_ids: Vec<i64>,
+    options: Option<PipelineOptionsInput>,
+    app: AppHandle,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+) -> Result<EnqueueResult, String> {
+    let base = options
+        .unwrap_or(PipelineOptionsInput {
+            enable_scrape: Some(true),
+            enable_move: Some(true),
+            enable_preview: Some(true),
+        })
+        .into_options();
+    enqueue_pipeline_jobs_inner(&app, &db, &queue, file_ids, base)
+}
+
+/// One-click organize: enqueue full pipeline for all non-missing library files
+#[tauri::command]
+pub fn organize_eligible_files_command(
+    app: AppHandle,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+) -> Result<EnqueueResult, String> {
+    let file_ids = {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        guard
+            .list_organizable_file_ids()
+            .map_err(|e| format!("Failed to list files: {}", e))?
+    };
+
+    enqueue_pipeline_jobs_inner(
+        &app,
+        &db,
+        &queue,
+        file_ids,
+        PipelineOptions::default(),
+    )
+}
+
+fn enqueue_pipeline_jobs_inner(
+    app: &AppHandle,
+    db: &Arc<Mutex<Database>>,
+    queue: &Arc<TaskQueue>,
+    file_ids: Vec<i64>,
+    base: PipelineOptions,
+) -> Result<EnqueueResult, String> {
+    if file_ids.is_empty() {
+        return Ok(EnqueueResult {
+            job_ids: Vec::new(),
+            enqueued: 0,
+            skipped: 0,
+        });
+    }
+
+    ensure_queue_ready(queue, app, db)?;
+
+    if base.is_noop() {
+        return Err("Pipeline options disable all steps".to_string());
+    }
+
+    let mut job_ids = Vec::new();
+    let mut skipped = 0usize;
+
+    for file_id in file_ids {
+        let options = {
+            let guard = db
+                .lock()
+                .map_err(|e| format!("Database lock error: {}", e))?;
+            match guard.get_file_by_id(file_id) {
+                Ok(file) => {
+                    if file.status == file_status::missing {
+                        skipped += 1;
+                        continue;
+                    }
+                    if !std::path::Path::new(&file.path).exists() {
+                        let _ = guard.update_file_status(file_id, file_status::missing);
+                        skipped += 1;
+                        continue;
+                    }
+                    crate::pipeline::options_for_existing_file(&guard, file_id, &base)
+                        .unwrap_or_else(|_| base.clone())
+                }
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            }
+        };
+
+        if options.is_noop() {
+            skipped += 1;
+            continue;
+        }
+
+        match queue.enqueue_pipeline(file_id, options, None) {
+            Ok(id) => job_ids.push(id),
+            Err(e) => {
+                log_command_error(
+                    db,
+                    "queue",
+                    Some(file_id),
+                    None,
+                    &format!("enqueue failed: {}", e),
+                );
+                skipped += 1;
+            }
+        }
+    }
+
+    Ok(EnqueueResult {
+        enqueued: job_ids.len(),
+        skipped,
+        job_ids,
+    })
 }
 

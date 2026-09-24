@@ -2,8 +2,9 @@ import { useState } from "react";
 import FileBrowser from "./components/FileBrowser";
 import ManualOrganize from "./components/ManualOrganize";
 import Settings from "./components/Settings";
+import ErrorLogPanel from "./components/ErrorLogPanel";
 
-type Tab = "browser" | "organize" | "settings";
+type Tab = "browser" | "organize" | "errors" | "settings";
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("browser");
@@ -41,6 +42,16 @@ function App() {
               手動整理
             </button>
             <button
+              onClick={() => setActiveTab("errors")}
+              className={`py-4 px-1 border-b-2 font-medium text-sm ${
+                activeTab === "errors"
+                  ? "border-blue-500 text-blue-600"
+                  : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
+              }`}
+            >
+              錯誤日誌
+            </button>
+            <button
               onClick={() => setActiveTab("settings")}
               className={`py-4 px-1 border-b-2 font-medium text-sm ${
                 activeTab === "settings"
@@ -56,6 +67,7 @@ function App() {
       <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
         {activeTab === "browser" && <FileBrowser />}
         {activeTab === "organize" && <ManualOrganize />}
+        {activeTab === "errors" && <ErrorLogPanel />}
         {activeTab === "settings" && <Settings />}
       </main>
     </div>
@@ -63,4 +75,3 @@ function App() {
 }
 
 export default App;
-

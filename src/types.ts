@@ -107,3 +107,36 @@ export interface TaskQueueStatus {
   jobs: TaskQueueJobView[];
 }
 
+export interface PipelineOptionsInput {
+  enableScrape?: boolean;
+  enableMove?: boolean;
+  enablePreview?: boolean;
+}
+
+export interface EnqueueResult {
+  jobIds: number[];
+  enqueued: number;
+  skipped: number;
+}
+
+export interface ConnectivityCheck {
+  ok: boolean;
+  message: string;
+}
+
+export interface ConnectivityReport {
+  ffmpeg: ConnectivityCheck;
+  avdc: ConnectivityCheck;
+  stashdb: ConnectivityCheck;
+}
+
+export interface ErrorLogEntry {
+  id: number;
+  createdAt: string;
+  category: string;
+  fileId: number | null;
+  path: string | null;
+  message: string;
+  detail: string | null;
+}
+
