@@ -30,6 +30,7 @@ pub struct ScrapeResult {
 pub async fn scan_directory_command(
     path: String,
     db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
 ) -> Result<ScanResult, String> {
     // Directory walk off the async runtime; no DB lock held.
     let scanned = tokio::task::spawn_blocking(move || scanner::scan_directory(path))
@@ -37,12 +38,15 @@ pub async fn scan_directory_command(
         .map_err(|e| format!("Scan task join failed: {}", e))?
         .map_err(|e| format!("Scan failed: {}", e))?;
 
+    let suppressions = queue.path_suppressions().ok();
+    let supp_ref = suppressions.as_deref();
+
     // Short lock: insert rows (null phash ok; COALESCE keeps existing).
-    let (imported_ids, jobs) = {
+    let (imported, jobs) = {
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::import_files_pending_phash(&db, &scanned)
+        scanner::import_files_pending_phash(&db, &scanned, supp_ref)
             .map_err(|e| format!("Import failed: {}", e))?
     };
 
@@ -55,13 +59,26 @@ pub async fn scan_directory_command(
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::write_phashes(&db, &results)
+        scanner::write_phashes(&db, &results, supp_ref)
             .map_err(|e| format!("Failed to write phash: {}", e))?;
     }
 
+    // Drop ids removed by phash near-dedup; unique by path upsert
+    let file_ids: Vec<i64> = {
+        let db = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let mut seen = std::collections::HashSet::new();
+        imported
+            .into_iter()
+            .map(|e| e.file_id)
+            .filter(|id| seen.insert(*id) && db.get_file_by_id(*id).is_ok())
+            .collect()
+    };
+
     Ok(ScanResult {
-        imported_count: imported_ids.len(),
-        file_ids: imported_ids,
+        imported_count: file_ids.len(),
+        file_ids,
     })
 }
 
@@ -69,6 +86,7 @@ pub async fn scan_directory_command(
 pub async fn scan_multiple_directories_command(
     paths: Vec<String>,
     db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
 ) -> Result<ScanResult, String> {
     if paths.is_empty() {
         return Err("No directories provided".to_string());
@@ -78,11 +96,14 @@ pub async fn scan_multiple_directories_command(
         .await
         .map_err(|e| format!("Scan task join failed: {}", e))?;
 
-    let (imported_ids, jobs) = {
+    let suppressions = queue.path_suppressions().ok();
+    let supp_ref = suppressions.as_deref();
+
+    let (imported, jobs) = {
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::import_files_pending_phash(&db, &scanned)
+        scanner::import_files_pending_phash(&db, &scanned, supp_ref)
             .map_err(|e| format!("Import failed: {}", e))?
     };
 
@@ -94,13 +115,25 @@ pub async fn scan_multiple_directories_command(
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::write_phashes(&db, &results)
+        scanner::write_phashes(&db, &results, supp_ref)
             .map_err(|e| format!("Failed to write phash: {}", e))?;
     }
 
+    let file_ids: Vec<i64> = {
+        let db = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let mut seen = std::collections::HashSet::new();
+        imported
+            .into_iter()
+            .map(|e| e.file_id)
+            .filter(|id| seen.insert(*id) && db.get_file_by_id(*id).is_ok())
+            .collect()
+    };
+
     Ok(ScanResult {
-        imported_count: imported_ids.len(),
-        file_ids: imported_ids,
+        imported_count: file_ids.len(),
+        file_ids,
     })
 }
 
