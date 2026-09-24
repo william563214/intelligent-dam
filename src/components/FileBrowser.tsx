@@ -109,41 +109,6 @@ export default function FileBrowser() {
     }
   };
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-gray-500">載入中...</div>
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <div className="text-red-500">錯誤: {error}</div>
-      </div>
-    );
-  }
-
-  if (files.length === 0) {
-    return (
-      <div className="p-6">
-        <div className="mb-4 flex justify-between items-center">
-          <h2 className="text-2xl font-bold text-gray-900">影片庫</h2>
-          <button
-            onClick={loadFiles}
-            className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-          >
-            重新整理
-          </button>
-        </div>
-        <div className="flex items-center justify-center h-64">
-          <div className="text-gray-500">尚無檔案，請先掃描目錄</div>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="p-6">
       <div className="mb-4 flex flex-wrap justify-between items-center gap-2">
@@ -173,7 +138,8 @@ export default function FileBrowser() {
         <button
           type="button"
           onClick={selectAll}
-          className="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200"
+          disabled={files.length === 0}
+          className="px-3 py-1 text-sm bg-gray-100 rounded hover:bg-gray-200 disabled:opacity-50"
         >
           全選
         </button>
@@ -234,24 +200,44 @@ export default function FileBrowser() {
         <p className="mb-4 text-sm text-gray-700">{batchMessage}</p>
       )}
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
-        {files.map((item) => {
-          const checked = selected.has(item.file.id);
-          return (
-            <div key={item.file.id} className="relative">
-              <label className="absolute left-2 top-2 z-10 flex items-center gap-1 rounded bg-white/90 px-2 py-1 text-xs shadow">
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  onChange={() => toggleSelect(item.file.id)}
-                />
-                選取
-              </label>
-              <VideoCard fileWithMetadata={item} />
-            </div>
-          );
-        })}
-      </div>
+      {loading && (
+        <div className="flex items-center justify-center h-64">
+          <div className="text-gray-500">載入中...</div>
+        </div>
+      )}
+
+      {!loading && error && (
+        <div className="flex items-center justify-center h-64">
+          <div className="text-red-500">錯誤: {error}</div>
+        </div>
+      )}
+
+      {!loading && !error && files.length === 0 && (
+        <div className="flex items-center justify-center h-64">
+          <div className="text-gray-500">尚無檔案，請先掃描目錄</div>
+        </div>
+      )}
+
+      {!loading && !error && files.length > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
+          {files.map((item) => {
+            const checked = selected.has(item.file.id);
+            return (
+              <div key={item.file.id} className="relative">
+                <label className="absolute left-2 top-2 z-10 flex items-center gap-1 rounded bg-white/90 px-2 py-1 text-xs shadow">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleSelect(item.file.id)}
+                  />
+                  選取
+                </label>
+                <VideoCard fileWithMetadata={item} />
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
