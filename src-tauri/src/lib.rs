@@ -1,4 +1,5 @@
 mod database;
+mod file_status;
 mod scanner;
 mod ffmpeg;
 mod phash;

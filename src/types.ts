@@ -4,6 +4,7 @@ export interface FileRecord {
   size: number;
   created_at: string;
   phash: string | null;
+  /** processing | ready | scrape_failed | missing */
   status: string;
 }
 
