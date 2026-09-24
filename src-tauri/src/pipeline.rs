@@ -118,6 +118,26 @@ fn stopped(stop_flag: Option<&AtomicBool>) -> bool {
         .unwrap_or(false)
 }
 
+fn persist_step_error(
+    db: &Arc<Mutex<Database>>,
+    category: &str,
+    file_id: i64,
+    path: &str,
+    message: &str,
+) {
+    if let Ok(guard) = db.lock() {
+        if let Err(e) = guard.insert_error_log(
+            category,
+            Some(file_id),
+            if path.is_empty() { None } else { Some(path) },
+            message,
+            None,
+        ) {
+            eprintln!("pipeline: failed to write ErrorLog: {}", e);
+        }
+    }
+}
+
 /// True when scrape already ran (success with source_type or scrape_failed)
 /// Used to skip re-scrape when a move lands back under the watch tree
 pub fn is_already_scraped(db: &Database, file_id: i64) -> Result<bool> {
@@ -269,6 +289,7 @@ pub fn run_for_file(
                 result.scrape_ok = Some(false);
                 let msg = "scrape returned no result".to_string();
                 result.errors.push(msg.clone());
+                persist_step_error(db, "scrape", file_id, &initial_path, &msg);
                 emit_progress(
                     app,
                     PipelineProgressEvent {
@@ -283,7 +304,9 @@ pub fn run_for_file(
             }
             Err(e) => {
                 result.scrape_ok = Some(false);
-                result.errors.push(format!("scrape: {:#}", e));
+                let msg = format!("scrape: {:#}", e);
+                result.errors.push(msg.clone());
+                persist_step_error(db, "scrape", file_id, &initial_path, &msg);
                 emit_progress(
                     app,
                     PipelineProgressEvent {
@@ -360,7 +383,9 @@ pub fn run_for_file(
                 );
             }
             Err(e) => {
-                result.errors.push(format!("move: {:#}", e));
+                let msg = format!("move: {:#}", e);
+                result.errors.push(msg.clone());
+                persist_step_error(db, "move", file_id, &initial_path, &msg);
                 emit_progress(
                     app,
                     PipelineProgressEvent {
@@ -424,7 +449,9 @@ pub fn run_for_file(
                 );
             }
             Err(e) => {
-                result.errors.push(format!("preview: {:#}", e));
+                let msg = format!("preview: {:#}", e);
+                result.errors.push(msg.clone());
+                persist_step_error(db, "ffmpeg", file_id, &path_now, &msg);
                 emit_progress(
                     app,
                     PipelineProgressEvent {
