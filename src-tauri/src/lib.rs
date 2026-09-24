@@ -62,6 +62,7 @@ pub fn run() {
             commands::get_task_queue_status_command,
             commands::retry_task_command,
             commands::test_connectivity_command,
+            commands::canonicalize_path_command,
             commands::get_error_logs_command,
             commands::clear_error_logs_command,
             commands::enqueue_pipeline_jobs_command,

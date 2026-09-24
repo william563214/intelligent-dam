@@ -166,11 +166,70 @@ fn has_sprite(db: &Database, file_id: i64) -> Result<bool> {
         .unwrap_or(false))
 }
 
+/// True when template render already equals the file's current path (move no-op)
+///
+/// Absolute templates compare full paths Relative templates also treat a path
+/// that already ends with the rendered `studio/title.ext` layout as organized
+/// so soft re-enqueue does not nest another studio folder
+pub fn destination_equals_source(
+    db: &Database,
+    file_id: i64,
+    settings: &AppSettings,
+) -> Result<bool> {
+    let template = settings.output_template.trim();
+    if template.is_empty() {
+        return Ok(false);
+    }
+
+    let file = db.get_file_by_id(file_id)?;
+    let source = PathBuf::from(&file.path);
+    if !source.is_file() {
+        return Ok(false);
+    }
+
+    let meta = db.get_metadata(file_id)?;
+    let tags = db.get_file_tags(file_id).unwrap_or_default();
+    let first_actor = tags
+        .iter()
+        .find(|t| t.category.as_deref() == Some("Actor"))
+        .map(|t| t.name.as_str());
+    let ctx = TemplateContext::from_metadata(
+        &source,
+        meta.as_ref().and_then(|m| m.studio.as_deref()),
+        meta.as_ref().and_then(|m| m.release_date.as_deref()),
+        meta.as_ref().and_then(|m| m.title.as_deref()),
+        first_actor,
+    );
+    let base_dir = source
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let desired = render_output_path(template, &ctx, &base_dir)?;
+    if path_template::paths_equal(&source, &desired) {
+        return Ok(true);
+    }
+
+    // Relative template: file may already sit at .../<rendered relative>
+    // after a prior organize; re-render from parent would nest another level
+    if !path_template::is_absolute_template(template) {
+        let relative = render_output_path(template, &ctx, Path::new(""))?;
+        if !relative.as_os_str().is_empty() && source.ends_with(&relative) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Soften options for a file that is already organized under the watch tree
+///
+/// When `settings` is provided also disables move if the template destination
+/// already equals the current path so fully-done files become noop
 pub fn options_for_existing_file(
     db: &Database,
     file_id: i64,
     base: &PipelineOptions,
+    settings: Option<&AppSettings>,
 ) -> Result<PipelineOptions> {
     let mut opts = base.clone();
     if is_already_scraped(db, file_id)? {
@@ -178,6 +237,13 @@ pub fn options_for_existing_file(
     }
     if has_sprite(db, file_id)? {
         opts.enable_preview = false;
+    }
+    if opts.enable_move {
+        if let Some(settings) = settings {
+            if destination_equals_source(db, file_id, settings)? {
+                opts.enable_move = false;
+            }
+        }
     }
     Ok(opts)
 }
@@ -506,7 +572,7 @@ pub fn run_for_file(
     result
 }
 
-fn load_settings(app: &AppHandle) -> AppSettings {
+pub(crate) fn load_settings(app: &AppHandle) -> AppSettings {
     match app.try_state::<Mutex<SettingsStore>>() {
         Some(store) => store
             .lock()
@@ -1020,6 +1086,7 @@ mod tests {
             &guard,
             file_id,
             &PipelineOptions::default(),
+            Some(&settings),
         )
         .unwrap();
         assert!(
@@ -1029,6 +1096,10 @@ mod tests {
         assert!(
             !softened.enable_preview,
             "sprite already present so preview skipped"
+        );
+        assert!(
+            !softened.enable_move,
+            "already at template destination so move skipped"
         );
         assert_eq!(
             guard.get_file_by_id(file_id).unwrap().status,
@@ -1047,12 +1118,47 @@ mod tests {
         db.update_file_status(file_id, file_status::scrape_failed)
             .unwrap();
         let softened =
-            options_for_existing_file(&db, file_id, &PipelineOptions::default()).unwrap();
+            options_for_existing_file(&db, file_id, &PipelineOptions::default(), None).unwrap();
         assert!(!softened.enable_scrape);
         assert_eq!(
             db.get_file_by_id(file_id).unwrap().status,
             file_status::scrape_failed
         );
+    }
+
+    #[test]
+    fn options_disables_move_when_already_at_destination() {
+        let dir = unique_temp_dir("already_dest");
+        let studio = dir.join("StudioX");
+        fs::create_dir_all(&studio).unwrap();
+        let dest = studio.join("Title.mp4");
+        fs::write(&dest, b"data").unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(dest.to_str().unwrap(), 4, None)
+            .unwrap();
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Title".to_string()),
+            studio: Some("StudioX".to_string()),
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: Some("/tmp/s.vtt".to_string()),
+            source_type: Some("scraped_avdc".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let softened =
+            options_for_existing_file(&db, file_id, &PipelineOptions::default(), Some(&settings))
+                .unwrap();
+        assert!(softened.is_noop(), "fully organized file must be noop");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
