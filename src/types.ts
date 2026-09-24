@@ -62,3 +62,15 @@ export interface WatcherFileEvent {
   error: string | null;
 }
 
+/** Progress from automatic scrape → move → preview pipeline */
+export interface PipelineProgressEvent {
+  fileId: number;
+  path: string;
+  /** scrape | move | preview | done | pipeline */
+  step: string;
+  /** started | ok | failed | skipped | completed_with_errors */
+  status: string;
+  message: string | null;
+  newPath: string | null;
+}
+
