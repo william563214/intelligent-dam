@@ -8,8 +8,17 @@ import {
   startWatcher,
   stopWatcher,
   getWatcherStatus,
+  getTaskQueueStatus,
+  retryTask,
 } from "../api";
-import type { AppSettings, PipelineProgressEvent, WatcherFileEvent, WatcherStatus } from "../types";
+import type {
+  AppSettings,
+  PipelineProgressEvent,
+  TaskQueueProgressEvent,
+  TaskQueueStatus,
+  WatcherFileEvent,
+  WatcherStatus,
+} from "../types";
 
 const default_settings: AppSettings = {
   scanDirectories: [],
@@ -35,16 +44,20 @@ export default function Settings() {
   });
   const [watcherBusy, setWatcherBusy] = useState(false);
   const [watcherMessage, setWatcherMessage] = useState<string | null>(null);
+  const [queueStatus, setQueueStatus] = useState<TaskQueueStatus | null>(null);
+  const [queueMessage, setQueueMessage] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings();
     checkFFmpeg();
     refreshWatcherStatus();
+    refreshQueueStatus();
   }, []);
 
   useEffect(() => {
     let unlistenFile: (() => void) | undefined;
     let unlistenPipeline: (() => void) | undefined;
+    let unlistenQueue: (() => void) | undefined;
 
     listen<WatcherFileEvent>("watcher-file-detected", (event) => {
       const payload = event.payload;
@@ -55,7 +68,7 @@ export default function Settings() {
       setWatcherMessage(
         `偵測到新檔 (${payload.kind}): ${payload.path}` +
           (payload.fileId != null ? ` #${payload.fileId}` : "") +
-          " → 啟動自動流水線"
+          " → 已送入任務佇列"
       );
     })
       .then((fn) => {
@@ -80,12 +93,36 @@ export default function Settings() {
         console.error("Failed to listen pipeline events:", err);
       });
 
+    listen<TaskQueueProgressEvent>("task-queue-progress", (event) => {
+      const p = event.payload;
+      const detail = p.message ? ` (${p.message})` : "";
+      const failHint =
+        p.state === "failed"
+          ? p.retryable
+            ? " — 可重試"
+            : " — 不可重試"
+          : "";
+      setQueueMessage(
+        `佇列 job #${p.jobId} file #${p.fileId} [${p.kind}/${p.state}] attempt ${p.attempt}${detail}${failHint}`
+      );
+      void refreshQueueStatus();
+    })
+      .then((fn) => {
+        unlistenQueue = fn;
+      })
+      .catch((err) => {
+        console.error("Failed to listen task-queue events:", err);
+      });
+
     return () => {
       if (unlistenFile) {
         unlistenFile();
       }
       if (unlistenPipeline) {
         unlistenPipeline();
+      }
+      if (unlistenQueue) {
+        unlistenQueue();
       }
     };
   }, []);
@@ -183,6 +220,37 @@ export default function Settings() {
     } catch (err) {
       console.error("Failed to get watcher status:", err);
     }
+  };
+
+  const refreshQueueStatus = async () => {
+    try {
+      const status = await getTaskQueueStatus();
+      setQueueStatus(status);
+    } catch (err) {
+      console.error("Failed to get task queue status:", err);
+    }
+  };
+
+  const handleRetryFailed = async () => {
+    if (!queueStatus) {
+      return;
+    }
+    const failed = queueStatus.jobs.filter(
+      (j) => j.state === "failed" && j.retryable
+    );
+    for (const job of failed) {
+      try {
+        await retryTask(job.jobId);
+      } catch (err) {
+        console.error("Failed to retry job", job.jobId, err);
+        setQueueMessage(
+          `重試 job #${job.jobId} 失敗: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
+    }
+    await refreshQueueStatus();
   };
 
   const handleStartWatcher = async () => {
@@ -429,10 +497,40 @@ export default function Settings() {
           {watcherMessage && (
             <p className="mt-2 text-sm text-gray-700">{watcherMessage}</p>
           )}
+          {queueMessage && (
+            <p className="mt-1 text-sm text-gray-700">{queueMessage}</p>
+          )}
+          {queueStatus && (
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-600">
+              <span>
+                佇列 concurrency={queueStatus.concurrency} pending=
+                {queueStatus.pending} running={queueStatus.running} failed=
+                {queueStatus.failed} succeeded={queueStatus.succeeded}
+              </span>
+              <button
+                type="button"
+                onClick={refreshQueueStatus}
+                className="px-2 py-1 bg-gray-200 rounded hover:bg-gray-300"
+              >
+                重新整理佇列
+              </button>
+              {queueStatus.failed > 0 && (
+                <button
+                  type="button"
+                  onClick={handleRetryFailed}
+                  className="px-2 py-1 bg-amber-100 text-amber-900 rounded hover:bg-amber-200"
+                >
+                  重試失敗任務
+                </button>
+              )}
+            </div>
+          )}
           <p className="mt-1 text-xs text-gray-500">
-            偵測 Created / Moved 影片後會入庫，並自動執行刮削 → 模板搬運 →
-            預覽（事件：watcher-file-detected / watcher-pipeline-progress）。
-            測試可用環境變數 IDAM_PIPELINE_DISABLE、IDAM_PIPELINE_SKIP_SCRAPE、
+            偵測 Created / Moved 影片後會入庫，並將 phash／刮削→模板搬運→預覽
+            送入背景任務佇列（事件：watcher-file-detected /
+            watcher-pipeline-progress / task-queue-progress）。預設並發 2、同檔
+            序列；可用 IDAM_QUEUE_CONCURRENCY 調整。測試可用
+            IDAM_PIPELINE_DISABLE、IDAM_PIPELINE_SKIP_SCRAPE、
             IDAM_PIPELINE_SKIP_MOVE、IDAM_PIPELINE_SKIP_PREVIEW 跳過步驟。
           </p>
         </div>

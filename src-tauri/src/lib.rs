@@ -9,6 +9,7 @@ mod phash;
 mod pipeline;
 mod scraper;
 mod settings;
+mod task_queue;
 mod watcher;
 mod commands;
 
@@ -16,6 +17,7 @@ use database::Database;
 use settings::SettingsStore;
 use std::sync::{Arc, Mutex};
 use tauri::Manager;
+use task_queue::TaskQueue;
 use watcher::WatcherManager;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -38,6 +40,7 @@ pub fn run() {
             app.manage(Arc::new(Mutex::new(db)));
             app.manage(Mutex::new(settings_store));
             app.manage(WatcherManager::new());
+            app.manage(Arc::new(TaskQueue::new()));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -54,6 +57,8 @@ pub fn run() {
             commands::start_watcher_command,
             commands::stop_watcher_command,
             commands::get_watcher_status_command,
+            commands::get_task_queue_status_command,
+            commands::retry_task_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

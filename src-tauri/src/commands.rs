@@ -5,6 +5,7 @@ use crate::scanner;
 use crate::scraper::{scrape_metadata, to_database_metadata};
 use crate::settings::{AppSettings, SettingsStore};
 use crate::watcher::{self, WatcherManager, WatcherStatus};
+use crate::task_queue::{TaskQueue, TaskQueueStatus};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -130,6 +131,7 @@ pub async fn save_settings_command(
     settings: AppSettings,
     settings_store: State<'_, Mutex<SettingsStore>>,
     watcher: State<'_, WatcherManager>,
+    queue: State<'_, Arc<TaskQueue>>,
     app: AppHandle,
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<(), String> {
@@ -148,7 +150,7 @@ pub async fn save_settings_command(
         join_detached_worker(watcher.request_stop()).await?;
         if !paths.is_empty() {
             watcher
-                .start(paths, app, Arc::clone(&db))
+                .start(paths, app, Arc::clone(&db), Arc::clone(&queue))
                 .map_err(|e| format!("Failed to reload watcher paths: {:#}", e))?;
         }
     }
@@ -162,6 +164,7 @@ pub async fn start_watcher_command(
     db: State<'_, Arc<Mutex<Database>>>,
     settings_store: State<'_, Mutex<SettingsStore>>,
     watcher: State<'_, WatcherManager>,
+    queue: State<'_, Arc<TaskQueue>>,
 ) -> Result<WatcherStatus, String> {
     let settings = {
         let store = settings_store
@@ -183,7 +186,7 @@ pub async fn start_watcher_command(
     join_detached_worker(watcher.request_stop()).await?;
 
     watcher
-        .start(paths, app, Arc::clone(&db))
+        .start(paths, app, Arc::clone(&db), Arc::clone(&queue))
         .map_err(|e| format!("Failed to start watcher: {:#}", e))
 }
 
@@ -198,6 +201,21 @@ pub async fn stop_watcher_command(
 #[tauri::command]
 pub fn get_watcher_status_command(watcher: State<'_, WatcherManager>) -> WatcherStatus {
     watcher.status()
+}
+
+#[tauri::command]
+pub fn get_task_queue_status_command(
+    queue: State<'_, Arc<TaskQueue>>,
+) -> Result<TaskQueueStatus, String> {
+    queue.status()
+}
+
+#[tauri::command]
+pub fn retry_task_command(
+    job_id: u64,
+    queue: State<'_, Arc<TaskQueue>>,
+) -> Result<u64, String> {
+    queue.retry(job_id)
 }
 
 async fn join_detached_worker(
