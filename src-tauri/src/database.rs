@@ -161,7 +161,12 @@ impl Database {
             return Ok(());
         }
 
-        self.conn.execute_batch(
+        // DROP Tags 時 FileTags 仍引用舊表 需暫時關閉 FK 以保留關聯列
+        let foreign_keys_on: i64 = self
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        self.conn.execute("PRAGMA foreign_keys = OFF", [])?;
+        let migrate_result = self.conn.execute_batch(
             "
             CREATE TABLE Tags_mig (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,7 +179,11 @@ impl Database {
             DROP TABLE Tags;
             ALTER TABLE Tags_mig RENAME TO Tags;
             ",
-        )?;
+        );
+        if foreign_keys_on != 0 {
+            let _ = self.conn.execute("PRAGMA foreign_keys = ON", []);
+        }
+        migrate_result?;
 
         Ok(())
     }
