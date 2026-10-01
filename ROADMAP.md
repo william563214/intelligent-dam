@@ -1,6 +1,6 @@
 # Intelligent DAM — Roadmap
 
-本文件整理 **第一階段 MVP** 完成後的缺口與建議實作順序。規格細節見 [SPECIFICATION.md](./SPECIFICATION.md)；安裝與使用見 [README.md](./README.md)。
+本文件整理 **第一階段 MVP** 完成後的缺口與建議實作順序，並反映 **`main` @ `c433334`** 現況。規格細節見 [SPECIFICATION.md](./SPECIFICATION.md)；安裝與使用見 [README.md](./README.md)。
 
 > 實作變更請透過 Pull Request 送審，**請勿直接 merge 到 main**（合併請威廉明確指示）。細項以 GitHub Issues 為準。
 
@@ -12,87 +12,89 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 
 | SPEC / README | 本檔 | 說明 |
 |---------------|------|------|
-| **第一階段** MVP 基礎建設 ✅ | （已完成）+ 下方 **MVP wrap-up**（items #1–#5） | Foundation 已落地；wrap-up 補齊與 SPEC 的落差，對應 Issues #1–#5 |
-| **第二階段** 自動化與刮削 | **Automation core**（items #6–#11） | Watcher、穩定度檢測、pipeline、Handlebars、佇列、去重 |
-| （README／SPEC 未單列） | **UX polish** | 一鍵整理、批次、錯誤日誌、Settings 選擇器／連線測試 |
-| **第三階段** AI 整合 | **Deferred / Later** | ONNX / CLIP、語意搜尋、即時轉碼 — **現階段不要開工** |
+| **第一階段** MVP 基礎建設 ✅ | （已完成）+ 下方 **MVP wrap-up**（items #1–#5）✅ | Foundation 已落地；wrap-up 已合入 main |
+| **第二階段** 自動化與刮削 ✅ | **Automation core**（items #6–#11）✅ | Watcher、穩定度檢測、pipeline、Handlebars、佇列、去重 |
+| （README／SPEC 未單列） | **UX polish**（#12）✅ | 一鍵整理、批次、錯誤日誌、Settings 選擇器／連線測試 |
+| **第三階段** AI 整合 | **Deferred / Later**（#13） | ONNX / CLIP、語意搜尋、即時轉碼 — **現階段不要開工** |
 
 ---
 
 ## 專案現況 (Status)
 
-- **第一階段 MVP 已完成**（見 README / SPECIFICATION）：Tauri v2 + React/TS、SQLite Schema、手動掃描入庫、FFmpeg 縮圖 / Sprite Sheet、AV_Data_Capture + StashDB 刮削命令、手動整理與設定 UI。
-- **進行中（MVP wrap-up）**：實作 PR 已堆疊、多份 DAM APPROVE，**尚未合入 main**（見下方 Active PRs）。
-- **下一步（第二階段）**：Watcher、模板搬運、任務佇列與完整狀態機，再談 UX polish。
-- **明確延後（第三階段）**：ONNX / CLIP、語意搜尋、即時轉碼。
+基準：**`main` @ `c433334`**（含 PR [#20](https://github.com/william563214/intelligent-dam/pull/20) tag uniqueness）。
 
-### Active PRs（堆疊，待威廉 merge）
-
-合併順序：**#15 → #16 → #17 → #18** → main。皆為 draft／stacked；**勿跳過 base 單獨合入**。
-
-| PR | 對應 | DAM 審核（截至文件更新時） | 狀態 |
-|----|------|---------------------------|------|
-| [#15](https://github.com/william563214/intelligent-dam/pull/15) | Issue #1 Settings 持久化 | **APPROVE**（複審通過） | 未 merge；實作在分支，非 main |
-| [#16](https://github.com/william563214/intelligent-dam/pull/16) | Issue #2 Scrape E2E | **APPROVE**（複審通過） | base = #15；未 merge |
-| [#17](https://github.com/william563214/intelligent-dam/pull/17) | Issue #3 phash on scan | **APPROVE**（複審通過） | base = #16；未 merge |
-| [#18](https://github.com/william563214/intelligent-dam/pull/18) | Issue #4 Hover Sprite / VTT | 仍有審核意見／未標 APPROVE | base = #17；未 merge |
-
-`main` 仍反映 MVP 缺口，直到上述 PR 依序合入。
+- **第一階段 MVP + wrap-up：已完成**（Issues #1–#5 對應 PR #15–#19）。
+- **第二階段 Automation core：已完成**（Issues #6–#11 對應 PR #21–#25）。
+- **UX polish（#12）：已完成**（PR [#26](https://github.com/william563214/intelligent-dam/pull/26)，`a2c96e6`）。
+- **Tag uniqueness（#20）：已合入** — `(name, category)` 唯一約束 + 原子、可恢復遷移（`c433334`）。
+- **明確延後（第三階段 / #13）**：ONNX / CLIP、語意搜尋、即時轉碼。
 
 ---
 
 ## 與 SPECIFICATION 的已知缺口 (Known Gaps)
 
-以下描述以 **`main` 現況** 為準；括號註記堆疊 PR 中的進展（**尚未 merge**）。
+以下僅列已於 `src-tauri/src` / `src/`（及 repo 根目錄）**實際確認**的剩餘缺口；已合入功能不再列為缺口。
 
-| 缺口 | `main` 現況 | SPEC / 預期 | 追蹤 |
-|------|-------------|-------------|------|
-| Settings 持久化 | 設定只在前端 `localStorage`；後端無 JSON / store | SPEC §8.3：後端持久化掃描目錄、AVDC、StashDB URL、輸出模板 | **進行中** — [#15](https://github.com/william563214/intelligent-dam/pull/15)（DAM APPROVE，**待 merge**；完成後後端 `settings.json` 為真相來源） |
-| Scraper 設定未完整到達後端 | 刮削依前端傳參；後端不持有設定 | 後端讀持久化設定；AV_Data_Capture → StashDB fallback | 隨 #15 解決 fallback；E2E 見 #16 |
-| Tags / Actors 入庫不完整 | `to_database_metadata` 未寫 Tags／Actors | 刮削成功寫入 Metadata + Tags / Actors | **進行中** — [#16](https://github.com/william563214/intelligent-dam/pull/16)（APPROVE，待 merge） |
-| `phash` | import 使用 size + mtime stub，非感知雜湊 | 掃描產出可供 StashDB / 去重的 PHash | **進行中** — [#17](https://github.com/william563214/intelligent-dam/pull/17)（APPROVE，待 merge） |
-| Sprite / VTT ↔ hover preview | 後端可生成 Sprite／VTT；`VideoCard` 僅封面／「預覽中…」占位，**未接 VTT scrub** | SPEC §3.2：懸停依時間點顯示 Sprite | **進行中** — [#18](https://github.com/william563214/intelligent-dam/pull/18)（堆疊中，待 merge） |
-| `notify` 無 Watcher | `Cargo.toml` 有 `notify`，無 Watcher 模組 | SPEC §3.1 / §5：監控 Created / Moved | 第二階段 Automation |
-| Output path template | Settings UI 有 Handlebars 欄位；後端無 rename／move | 依模板搬運並更新 `Files.path` | 第二階段 Automation |
-| 檔案狀態機 | 有 `status` 與 `update_file_status`；未系統性使用 `processing` / `scrape_failed` / `missing` | SPEC §7.2 定義 `scrape_failed`；需與 schema 狀態對齊並涵蓋 processing／missing | Issue #5；#16 已涵蓋部分 `scrape_failed`（待 merge） |
+| 缺口 | `main` @ `c433334` 現況 | 備註 |
+|------|-------------------------|------|
+| Task queue 非持久化 | `task_queue.rs` 為進程內 `VecDeque` / `HashMap`；註明 in-memory、重啟遺失、非 crash-safe | Issue #10 已交付佇列與進度事件；持久化／重啟恢復仍缺 |
+| Near-phash 閾值 ≤8 可能誤判 | `phash.rs` 預設 `near_phash_max_distance = 8`（可用 `IDAM_NEAR_PHASH_MAX_DISTANCE` 覆寫）；文件註明視覺近似但不同片段可能 false-positive | 行為符合 Stash 風格；非阻塞 |
+| 無 CI workflow | 無 `.github/workflows`；僅有本機 `cargo test` / `vitest` | — |
+| 無 Tauri invoke／整合測試 | 後端多為 `#[cfg(test)]` 單元測試；前端僅 `src/utils/*.test.ts`；無 invoke／tauri-driver E2E | — |
+| Watcher 無 E2E | `watcher.rs` 測試僅涵蓋路徑／事件分類／debounce 等 helper，無 notify→穩定度→ingest→queue 端到端 | — |
+| Windows 鎖偵測偏重 size stability | `file_stability.rs`：Windows 上多數複製工具不鎖目的檔，**size-stable 為主要可靠訊號**；`try_lock` 回傳 `WouldBlock` 時繼續等待，**僅其他錯誤**才退回 size-stable | Issue #8 已交付穩定度閘門 |
+| 進階 Handlebars helpers／碰撞 UI 缺席 | `path_template.rs` 僅註冊變數渲染、無 `register_helper`；衝突時後端 `unique_destination` 自動加後綴，前端無碰撞／衝突 UI | Issue #9 已交付基本模板搬運 |
+| 正式連線未啟用 `PRAGMA foreign_keys` | `Database::new` / `init_schema` 未執行 `PRAGMA foreign_keys = ON`；FK 宣告存在但連線預設不強制 | 測試路徑偶有手動開啟 |
+| 無 `PRAGMA user_version` schema 版本 | schema 以 `CREATE TABLE IF NOT EXISTS` + 特製遷移為主；未使用 `user_version` 做版本追蹤 | — |
+| `get_or_create_tag` 非 `ON CONFLICT` | `database.rs` 為 select-then-insert（`SELECT` 後無列再 `INSERT`），非 `INSERT … ON CONFLICT` | 併發下理論上可能撞 UNIQUE |
+
+### PR #20 審核非阻塞 nits（仍存在於程式碼）
+
+1. **碰撞測試 `>= 3` 斷言過寬** — `database.rs` 中 `startup_backups_nonempty_tags_mig_when_tags_also_nonempty` 以 `backup_name.matches('_').count() >= 3` 斷言碰撞後綴；基底名 `Tags_mig_backup_<secs>` 已含 3 個 `_`，即使未加碰撞後綴也會通過。
+2. **僅 `BEGIN IMMEDIATE` 本身失敗時略過 FK 還原** — `swap_empty_tags_with_tags_mig` 在 `PRAGMA foreign_keys = OFF` 之後：swap 本體失敗路徑**會**呼叫 `restore_foreign_keys_state`；**只有** `BEGIN IMMEDIATE` 本身失敗提早返回時，才不會還原 FK。
+3. **遷移 backup 警告未寫入 ErrorLog** — `backup_nonempty_tags_mig` 僅 `eprintln!` 警告；未呼叫 `insert_error_log`。
 
 ---
 
-## 分階段 Checklist（建議順序）
+## 分階段 Checklist
 
-### MVP wrap-up（對應 Issues #1–#5；屬第一階段收尾）
+### MVP wrap-up（Issues #1–#5）— DONE
 
-補齊 MVP 與 SPEC 的落差，再進入第二階段自動化。
+補齊 MVP 與 SPEC 的落差；已全部合入 `main`。
 
-- [ ] **1. Persist settings on Tauri side** — 後端可讀寫掃描目錄、AVDC、StashDB URL、輸出模板 → [#15](https://github.com/william563214/intelligent-dam/pull/15)（**進行中／DAM APPROVE，待威廉 merge**；勿在 `main` 上勾成已完成）
-- [ ] **2. End-to-end scraping** — tags／actors 入 DB；AV_Data_Capture → StashDB；失敗可標狀態 → [#16](https://github.com/william563214/intelligent-dam/pull/16)（APPROVE，待 merge）
-- [ ] **3. Compute phash during scan** — 入庫產出可用感知雜湊 → [#17](https://github.com/william563214/intelligent-dam/pull/17)（APPROVE，待 merge）
-- [ ] **4. Wire hover preview to Sprite / VTT** — `VideoCard` 依 VTT 做懸停 scrubbing → [#18](https://github.com/william563214/intelligent-dam/pull/18)（堆疊中，待 merge）
-- [ ] **5. File status machine** — 維護 `processing`／`scrape_failed`（SPEC §7.2）／`missing`／`ready`（部分隨 #16；完整狀態機仍開放）
+- [x] **1. Persist settings on Tauri side** — Issue [#1](https://github.com/william563214/intelligent-dam/issues/1) → PR [#15](https://github.com/william563214/intelligent-dam/pull/15)（`f7496aa`）
+- [x] **2. End-to-end scraping** — Issue [#2](https://github.com/william563214/intelligent-dam/issues/2) → PR [#16](https://github.com/william563214/intelligent-dam/pull/16)（`9524fba`）；含 `scrape_failed`
+- [x] **3. Compute phash during scan** — Issue [#3](https://github.com/william563214/intelligent-dam/issues/3) → PR [#17](https://github.com/william563214/intelligent-dam/pull/17)（`75a885e`）
+- [x] **4. Wire hover preview to Sprite / VTT** — Issue [#4](https://github.com/william563214/intelligent-dam/issues/4) → PR [#18](https://github.com/william563214/intelligent-dam/pull/18)（`d362440`）
+- [x] **5. File status machine** — Issue [#5](https://github.com/william563214/intelligent-dam/issues/5) → PR [#19](https://github.com/william563214/intelligent-dam/pull/19)（`f34f66c`）；`scrape_failed` 來自 #16
 
-### Automation core（第二階段）
+### Automation core（Issues #6–#11）— DONE
 
-- [ ] **6. notify Watcher** — 監聽設定中的攝取目錄（Created / Moved）
-- [ ] **7. Wait until file write completes** — 寫入完成（file lock／穩定度檢測）後才處理
-- [ ] **8. Auto pipeline** — ingest → scrape → template move → preview
-- [ ] **9. Handlebars path template rename / move** — 依輸出模板搬運並更新 DB path
-- [ ] **10. Task queue + progress events** — 背景佇列與進度回報給前端
-- [ ] **11. Dedup by phash / path** — 依 phash 與 path 避免重複入庫或重複處理
+Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#8 對調）。
 
-### UX polish
+- [x] **6. notify Watcher** — Issue [#6](https://github.com/william563214/intelligent-dam/issues/6) → PR [#21](https://github.com/william563214/intelligent-dam/pull/21)（`ca2600d`）
+- [x] **7. Auto pipeline** — Issue [#7](https://github.com/william563214/intelligent-dam/issues/7) → PR [#23](https://github.com/william563214/intelligent-dam/pull/23)（`c23f4d8`）；經 #24 佇列排程
+- [x] **8. Wait until file write completes** — Issue [#8](https://github.com/william563214/intelligent-dam/issues/8) → PR [#22](https://github.com/william563214/intelligent-dam/pull/22)（`a48b1d7`）
+- [x] **9. Handlebars path template rename / move** — Issue [#9](https://github.com/william563214/intelligent-dam/issues/9) → 實作於 PR [#23](https://github.com/william563214/intelligent-dam/pull/23)（`c23f4d8`）
+- [x] **10. Task queue + progress events** — Issue [#10](https://github.com/william563214/intelligent-dam/issues/10) → PR [#24](https://github.com/william563214/intelligent-dam/pull/24)（`cff2456`）
+- [x] **11. Dedup by phash / path** — Issue [#11](https://github.com/william563214/intelligent-dam/issues/11) → PR [#25](https://github.com/william563214/intelligent-dam/pull/25)（`bda2eaf`）
+
+### UX polish（Issue #12）— DONE
 
 - [x] **一鍵整理** — 影片庫「一鍵整理」對可整理檔 enqueue 既有 scrape→move→preview 佇列（`organize_eligible_files_command`）
 - [x] **批次操作** — 影片庫多選 + 批量刮削／預覽／整理（`enqueue_pipeline_jobs_command`）
 - [x] **錯誤日誌** — SQLite `ErrorLog` +「錯誤日誌」分頁；pipeline／手動刮削／FFmpeg 失敗入庫
 - [x] **Settings：資料夾選擇器 + 連線／可用性測試** — `tauri-plugin-dialog` 選掃描／AVDC；FFmpeg／AVDC／StashDB 測試（`test_connectivity_command`）
 
-追蹤：Issue #12。
+追蹤：Issue [#12](https://github.com/william563214/intelligent-dam/issues/12) → PR [#26](https://github.com/william563214/intelligent-dam/pull/26)（`a2c96e6`）。
 
-### Deferred / Later（第三階段 — 明確延後，現階段不要開工）
+### Deferred / Later（第三階段 / Issue #13 — 明確延後，現階段不要開工）
 
 - [ ] ONNX Runtime + CLIP
 - [ ] 語意搜尋／向量（sqlite-vss 等）
 - [ ] 即時轉碼（例如 H.265 → H.264 串流）
+
+追蹤：Issue [#13](https://github.com/william563214/intelligent-dam/issues/13)。
 
 ---
 
@@ -106,5 +108,5 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 ## 協作備註
 
 - 實作請開 PR；本 roadmap 僅文件與優先序。
-- **合併請威廉明確指示**；堆疊 PR 請依 #15 → #16 → #17 → #18 順序。
-- 細項追蹤以 GitHub Issues 為準；PR 合入後請同步勾選本檔 checklist 並改寫 Known Gaps。
+- **合併請威廉明確指示**。
+- 細項追蹤以 GitHub Issues 為準；合入後請同步勾選本檔 checklist 並更新 Known Gaps。
