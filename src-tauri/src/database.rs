@@ -96,12 +96,13 @@ impl Database {
             [],
         )?;
 
-        // 標籤表
+        // 標籤表 同名可存在於不同 category
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS Tags (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                category TEXT
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
             )",
             [],
         )?;
@@ -131,6 +132,48 @@ impl Database {
                 detail TEXT
             )",
             [],
+        )?;
+
+        self.migrate_tags_unique_to_name_category()?;
+
+        Ok(())
+    }
+
+    /// 既有 DB 若仍為 name 唯一 則重建為 (name, category) 唯一
+    fn migrate_tags_unique_to_name_category(&self) -> SqliteResult<()> {
+        let table_sql: String = match self.conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'Tags'",
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(sql) => sql,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        let normalized: String = table_sql
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+
+        if normalized.contains("unique(name,category)") {
+            return Ok(());
+        }
+
+        self.conn.execute_batch(
+            "
+            CREATE TABLE Tags_mig (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
+            );
+            INSERT INTO Tags_mig (id, name, category)
+                SELECT id, name, category FROM Tags;
+            DROP TABLE Tags;
+            ALTER TABLE Tags_mig RENAME TO Tags;
+            ",
         )?;
 
         Ok(())
@@ -340,15 +383,14 @@ impl Database {
     }
 
     pub fn get_or_create_tag(&self, name: &str, category: Option<String>) -> SqliteResult<i64> {
-        // 嘗試獲取現有標籤
+        // 以 (name, category) 為鍵 IS 可正確比對 NULL category
         match self.conn.query_row(
-            "SELECT id FROM Tags WHERE name = ?1",
-            params![name],
+            "SELECT id FROM Tags WHERE name = ?1 AND category IS ?2",
+            params![name, category],
             |row| row.get(0),
         ) {
             Ok(id) => Ok(id),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
-                // 創建新標籤
                 self.conn.execute(
                     "INSERT INTO Tags (name, category) VALUES (?1, ?2)",
                     params![name, category],
@@ -631,6 +673,32 @@ mod tests {
         Database::new(":memory:").expect("open memory db")
     }
 
+    fn tag_row(db: &Database, id: i64) -> Tag {
+        db.conn
+            .query_row(
+                "SELECT id, name, category FROM Tags WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(Tag {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        category: row.get(2)?,
+                    })
+                },
+            )
+            .expect("tag row")
+    }
+
+    fn tags_table_sql(db: &Database) -> String {
+        db.conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'Tags'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Tags sql")
+    }
+
     #[test]
     fn apply_scraped_tags_writes_tags_and_actors() {
         let db = open_memory_db();
@@ -653,6 +721,169 @@ mod tests {
 
         let alice = tags.iter().find(|t| t.name == "Alice").expect("Alice");
         assert_eq!(alice.category.as_deref(), Some("Actor"));
+    }
+
+    #[test]
+    fn get_or_create_tag_same_name_different_category_are_distinct() {
+        let db = open_memory_db();
+        let tag_id = db
+            .get_or_create_tag("Alice", Some("Tag".to_string()))
+            .expect("create Tag");
+        let actor_id = db
+            .get_or_create_tag("Alice", Some("Actor".to_string()))
+            .expect("create Actor");
+
+        assert_ne!(tag_id, actor_id);
+        assert_eq!(tag_row(&db, tag_id).category.as_deref(), Some("Tag"));
+        assert_eq!(tag_row(&db, actor_id).category.as_deref(), Some("Actor"));
+    }
+
+    #[test]
+    fn get_or_create_tag_same_name_and_category_returns_same_id() {
+        let db = open_memory_db();
+        let first = db
+            .get_or_create_tag("Beach", Some("Tag".to_string()))
+            .expect("first");
+        let second = db
+            .get_or_create_tag("Beach", Some("Tag".to_string()))
+            .expect("second");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn get_or_create_tag_null_category_returns_same_id() {
+        let db = open_memory_db();
+        let first = db.get_or_create_tag("Uncategorized", None).expect("first");
+        let second = db.get_or_create_tag("Uncategorized", None).expect("second");
+        let as_tag = db
+            .get_or_create_tag("Uncategorized", Some("Tag".to_string()))
+            .expect("as Tag");
+
+        assert_eq!(first, second);
+        assert_ne!(first, as_tag);
+        assert!(tag_row(&db, first).category.is_none());
+        assert_eq!(tag_row(&db, as_tag).category.as_deref(), Some("Tag"));
+    }
+
+    #[test]
+    fn apply_scraped_tags_keeps_actor_and_tag_with_same_name() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/overlap.mp4", 512, None)
+            .expect("insert file");
+
+        db.apply_scraped_tags(
+            file_id,
+            &["Alice".to_string()],
+            &["Alice".to_string()],
+        )
+        .expect("apply tags");
+
+        let tags = db.get_file_tags(file_id).expect("get tags");
+        assert_eq!(tags.len(), 2);
+
+        let as_tag = tags
+            .iter()
+            .find(|t| t.category.as_deref() == Some("Tag"))
+            .expect("Tag Alice");
+        let as_actor = tags
+            .iter()
+            .find(|t| t.category.as_deref() == Some("Actor"))
+            .expect("Actor Alice");
+
+        assert_eq!(as_tag.name, "Alice");
+        assert_eq!(as_actor.name, "Alice");
+        assert_ne!(as_tag.id, as_actor.id);
+    }
+
+    #[test]
+    fn migrate_legacy_tags_preserves_filetags_and_allows_same_name_categories() {
+        let db = open_memory_db();
+        let file_id = db
+            .insert_file("/tmp/legacy-tags.mp4", 128, None)
+            .expect("insert file");
+
+        // 先建 legacy schema 再綁定 file_id 驗證遷移後 FileTags 仍指向原 id
+        db.conn
+            .execute_batch(
+                "
+                DROP TABLE IF EXISTS Tags;
+                CREATE TABLE Tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    category TEXT
+                );
+                INSERT INTO Tags (id, name, category) VALUES (42, 'Shared', 'Tag');
+                ",
+            )
+            .expect("seed legacy schema");
+        db.conn
+            .execute(
+                "INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (?1, 42, 1.0)",
+                params![file_id],
+            )
+            .expect("seed FileTags");
+
+        db.migrate_tags_unique_to_name_category()
+            .expect("migrate");
+
+        let linked = db.get_file_tags(file_id).expect("get tags");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].id, 42);
+        assert_eq!(linked[0].name, "Shared");
+        assert_eq!(linked[0].category.as_deref(), Some("Tag"));
+
+        let tag_id = db
+            .get_or_create_tag("Shared", Some("Tag".to_string()))
+            .expect("existing Tag");
+        let actor_id = db
+            .get_or_create_tag("Shared", Some("Actor".to_string()))
+            .expect("new Actor");
+
+        assert_eq!(tag_id, 42);
+        assert_ne!(tag_id, actor_id);
+        assert_eq!(tag_row(&db, actor_id).category.as_deref(), Some("Actor"));
+    }
+
+    #[test]
+    fn migrate_tags_unique_is_idempotent() {
+        let db = open_memory_db();
+        db.conn
+            .execute_batch(
+                "
+                DROP TABLE Tags;
+                CREATE TABLE Tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    category TEXT
+                );
+                INSERT INTO Tags (name, category) VALUES ('Shared', 'Tag');
+                ",
+            )
+            .expect("seed legacy schema");
+
+        db.migrate_tags_unique_to_name_category()
+            .expect("first migrate");
+        let sql_after_first = tags_table_sql(&db);
+        db.migrate_tags_unique_to_name_category()
+            .expect("second migrate");
+        let sql_after_second = tags_table_sql(&db);
+
+        assert_eq!(sql_after_first, sql_after_second);
+        let normalized: String = sql_after_second
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        assert!(normalized.contains("unique(name,category)"));
+
+        let tag_id = db
+            .get_or_create_tag("Shared", Some("Tag".to_string()))
+            .expect("existing");
+        let again = db
+            .get_or_create_tag("Shared", Some("Tag".to_string()))
+            .expect("again");
+        assert_eq!(tag_id, again);
     }
 
     #[test]
