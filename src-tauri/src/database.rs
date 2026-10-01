@@ -3,6 +3,7 @@ use crate::phash;
 use rusqlite::{Connection, Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileRecord {
@@ -190,7 +191,8 @@ impl Database {
     }
 
     /// 已是新 schema 時處理殘留 Tags_mig
-    /// Tags 空且 Tags_mig 有資料則改用 Tags_mig 僅在 Tags_mig 空或 Tags 已有資料時 DROP
+    /// Tags 空且 Tags_mig 有資料則交易內改用 Tags_mig
+    /// 兩邊都非空則備份 Tags_mig 不 DROP 以免丟掉 abb2fd3 殘留資料
     fn reconcile_leftover_tags_mig(&self) -> SqliteResult<()> {
         if !self.table_exists("Tags_mig")? {
             return Ok(());
@@ -200,28 +202,88 @@ impl Database {
         let mig_count = self.table_row_count("Tags_mig")?;
 
         if tags_count == 0 && mig_count > 0 {
-            let foreign_keys_on: i64 = self
-                .conn
-                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
-            self.conn.execute("PRAGMA foreign_keys = OFF", [])?;
-            let swap_result = (|| -> SqliteResult<()> {
-                self.conn.execute("DROP TABLE Tags", [])?;
-                self.conn
-                    .execute("ALTER TABLE Tags_mig RENAME TO Tags", [])?;
-                Ok(())
-            })();
-            // 保留 swap 主錯誤
-            if let Err(e) = swap_result {
-                let _ = self.restore_foreign_keys_state(foreign_keys_on);
-                return Err(e);
-            }
-            self.restore_foreign_keys_state(foreign_keys_on)?;
+            return self.swap_empty_tags_with_tags_mig();
+        }
+
+        if mig_count == 0 {
+            self.conn.execute("DROP TABLE Tags_mig", [])?;
             return Ok(());
         }
 
-        // Tags 已有資料則 Tags_mig 視為過期副本 或 Tags_mig 本身為空
-        self.conn.execute("DROP TABLE Tags_mig", [])?;
+        // Tags 與 Tags_mig 都非空 保留殘表以免永久丟 tag
+        self.backup_nonempty_tags_mig()?;
         Ok(())
+    }
+
+    fn swap_empty_tags_with_tags_mig(&self) -> SqliteResult<()> {
+        let foreign_keys_on: i64 = self
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        self.conn.execute("PRAGMA foreign_keys = OFF", [])?;
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let swap_result = (|| -> SqliteResult<()> {
+            self.conn.execute("DROP TABLE Tags", [])?;
+            self.conn
+                .execute("ALTER TABLE Tags_mig RENAME TO Tags", [])?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+        if let Err(e) = swap_result {
+            if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                eprintln!(
+                    "warn: ROLLBACK failed after Tags_mig swap error: {}",
+                    rb
+                );
+            }
+            if let Err(restore) = self.restore_foreign_keys_state(foreign_keys_on) {
+                eprintln!(
+                    "warn: restore foreign_keys after Tags_mig swap error: {}",
+                    restore
+                );
+            }
+            return Err(e);
+        }
+        self.restore_foreign_keys_state(foreign_keys_on)?;
+        Ok(())
+    }
+
+    /// 將非空 Tags_mig 改名備份 處理同一秒碰撞
+    fn backup_nonempty_tags_mig(&self) -> SqliteResult<String> {
+        let base_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        for suffix in 0u32..1000 {
+            let backup_name = if suffix == 0 {
+                format!("Tags_mig_backup_{base_secs}")
+            } else {
+                format!("Tags_mig_backup_{base_secs}_{suffix}")
+            };
+            if self.table_exists(&backup_name)? {
+                continue;
+            }
+            // 名稱僅含固定前綴與數字
+            self.conn.execute(
+                &format!("ALTER TABLE Tags_mig RENAME TO {backup_name}"),
+                [],
+            )?;
+            eprintln!(
+                "warn: preserved nonempty Tags_mig as {} because Tags already has rows",
+                backup_name
+            );
+            return Ok(backup_name);
+        }
+
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: rusqlite::ErrorCode::ConstraintViolation,
+                extended_code: 1,
+            },
+            Some(
+                "unable to allocate Tags_mig_backup_* name after collisions".to_string(),
+            ),
+        ))
     }
 
     /// 只檢查 FileTags 對 Tags 的 FK 避免無關 orphan 阻擋遷移
@@ -293,7 +355,12 @@ impl Database {
             Ok(()) => self.restore_foreign_keys_state(foreign_keys_on),
             Err(e) => {
                 // 保留遷移主錯誤 仍嘗試恢復 FK
-                let _ = self.restore_foreign_keys_state(foreign_keys_on);
+                if let Err(restore) = self.restore_foreign_keys_state(foreign_keys_on) {
+                    eprintln!(
+                        "warn: restore foreign_keys after Tags migrate error: {}",
+                        restore
+                    );
+                }
                 Err(e)
             }
         }
@@ -340,8 +407,13 @@ impl Database {
         match tx_result {
             Ok(()) => Ok(()),
             Err(e) => {
-                // 保留主錯誤 ROLLBACK 失敗不覆蓋
-                let _ = self.conn.execute("ROLLBACK", []);
+                // 保留主錯誤 ROLLBACK 失敗只記 warn
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after Tags migrate error: {}",
+                        rb
+                    );
+                }
                 Err(e)
             }
         }
@@ -1238,6 +1310,138 @@ mod tests {
             &tags_table_sql(&db)
         ));
         assert_eq!(tag_row(&db, 5).name, "Keep");
+    }
+
+    #[test]
+    fn migrate_ignores_filetags_files_orphan_fk() {
+        let db = open_memory_db();
+        seed_legacy_tags_schema(&db, 5, "Keep", "Tag");
+        // FileTags→Files orphan 不應阻擋 Tags 遷移 我們只檢查 FileTags→Tags
+        db.conn
+            .execute("PRAGMA foreign_keys = OFF", [])
+            .expect("fk off");
+        db.conn
+            .execute(
+                "INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (99999, 5, 1.0)",
+                [],
+            )
+            .expect("orphan filetag to missing file");
+
+        db.migrate_tags_unique_to_name_category()
+            .expect("migrate despite FileTags->Files orphan");
+        assert!(Database::tags_schema_is_name_category_unique(
+            &tags_table_sql(&db)
+        ));
+        assert_eq!(tag_row(&db, 5).name, "Keep");
+    }
+
+    #[test]
+    fn startup_backups_nonempty_tags_mig_when_tags_also_nonempty() {
+        let path = temp_db_path("both-nonempty");
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            // 預佔用附近秒數的備份名 迫使走碰撞後綴
+            let mut ddl = String::from(
+                "
+                CREATE TABLE Files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL UNIQUE,
+                    size INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    phash TEXT,
+                    status TEXT DEFAULT 'ready'
+                );
+                CREATE TABLE Tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    category TEXT,
+                    UNIQUE(name, category)
+                );
+                CREATE TABLE Tags_mig (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    category TEXT,
+                    UNIQUE(name, category)
+                );
+                CREATE TABLE FileTags (
+                    file_id INTEGER,
+                    tag_id INTEGER,
+                    confidence FLOAT DEFAULT 1.0,
+                    PRIMARY KEY (file_id, tag_id)
+                );
+                ",
+            );
+            for offset in 0..3 {
+                ddl.push_str(&format!(
+                    "CREATE TABLE Tags_mig_backup_{} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        category TEXT,
+                        UNIQUE(name, category)
+                    );",
+                    secs + offset
+                ));
+            }
+            ddl.push_str(
+                "
+                INSERT INTO Files (id, path, size) VALUES (1, '/tmp/both.mp4', 1);
+                INSERT INTO Tags (id, name, category) VALUES (10, 'KeepTags', 'Tag');
+                INSERT INTO Tags_mig (id, name, category) VALUES (20, 'FromMig', 'Actor');
+                INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (1, 10, 1.0);
+                ",
+            );
+            conn.execute_batch(&ddl).expect("seed both nonempty");
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("startup");
+        assert!(!db.table_exists("Tags_mig").expect("Tags_mig renamed"));
+        assert_eq!(tag_row(&db, 10).name, "KeepTags");
+        let linked = db.get_file_tags(1).expect("filetags");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].id, 10);
+        assert_eq!(
+            db.conn
+                .query_row("SELECT COUNT(*) FROM Tags", [], |row| row.get::<_, i64>(0))
+                .expect("tags count"),
+            1
+        );
+
+        let mut stmt = db
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name LIKE 'Tags_mig_backup_%'",
+            )
+            .expect("list backups");
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("map")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("names");
+        let backup_name = names
+            .iter()
+            .find(|name| {
+                db.conn
+                    .query_row(
+                        &format!("SELECT COUNT(*) FROM {name} WHERE id = 20 AND name = 'FromMig'"),
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap_or(0)
+                    == 1
+            })
+            .expect("backup holding FromMig")
+            .clone();
+        // Tags_mig_backup_<secs> 有兩個底線 碰撞後綴為第三個
+        assert!(
+            backup_name.matches('_').count() >= 3,
+            "expected collision suffix in {backup_name}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
