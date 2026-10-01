@@ -138,7 +138,12 @@ impl Database {
             [],
         )?;
 
+        // 遷移前先清 orphan 但 Tags 空且 Tags_mig 有資料時暫留 FileTags→Tags
+        self.cleanup_fk_orphans_for_startup()?;
         self.migrate_tags_unique_to_name_category()?;
+        // Tags 定案後再清一次並啟用 FK
+        self.cleanup_fk_orphans_for_startup()?;
+        self.enable_foreign_keys()?;
 
         Ok(())
     }
@@ -219,8 +224,32 @@ impl Database {
         let foreign_keys_on: i64 = self
             .conn
             .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        // FK 必須在交易外關閉
         self.conn.execute("PRAGMA foreign_keys = OFF", [])?;
-        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let begin_result = (|| -> SqliteResult<()> {
+            #[cfg(test)]
+            if swap_tags_fault::should_fail_begin() {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::DatabaseBusy,
+                        extended_code: 5,
+                    },
+                    Some("injected BEGIN IMMEDIATE failure".to_string()),
+                ));
+            }
+            self.conn.execute("BEGIN IMMEDIATE", [])?;
+            Ok(())
+        })();
+        if let Err(e) = begin_result {
+            // BEGIN 失敗時仍須還原 FK
+            if let Err(restore) = self.restore_foreign_keys_state(foreign_keys_on) {
+                eprintln!(
+                    "warn: restore foreign_keys after Tags_mig BEGIN failure: {}",
+                    restore
+                );
+            }
+            return Err(e);
+        }
         let swap_result = (|| -> SqliteResult<()> {
             self.conn.execute("DROP TABLE Tags", [])?;
             self.conn
@@ -268,10 +297,19 @@ impl Database {
                 &format!("ALTER TABLE Tags_mig RENAME TO {backup_name}"),
                 [],
             )?;
-            eprintln!(
-                "warn: preserved nonempty Tags_mig as {} because Tags already has rows",
-                backup_name
+            let message = format!(
+                "preserved nonempty Tags_mig as {backup_name} because Tags already has rows"
             );
+            eprintln!("warn: {message}");
+            if let Err(log_err) = self.insert_error_log(
+                "migration",
+                None,
+                None,
+                &message,
+                Some("Tags_mig backup during reconcile"),
+            ) {
+                eprintln!("warn: failed to write ErrorLog for Tags_mig backup: {log_err}");
+            }
             return Ok(backup_name);
         }
 
@@ -327,6 +365,152 @@ impl Database {
                     "failed to restore foreign_keys=ON after Tags migration".to_string(),
                 ),
             ));
+        }
+        Ok(())
+    }
+
+    /// 啟用連線級 FK 並以 foreign_key_check 確認無殘留違反
+    fn enable_foreign_keys(&self) -> SqliteResult<()> {
+        self.conn.execute("PRAGMA foreign_keys = ON", [])?;
+        let enabled: i64 = self
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+        if enabled == 0 {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::ApiMisuse,
+                    extended_code: 21,
+                },
+                Some("failed to enable PRAGMA foreign_keys=ON".to_string()),
+            ));
+        }
+        let mut stmt = self.conn.prepare("PRAGMA foreign_key_check")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let table: String = row.get(0)?;
+            let rowid: i64 = row.get(1)?;
+            let parent: String = row.get(2)?;
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::ConstraintViolation,
+                    extended_code: 787,
+                },
+                Some(format!(
+                    "foreign_key_check failed after orphan cleanup table={table} rowid={rowid} parent={parent}"
+                )),
+            ));
+        }
+        Ok(())
+    }
+
+    /// 清除指向不存在父列的關聯 寫入 ErrorLog 避免靜默丟資料
+    /// Tags 空且 Tags_mig 有資料時跳過 FileTags→Tags 以免交換前誤刪
+    fn cleanup_fk_orphans_for_startup(&self) -> SqliteResult<()> {
+        if self.table_exists("FileTags")? && self.table_exists("Files")? {
+            self.delete_orphan_filetags_missing_files()?;
+        }
+        if self.table_exists("Metadata")? && self.table_exists("Files")? {
+            self.delete_orphan_metadata_missing_files()?;
+        }
+        if self.table_exists("FileTags")? && self.table_exists("Tags")? {
+            let tags_count = self.table_row_count("Tags")?;
+            let mig_count = if self.table_exists("Tags_mig")? {
+                self.table_row_count("Tags_mig")?
+            } else {
+                0
+            };
+            if tags_count > 0 || mig_count == 0 {
+                self.delete_orphan_filetags_missing_tags()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn log_orphan_removal(
+        &self,
+        file_id: Option<i64>,
+        message: &str,
+        detail: &str,
+    ) {
+        eprintln!("warn: {message}");
+        if let Err(e) = self.insert_error_log(
+            "database",
+            file_id,
+            None,
+            message,
+            Some(detail),
+        ) {
+            eprintln!("warn: failed to write ErrorLog for orphan cleanup: {e}");
+        }
+    }
+
+    fn delete_orphan_filetags_missing_files(&self) -> SqliteResult<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, tag_id FROM FileTags
+             WHERE file_id NOT IN (SELECT id FROM Files)",
+        )?;
+        let orphans: Vec<(i64, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (file_id, tag_id) in orphans {
+            self.conn.execute(
+                "DELETE FROM FileTags WHERE file_id = ?1 AND tag_id = ?2",
+                params![file_id, tag_id],
+            )?;
+            self.log_orphan_removal(
+                Some(file_id),
+                &format!(
+                    "removed orphan FileTags row file_id={file_id} tag_id={tag_id} (missing Files)"
+                ),
+                "startup foreign_key orphan cleanup",
+            );
+        }
+        Ok(())
+    }
+
+    fn delete_orphan_filetags_missing_tags(&self) -> SqliteResult<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, tag_id FROM FileTags
+             WHERE tag_id NOT IN (SELECT id FROM Tags)",
+        )?;
+        let orphans: Vec<(i64, i64)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (file_id, tag_id) in orphans {
+            self.conn.execute(
+                "DELETE FROM FileTags WHERE file_id = ?1 AND tag_id = ?2",
+                params![file_id, tag_id],
+            )?;
+            self.log_orphan_removal(
+                Some(file_id),
+                &format!(
+                    "removed orphan FileTags row file_id={file_id} tag_id={tag_id} (missing Tags)"
+                ),
+                "startup foreign_key orphan cleanup",
+            );
+        }
+        Ok(())
+    }
+
+    fn delete_orphan_metadata_missing_files(&self) -> SqliteResult<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, title FROM Metadata
+             WHERE file_id NOT IN (SELECT id FROM Files)",
+        )?;
+        let orphans: Vec<(i64, Option<String>)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (file_id, title) in orphans {
+            self.conn
+                .execute("DELETE FROM Metadata WHERE file_id = ?1", params![file_id])?;
+            let title_note = title.unwrap_or_default();
+            self.log_orphan_removal(
+                Some(file_id),
+                &format!(
+                    "removed orphan Metadata row file_id={file_id} title={title_note} (missing Files)"
+                ),
+                "startup foreign_key orphan cleanup",
+            );
         }
         Ok(())
     }
@@ -934,6 +1118,34 @@ mod migrate_tags_fault {
 }
 
 #[cfg(test)]
+mod swap_tags_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAULT_BEGIN: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn arm_begin() {
+        FAULT_BEGIN.with(|f| f.set(true));
+    }
+
+    pub fn clear() {
+        FAULT_BEGIN.with(|f| f.set(false));
+    }
+
+    pub fn should_fail_begin() -> bool {
+        FAULT_BEGIN.with(|f| {
+            if f.get() {
+                f.set(false);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1201,6 +1413,128 @@ mod tests {
     }
 
     #[test]
+    fn foreign_keys_enabled_on_fresh_connection() {
+        let db = open_memory_db();
+        assert_eq!(foreign_keys_enabled(&db), 1);
+        db.conn
+            .prepare("PRAGMA foreign_key_check")
+            .expect("fk check prepare")
+            .query_map([], |_| Ok(()))
+            .expect("fk check")
+            .next()
+            .transpose()
+            .expect("no fk violations");
+    }
+
+    #[test]
+    fn startup_cleans_fk_orphans_and_logs_to_error_log() {
+        let path = temp_db_path("orphan-cleanup");
+        {
+            let conn = Connection::open(&path).expect("raw open");
+            // 種子 orphan 必須關 FK 才能寫入
+            conn.execute_batch("PRAGMA foreign_keys = OFF").expect("fk off");
+            conn.execute_batch(
+                "
+                CREATE TABLE Files (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL UNIQUE,
+                    size INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    phash TEXT,
+                    status TEXT DEFAULT 'ready'
+                );
+                CREATE TABLE Metadata (
+                    file_id INTEGER PRIMARY KEY,
+                    title TEXT,
+                    studio TEXT,
+                    release_date TEXT,
+                    summary TEXT,
+                    cover_image TEXT,
+                    sprite_sheet_path TEXT,
+                    source_type TEXT,
+                    FOREIGN KEY(file_id) REFERENCES Files(id)
+                );
+                CREATE TABLE Tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    category TEXT,
+                    UNIQUE(name, category)
+                );
+                CREATE TABLE FileTags (
+                    file_id INTEGER,
+                    tag_id INTEGER,
+                    confidence FLOAT DEFAULT 1.0,
+                    PRIMARY KEY (file_id, tag_id),
+                    FOREIGN KEY(file_id) REFERENCES Files(id),
+                    FOREIGN KEY(tag_id) REFERENCES Tags(id)
+                );
+                INSERT INTO Files (id, path, size) VALUES (1, '/tmp/keep.mp4', 1);
+                INSERT INTO Tags (id, name, category) VALUES (1, 'Keep', 'Tag');
+                INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (1, 1, 1.0);
+                INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (1, 999, 1.0);
+                INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (999, 1, 1.0);
+                INSERT INTO Metadata (file_id, title) VALUES (99999, 'orphan meta');
+                ",
+            )
+            .expect("seed orphans");
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("startup");
+        assert_eq!(foreign_keys_enabled(&db), 1);
+        let ft_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM FileTags", [], |row| row.get(0))
+            .expect("ft count");
+        assert_eq!(ft_count, 1);
+        let meta_count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM Metadata", [], |row| row.get(0))
+            .expect("meta count");
+        assert_eq!(meta_count, 0);
+        let logs = db.list_error_logs(50).expect("logs");
+        assert!(
+            logs.iter()
+                .any(|e| e.category == "database" && e.message.contains("missing Tags")),
+            "expected missing Tags orphan log got {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|e| e.category == "database" && e.message.contains("missing Files")),
+            "expected missing Files orphan log got {logs:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn swap_begin_failure_restores_foreign_keys() {
+        let db = open_memory_db();
+        assert_eq!(foreign_keys_enabled(&db), 1);
+        db.conn
+            .execute_batch(
+                "
+                CREATE TABLE Tags_mig (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    category TEXT,
+                    UNIQUE(name, category)
+                );
+                DELETE FROM Tags;
+                INSERT INTO Tags_mig (id, name, category) VALUES (1, 'FromMig', 'Tag');
+                ",
+            )
+            .expect("seed empty Tags + Tags_mig");
+
+        swap_tags_fault::arm_begin();
+        let err = db
+            .swap_empty_tags_with_tags_mig()
+            .expect_err("injected begin failure");
+        swap_tags_fault::clear();
+        assert!(err.to_string().contains("injected BEGIN IMMEDIATE failure"));
+        assert_eq!(foreign_keys_enabled(&db), 1);
+        assert!(db.table_exists("Tags_mig").expect("Tags_mig kept"));
+    }
+
+    #[test]
     fn migrate_with_foreign_keys_on_preserves_filetags_and_restores_fk() {
         let db = open_memory_db();
         let file_id = db
@@ -1375,7 +1709,7 @@ mod tests {
                 );
                 ",
             );
-            for offset in 0..3 {
+            for offset in 0..120 {
                 ddl.push_str(&format!(
                     "CREATE TABLE Tags_mig_backup_{} (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1383,7 +1717,7 @@ mod tests {
                         category TEXT,
                         UNIQUE(name, category)
                     );",
-                    secs + offset
+                    secs.saturating_add(offset)
                 ));
             }
             ddl.push_str(
@@ -1436,10 +1770,19 @@ mod tests {
             })
             .expect("backup holding FromMig")
             .clone();
-        // Tags_mig_backup_<secs> 有兩個底線 碰撞後綴為第三個
+        // Tags_mig_backup_<secs> 已有三個底線 碰撞後綴會變成第四個或結尾 _1
         assert!(
-            backup_name.matches('_').count() >= 3,
+            backup_name.ends_with("_1") || backup_name.matches('_').count() >= 4,
             "expected collision suffix in {backup_name}"
+        );
+        let logs = db.list_error_logs(20).expect("error logs");
+        assert!(
+            logs.iter().any(|e| {
+                e.category == "migration"
+                    && e.message.contains(&backup_name)
+                    && e.message.contains("Tags_mig")
+            }),
+            "expected ErrorLog entry for Tags_mig backup got {logs:?}"
         );
         let _ = std::fs::remove_file(&path);
     }
