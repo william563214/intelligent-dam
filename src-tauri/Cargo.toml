@@ -4,17 +4,20 @@ version = "0.1.0"
 description = "Intelligent Digital Asset Management System"
 authors = ["liaoweizhe"]
 edition = "2021"
+# 依賴樹最高 rust-version 來自 pest / icu_*（1.83）；rfd 關閉預設特徵後不再拉取 edition 2024 的 wayland-protocols
+rust-version = "1.83"
 
 [lib]
 name = "intelligent_dam_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+# 與目前 Cargo.lock 對齊 避免 npm/crate minor 漂移
+tauri-build = { version = "2.5", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["protocol-asset"] }
-tauri-plugin-opener = "2"
+tauri = { version = "2.9", features = ["protocol-asset"] }
+tauri-plugin-opener = "2.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -28,9 +31,9 @@ walkdir = "2.4"
 image = "0.24"
 regex = "1.10"
 handlebars = "5"
-tauri-plugin-dialog = "2"
+tauri-plugin-dialog = "2.6.0"
 
 # Linux 禁用 rfd gtk3 後備 以免在 tao setup MainContext 下 GtkGlobalThread 死鎖
-# macOS / Windows 使用原生 rfd 對話框
+# macOS / Windows 使用原生 rfd 對話框 無需 xdg-portal/gtk3 預設特徵
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-rfd = "0.16"
+rfd = { version = "0.16", default-features = false }
