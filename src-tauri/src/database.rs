@@ -403,114 +403,83 @@ impl Database {
         Ok(())
     }
 
-    /// 清除指向不存在父列的關聯 寫入 ErrorLog 避免靜默丟資料
+    /// 單一交易 bulk 清除 orphan 若有刪除則寫一筆 ErrorLog 摘要
     /// Tags 空且 Tags_mig 有資料時跳過 FileTags→Tags 以免交換前誤刪
     fn cleanup_fk_orphans_for_startup(&self) -> SqliteResult<()> {
-        if self.table_exists("FileTags")? && self.table_exists("Files")? {
-            self.delete_orphan_filetags_missing_files()?;
-        }
-        if self.table_exists("Metadata")? && self.table_exists("Files")? {
-            self.delete_orphan_metadata_missing_files()?;
-        }
-        if self.table_exists("FileTags")? && self.table_exists("Tags")? {
+        let has_filetags = self.table_exists("FileTags")?;
+        let has_files = self.table_exists("Files")?;
+        let has_metadata = self.table_exists("Metadata")?;
+        let has_tags = self.table_exists("Tags")?;
+
+        let clean_filetags_tags = if has_filetags && has_tags {
             let tags_count = self.table_row_count("Tags")?;
             let mig_count = if self.table_exists("Tags_mig")? {
                 self.table_row_count("Tags_mig")?
             } else {
                 0
             };
-            if tags_count > 0 || mig_count == 0 {
-                self.delete_orphan_filetags_missing_tags()?;
+            tags_count > 0 || mig_count == 0
+        } else {
+            false
+        };
+
+        let need_filetags_files = has_filetags && has_files;
+        let need_metadata = has_metadata && has_files;
+        if !need_filetags_files && !need_metadata && !clean_filetags_tags {
+            return Ok(());
+        }
+
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let result = (|| -> SqliteResult<()> {
+            let filetags_missing_files = if need_filetags_files {
+                self.conn.execute(
+                    "DELETE FROM FileTags WHERE file_id NOT IN (SELECT id FROM Files)",
+                    [],
+                )?
+            } else {
+                0
+            };
+            let metadata_missing_files = if need_metadata {
+                self.conn.execute(
+                    "DELETE FROM Metadata WHERE file_id NOT IN (SELECT id FROM Files)",
+                    [],
+                )?
+            } else {
+                0
+            };
+            let filetags_missing_tags = if clean_filetags_tags {
+                self.conn.execute(
+                    "DELETE FROM FileTags WHERE tag_id NOT IN (SELECT id FROM Tags)",
+                    [],
+                )?
+            } else {
+                0
+            };
+
+            let total =
+                filetags_missing_files + metadata_missing_files + filetags_missing_tags;
+            if total > 0 {
+                let message = format!(
+                    "startup orphan cleanup removed FileTags(missing Files)={filetags_missing_files} FileTags(missing Tags)={filetags_missing_tags} Metadata(missing Files)={metadata_missing_files}"
+                );
+                eprintln!("warn: {message}");
+                self.insert_error_log(
+                    "database",
+                    None,
+                    None,
+                    &message,
+                    Some("startup foreign_key orphan cleanup summary"),
+                )?;
             }
-        }
-        Ok(())
-    }
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
 
-    fn log_orphan_removal(
-        &self,
-        file_id: Option<i64>,
-        message: &str,
-        detail: &str,
-    ) {
-        eprintln!("warn: {message}");
-        if let Err(e) = self.insert_error_log(
-            "database",
-            file_id,
-            None,
-            message,
-            Some(detail),
-        ) {
-            eprintln!("warn: failed to write ErrorLog for orphan cleanup: {e}");
-        }
-    }
-
-    fn delete_orphan_filetags_missing_files(&self) -> SqliteResult<()> {
-        let mut stmt = self.conn.prepare(
-            "SELECT file_id, tag_id FROM FileTags
-             WHERE file_id NOT IN (SELECT id FROM Files)",
-        )?;
-        let orphans: Vec<(i64, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (file_id, tag_id) in orphans {
-            self.conn.execute(
-                "DELETE FROM FileTags WHERE file_id = ?1 AND tag_id = ?2",
-                params![file_id, tag_id],
-            )?;
-            self.log_orphan_removal(
-                Some(file_id),
-                &format!(
-                    "removed orphan FileTags row file_id={file_id} tag_id={tag_id} (missing Files)"
-                ),
-                "startup foreign_key orphan cleanup",
-            );
-        }
-        Ok(())
-    }
-
-    fn delete_orphan_filetags_missing_tags(&self) -> SqliteResult<()> {
-        let mut stmt = self.conn.prepare(
-            "SELECT file_id, tag_id FROM FileTags
-             WHERE tag_id NOT IN (SELECT id FROM Tags)",
-        )?;
-        let orphans: Vec<(i64, i64)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (file_id, tag_id) in orphans {
-            self.conn.execute(
-                "DELETE FROM FileTags WHERE file_id = ?1 AND tag_id = ?2",
-                params![file_id, tag_id],
-            )?;
-            self.log_orphan_removal(
-                Some(file_id),
-                &format!(
-                    "removed orphan FileTags row file_id={file_id} tag_id={tag_id} (missing Tags)"
-                ),
-                "startup foreign_key orphan cleanup",
-            );
-        }
-        Ok(())
-    }
-
-    fn delete_orphan_metadata_missing_files(&self) -> SqliteResult<()> {
-        let mut stmt = self.conn.prepare(
-            "SELECT file_id, title FROM Metadata
-             WHERE file_id NOT IN (SELECT id FROM Files)",
-        )?;
-        let orphans: Vec<(i64, Option<String>)> = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        for (file_id, title) in orphans {
-            self.conn
-                .execute("DELETE FROM Metadata WHERE file_id = ?1", params![file_id])?;
-            let title_note = title.unwrap_or_default();
-            self.log_orphan_removal(
-                Some(file_id),
-                &format!(
-                    "removed orphan Metadata row file_id={file_id} title={title_note} (missing Files)"
-                ),
-                "startup foreign_key orphan cleanup",
-            );
+        if let Err(e) = result {
+            if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                eprintln!("warn: ROLLBACK failed after orphan cleanup error: {rb}");
+            }
+            return Err(e);
         }
         Ok(())
     }
@@ -1416,14 +1385,15 @@ mod tests {
     fn foreign_keys_enabled_on_fresh_connection() {
         let db = open_memory_db();
         assert_eq!(foreign_keys_enabled(&db), 1);
-        db.conn
+        let mut stmt = db
+            .conn
             .prepare("PRAGMA foreign_key_check")
-            .expect("fk check prepare")
-            .query_map([], |_| Ok(()))
-            .expect("fk check")
-            .next()
-            .transpose()
-            .expect("no fk violations");
+            .expect("fk check prepare");
+        let mut rows = stmt.query([]).expect("fk check query");
+        assert!(
+            rows.next().expect("fk check next").is_none(),
+            "expected no foreign_key_check rows"
+        );
     }
 
     #[test]
@@ -1492,15 +1462,32 @@ mod tests {
             .expect("meta count");
         assert_eq!(meta_count, 0);
         let logs = db.list_error_logs(50).expect("logs");
+        let summaries: Vec<_> = logs
+            .iter()
+            .filter(|e| {
+                e.category == "database" && e.message.contains("startup orphan cleanup removed")
+            })
+            .collect();
+        assert_eq!(
+            summaries.len(),
+            1,
+            "expected exactly one orphan cleanup summary got {logs:?}"
+        );
+        let summary = summaries[0];
         assert!(
-            logs.iter()
-                .any(|e| e.category == "database" && e.message.contains("missing Tags")),
-            "expected missing Tags orphan log got {logs:?}"
+            summary.message.contains("FileTags(missing Files)=1"),
+            "summary={}",
+            summary.message
         );
         assert!(
-            logs.iter()
-                .any(|e| e.category == "database" && e.message.contains("missing Files")),
-            "expected missing Files orphan log got {logs:?}"
+            summary.message.contains("FileTags(missing Tags)=1"),
+            "summary={}",
+            summary.message
+        );
+        assert!(
+            summary.message.contains("Metadata(missing Files)=1"),
+            "summary={}",
+            summary.message
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -1532,6 +1519,155 @@ mod tests {
         assert!(err.to_string().contains("injected BEGIN IMMEDIATE failure"));
         assert_eq!(foreign_keys_enabled(&db), 1);
         assert!(db.table_exists("Tags_mig").expect("Tags_mig kept"));
+    }
+
+    #[test]
+    fn add_file_tag_enforces_fk_when_enabled() {
+        let db = open_memory_db();
+        assert_eq!(foreign_keys_enabled(&db), 1);
+        let file_id = db
+            .insert_file("/tmp/fk-tag.mp4", 1, None)
+            .expect("insert file");
+        let tag_id = db
+            .get_or_create_tag("Keep", Some("Tag".to_string()))
+            .expect("tag");
+
+        db.add_file_tag(file_id, tag_id, 1.0).expect("valid link");
+        assert_eq!(db.get_file_tags(file_id).expect("tags").len(), 1);
+
+        let missing_file = db
+            .add_file_tag(99999, tag_id, 1.0)
+            .expect_err("missing file");
+        assert!(
+            missing_file.to_string().to_lowercase().contains("foreign"),
+            "err={missing_file}"
+        );
+        let missing_tag = db
+            .add_file_tag(file_id, 99999, 1.0)
+            .expect_err("missing tag");
+        assert!(
+            missing_tag.to_string().to_lowercase().contains("foreign"),
+            "err={missing_tag}"
+        );
+        let orphan_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM FileTags
+                 WHERE file_id = 99999 OR tag_id = 99999",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(orphan_count, 0);
+    }
+
+    #[test]
+    fn update_metadata_rejects_missing_file_when_fk_on() {
+        let db = open_memory_db();
+        assert_eq!(foreign_keys_enabled(&db), 1);
+        let err = db
+            .update_metadata(&Metadata {
+                file_id: 99999,
+                title: Some("orphan".into()),
+                studio: None,
+                release_date: None,
+                summary: None,
+                cover_image: None,
+                sprite_sheet_path: None,
+                source_type: None,
+            })
+            .expect_err("missing file");
+        assert!(
+            err.to_string().to_lowercase().contains("foreign"),
+            "err={err}"
+        );
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM Metadata", [], |row| row.get(0))
+            .expect("count");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn persist_scrape_success_rejects_missing_file_when_fk_on() {
+        let db = open_memory_db();
+        assert_eq!(foreign_keys_enabled(&db), 1);
+        let err = db
+            .persist_scrape_success(
+                &Metadata {
+                    file_id: 99999,
+                    title: Some("ghost".into()),
+                    studio: None,
+                    release_date: None,
+                    summary: None,
+                    cover_image: None,
+                    sprite_sheet_path: None,
+                    source_type: Some("nfo".into()),
+                },
+                &["TagA".into()],
+                &["ActorA".into()],
+                file_status::ready,
+            )
+            .expect_err("missing file");
+        assert!(
+            err.to_string().to_lowercase().contains("foreign"),
+            "err={err}"
+        );
+        let meta: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM Metadata", [], |row| row.get(0))
+            .expect("meta");
+        let ft: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM FileTags", [], |row| row.get(0))
+            .expect("ft");
+        assert_eq!(meta, 0);
+        assert_eq!(ft, 0);
+    }
+
+    #[test]
+    fn delete_file_record_removes_children_under_fk_on() {
+        let db = open_memory_db();
+        assert_eq!(foreign_keys_enabled(&db), 1);
+        let file_id = db
+            .insert_file("/tmp/fk-delete.mp4", 1, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("keep".into()),
+            studio: None,
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: None,
+        })
+        .expect("meta");
+        db.apply_scraped_tags(file_id, &["X".into()], &["Y".into()])
+            .expect("tags");
+
+        // 直接刪父列應因子列 FK 失敗
+        let parent_err = db
+            .conn
+            .execute("DELETE FROM Files WHERE id = ?1", params![file_id])
+            .expect_err("raw parent delete");
+        assert!(
+            parent_err.to_string().to_lowercase().contains("foreign"),
+            "err={parent_err}"
+        );
+
+        db.delete_file_record(file_id).expect("app delete");
+        assert_eq!(db.count_files().expect("files"), 0);
+        let meta: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM Metadata", [], |row| row.get(0))
+            .expect("meta");
+        let ft: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM FileTags", [], |row| row.get(0))
+            .expect("ft");
+        assert_eq!(meta, 0);
+        assert_eq!(ft, 0);
     }
 
     #[test]
@@ -1709,7 +1845,8 @@ mod tests {
                 );
                 ",
             );
-            for offset in 0..120 {
+            // 僅預佔用當前秒與鄰近一秒 迫使走碰撞後綴
+            for offset in [0u64, 1] {
                 ddl.push_str(&format!(
                     "CREATE TABLE Tags_mig_backup_{} (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,

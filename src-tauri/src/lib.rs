@@ -16,12 +16,39 @@ mod commands;
 
 use database::Database;
 use settings::SettingsStore;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use tauri::Manager;
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use task_queue::TaskQueue;
 use watcher::WatcherManager;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+
+fn show_database_init_error(
+    app: &tauri::App,
+    db_path: &std::path::Path,
+    err: &impl std::fmt::Display,
+) {
+    let message = format!(
+        "無法初始化資料庫 應用程式即將結束\n\n路徑: {}\n錯誤: {}\n\n若持續失敗 請備份後刪除損壞的資料庫檔再重試",
+        db_path.display(),
+        err
+    );
+    eprintln!("error: {message}");
+    // blocking_show 不可在主執行緒呼叫 改背景執行緒顯示後再結束
+    let handle = app.handle().clone();
+    let (tx, rx) = mpsc::sync_channel(0);
+    std::thread::spawn(move || {
+        handle
+            .dialog()
+            .message(&message)
+            .title("Intelligent DAM — 資料庫錯誤")
+            .kind(MessageDialogKind::Error)
+            .blocking_show();
+        let _ = tx.send(());
+    });
+    let _ = rx.recv();
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -34,8 +61,13 @@ pub fn run() {
             std::fs::create_dir_all(&app_data_dir).unwrap();
             let db_path = app_data_dir.join("intelligent_dam.db");
 
-            let db = Database::new(db_path.to_str().unwrap())
-                .expect("Failed to initialize database");
+            let db = match Database::new(db_path.to_str().unwrap()) {
+                Ok(db) => db,
+                Err(e) => {
+                    show_database_init_error(app, &db_path, &e);
+                    return Err(Box::new(e));
+                }
+            };
             let settings_store = SettingsStore::new(&app_data_dir);
 
             // Arc so Watcher ingest worker can share the same mutex
