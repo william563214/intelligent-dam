@@ -44,15 +44,10 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 | Watcher 無 E2E | `watcher.rs` 測試僅涵蓋路徑／事件分類／debounce 等 helper，無 notify→穩定度→ingest→queue 端到端 | — |
 | Windows 鎖偵測偏重 size stability | `file_stability.rs`：Windows 上多數複製工具不鎖目的檔，**size-stable 為主要可靠訊號**；`try_lock` 回傳 `WouldBlock` 時繼續等待，**僅其他錯誤**才退回 size-stable | Issue #8 已交付穩定度閘門 |
 | 進階 Handlebars helpers／碰撞 UI 缺席 | `path_template.rs` 僅註冊變數渲染、無 `register_helper`；衝突時後端 `unique_destination` 自動加後綴，前端無碰撞／衝突 UI | Issue #9 已交付基本模板搬運 |
-| 正式連線未啟用 `PRAGMA foreign_keys` | `Database::new` / `init_schema` 未執行 `PRAGMA foreign_keys = ON`；FK 宣告存在但連線預設不強制 | 測試路徑偶有手動開啟 |
 | 無 `PRAGMA user_version` schema 版本 | schema 以 `CREATE TABLE IF NOT EXISTS` + 特製遷移為主；未使用 `user_version` 做版本追蹤 | — |
 | `get_or_create_tag` 非 `ON CONFLICT` | `database.rs` 為 select-then-insert（`SELECT` 後無列再 `INSERT`），非 `INSERT … ON CONFLICT` | 併發下理論上可能撞 UNIQUE |
 
-### PR #20 審核非阻塞 nits（仍存在於程式碼）
-
-1. **碰撞測試 `>= 3` 斷言過寬** — `database.rs` 中 `startup_backups_nonempty_tags_mig_when_tags_also_nonempty` 以 `backup_name.matches('_').count() >= 3` 斷言碰撞後綴；基底名 `Tags_mig_backup_<secs>` 已含 3 個 `_`，即使未加碰撞後綴也會通過。
-2. **僅 `BEGIN IMMEDIATE` 本身失敗時略過 FK 還原** — `swap_empty_tags_with_tags_mig` 在 `PRAGMA foreign_keys = OFF` 之後：swap 本體失敗路徑**會**呼叫 `restore_foreign_keys_state`；**只有** `BEGIN IMMEDIATE` 本身失敗提早返回時，才不會還原 FK。
-3. **遷移 backup 警告未寫入 ErrorLog** — `backup_nonempty_tags_mig` 僅 `eprintln!` 警告；未呼叫 `insert_error_log`。
+> 已由此 PR（[#28](https://github.com/william563214/intelligent-dam/pull/28)）修復、不再列為缺口：正式連線 `PRAGMA foreign_keys = ON`＋啟動 orphan 清理；#20 nits（碰撞斷言、`BEGIN` 失敗仍還原 FK、`Tags_mig` 備份寫入 ErrorLog）。
 
 ---
 

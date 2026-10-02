@@ -29,3 +29,8 @@ image = "0.24"
 regex = "1.10"
 handlebars = "5"
 tauri-plugin-dialog = "2"
+
+# Linux 禁用 rfd gtk3 後備 以免在 tao setup MainContext 下 GtkGlobalThread 死鎖
+# macOS / Windows 使用原生 rfd 對話框
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = "0.16"
