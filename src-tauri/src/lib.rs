@@ -40,35 +40,56 @@ pub(crate) fn format_database_init_error(
 }
 
 /// 同步顯示錯誤對話框 必須可在 Tauri setup 主執行緒呼叫
-/// Linux 優先 zenity 避免 tauri-plugin-dialog 事件迴圈死鎖 rfd 作跨平台後備
+///
+/// Linux 絕不使用 rfd gtk3 `show()`：其 `GtkGlobalThread::run_blocking` 會在
+/// tao `run_return` / `with_thread_default` 持有的 default MainContext 內靜默死鎖
+/// Linux 順序：zenity → kdialog → 僅 stderr（呼叫端已 eprintln）後由呼叫端 exit(1)
+/// 桌面非 Linux（macOS / Windows）使用 rfd 原生對話框
 fn show_blocking_error_dialog(title: &str, message: &str) {
+    // 測試專用：略過任何對話框 UI 讓呼叫端直接 exit(1)
+    // 正式發行路徑請勿設定 IDAM_SKIP_ERROR_DIALOG
     if std::env::var_os("IDAM_SKIP_ERROR_DIALOG").is_some() {
         return;
     }
 
     #[cfg(target_os = "linux")]
     {
+        // 若 zenity 已成功啟動但 display 失敗 仍視為已嘗試顯示（有 exit code 即返回）
         if let Ok(status) = std::process::Command::new("zenity")
             .arg("--error")
             .arg(format!("--title={title}"))
             .arg(format!("--text={message}"))
-            .arg("--no-wrap")
+            .arg("--no-markup")
             .arg("--width=520")
             .status()
         {
-            // zenity 有執行即視為已顯示 無論使用者按 OK 或關閉
             if status.code().is_some() {
                 return;
             }
         }
+        if let Ok(status) = std::process::Command::new("kdialog")
+            .arg(format!("--title={title}"))
+            .arg("--error")
+            .arg(message)
+            .status()
+        {
+            if status.code().is_some() {
+                return;
+            }
+        }
+        // 無 zenity / kdialog：不呼叫 rfd 僅依賴呼叫端 stderr
+        return;
     }
 
-    let _ = rfd::MessageDialog::new()
-        .set_level(rfd::MessageLevel::Error)
-        .set_title(title)
-        .set_description(message)
-        .set_buttons(rfd::MessageButtons::Ok)
-        .show();
+    #[cfg(all(desktop, not(target_os = "linux")))]
+    {
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title(title)
+            .set_description(message)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
 }
 
 /// 顯示錯誤後以 exit(1) 結束 不回傳 Err 以免 Failed to setup app panic
