@@ -44,7 +44,7 @@ pub(crate) fn format_database_init_error(
 /// Linux 絕不使用 rfd gtk3 `show()`：其 `GtkGlobalThread::run_blocking` 會在
 /// tao `run_return` / `with_thread_default` 持有的 default MainContext 內靜默死鎖
 /// Linux 順序：zenity → kdialog → 僅 stderr（呼叫端已 eprintln）後由呼叫端 exit(1)
-/// 桌面非 Linux（macOS / Windows）使用 rfd 原生對話框
+/// Windows / macOS 使用 rfd 原生對話框（cfg 與 Cargo.toml target 一致 避免 BSD 編譯失敗）
 fn show_blocking_error_dialog(title: &str, message: &str) {
     // 測試專用：略過任何對話框 UI 讓呼叫端直接 exit(1)
     // 正式發行路徑請勿設定 IDAM_SKIP_ERROR_DIALOG
@@ -81,7 +81,7 @@ fn show_blocking_error_dialog(title: &str, message: &str) {
         return;
     }
 
-    #[cfg(all(desktop, not(target_os = "linux")))]
+    #[cfg(any(windows, target_os = "macos"))]
     {
         let _ = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
