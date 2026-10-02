@@ -203,9 +203,10 @@ fn try_confirm_exclusive(path: &Path) -> LockProbe {
         Err(_) => return LockProbe::Unavailable,
     };
 
-    match file.try_lock() {
+    // 明確走 fs4::FileExt 避免與 std::fs::File::try_lock (1.89+) 固有方法衝突
+    match FileExt::try_lock(&file) {
         Ok(()) => {
-            let _ = file.unlock();
+            let _ = FileExt::unlock(&file);
             LockProbe::Free
         }
         Err(TryLockError::WouldBlock) => LockProbe::Held,
