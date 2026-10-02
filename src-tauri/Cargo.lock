@@ -2006,6 +2006,7 @@ dependencies = [
  "notify",
  "regex",
  "reqwest 0.11.27",
+ "rfd",
  "rusqlite",
  "serde",
  "serde_json",
