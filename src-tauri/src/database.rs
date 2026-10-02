@@ -403,7 +403,13 @@ impl Database {
         Ok(())
     }
 
+    fn select_exists(&self, sql: &str) -> SqliteResult<bool> {
+        let flag: i64 = self.conn.query_row(sql, [], |row| row.get(0))?;
+        Ok(flag != 0)
+    }
+
     /// 單一交易 bulk 清除 orphan 若有刪除則寫一筆 ErrorLog 摘要
+    /// 先以 cheap EXISTS 探測 無 orphan 時不取 BEGIN IMMEDIATE 寫鎖
     /// Tags 空且 Tags_mig 有資料時跳過 FileTags→Tags 以免交換前誤刪
     fn cleanup_fk_orphans_for_startup(&self) -> SqliteResult<()> {
         let has_filetags = self.table_exists("FileTags")?;
@@ -423,15 +429,44 @@ impl Database {
             false
         };
 
-        let need_filetags_files = has_filetags && has_files;
-        let need_metadata = has_metadata && has_files;
-        if !need_filetags_files && !need_metadata && !clean_filetags_tags {
+        let has_ft_files_orphans = if has_filetags && has_files {
+            self.select_exists(
+                "SELECT EXISTS(
+                    SELECT 1 FROM FileTags
+                    WHERE file_id NOT IN (SELECT id FROM Files)
+                )",
+            )?
+        } else {
+            false
+        };
+        let has_meta_orphans = if has_metadata && has_files {
+            self.select_exists(
+                "SELECT EXISTS(
+                    SELECT 1 FROM Metadata
+                    WHERE file_id NOT IN (SELECT id FROM Files)
+                )",
+            )?
+        } else {
+            false
+        };
+        let has_ft_tags_orphans = if clean_filetags_tags {
+            self.select_exists(
+                "SELECT EXISTS(
+                    SELECT 1 FROM FileTags
+                    WHERE tag_id NOT IN (SELECT id FROM Tags)
+                )",
+            )?
+        } else {
+            false
+        };
+
+        if !has_ft_files_orphans && !has_meta_orphans && !has_ft_tags_orphans {
             return Ok(());
         }
 
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let result = (|| -> SqliteResult<()> {
-            let filetags_missing_files = if need_filetags_files {
+            let filetags_missing_files = if has_ft_files_orphans {
                 self.conn.execute(
                     "DELETE FROM FileTags WHERE file_id NOT IN (SELECT id FROM Files)",
                     [],
@@ -439,7 +474,7 @@ impl Database {
             } else {
                 0
             };
-            let metadata_missing_files = if need_metadata {
+            let metadata_missing_files = if has_meta_orphans {
                 self.conn.execute(
                     "DELETE FROM Metadata WHERE file_id NOT IN (SELECT id FROM Files)",
                     [],
@@ -447,7 +482,7 @@ impl Database {
             } else {
                 0
             };
-            let filetags_missing_tags = if clean_filetags_tags {
+            let filetags_missing_tags = if has_ft_tags_orphans {
                 self.conn.execute(
                     "DELETE FROM FileTags WHERE tag_id NOT IN (SELECT id FROM Tags)",
                     [],
@@ -1621,8 +1656,13 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM FileTags", [], |row| row.get(0))
             .expect("ft");
+        let tags: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM Tags", [], |row| row.get(0))
+            .expect("tags");
         assert_eq!(meta, 0);
         assert_eq!(ft, 0);
+        assert_eq!(tags, 0);
     }
 
     #[test]

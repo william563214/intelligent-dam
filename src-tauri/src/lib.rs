@@ -16,38 +16,67 @@ mod commands;
 
 use database::Database;
 use settings::SettingsStore;
-use std::sync::{mpsc, Arc, Mutex};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tauri::Manager;
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use task_queue::TaskQueue;
 use watcher::WatcherManager;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 
-fn show_database_init_error(
-    app: &tauri::App,
-    db_path: &std::path::Path,
+#[allow(non_upper_case_globals)]
+const database_error_dialog_title: &str = "Intelligent DAM — 資料庫錯誤";
+
+/// 組裝資料庫初始化失敗的使用者訊息 供對話框與日誌共用
+pub(crate) fn format_database_init_error(
+    db_path: &Path,
     err: &impl std::fmt::Display,
-) {
-    let message = format!(
+) -> String {
+    format!(
         "無法初始化資料庫 應用程式即將結束\n\n路徑: {}\n錯誤: {}\n\n若持續失敗 請備份後刪除損壞的資料庫檔再重試",
         db_path.display(),
         err
-    );
+    )
+}
+
+/// 同步顯示錯誤對話框 必須可在 Tauri setup 主執行緒呼叫
+/// Linux 優先 zenity 避免 tauri-plugin-dialog 事件迴圈死鎖 rfd 作跨平台後備
+fn show_blocking_error_dialog(title: &str, message: &str) {
+    if std::env::var_os("IDAM_SKIP_ERROR_DIALOG").is_some() {
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::process::Command::new("zenity")
+            .arg("--error")
+            .arg(format!("--title={title}"))
+            .arg(format!("--text={message}"))
+            .arg("--no-wrap")
+            .arg("--width=520")
+            .status()
+        {
+            // zenity 有執行即視為已顯示 無論使用者按 OK 或關閉
+            if status.code().is_some() {
+                return;
+            }
+        }
+    }
+
+    let _ = rfd::MessageDialog::new()
+        .set_level(rfd::MessageLevel::Error)
+        .set_title(title)
+        .set_description(message)
+        .set_buttons(rfd::MessageButtons::Ok)
+        .show();
+}
+
+/// 顯示錯誤後以 exit(1) 結束 不回傳 Err 以免 Failed to setup app panic
+fn show_database_init_error_and_exit(db_path: &Path, err: &impl std::fmt::Display) -> ! {
+    let message = format_database_init_error(db_path, err);
     eprintln!("error: {message}");
-    // blocking_show 不可在主執行緒呼叫 改背景執行緒顯示後再結束
-    let handle = app.handle().clone();
-    let (tx, rx) = mpsc::sync_channel(0);
-    std::thread::spawn(move || {
-        handle
-            .dialog()
-            .message(&message)
-            .title("Intelligent DAM — 資料庫錯誤")
-            .kind(MessageDialogKind::Error)
-            .blocking_show();
-        let _ = tx.send(());
-    });
-    let _ = rx.recv();
+    show_blocking_error_dialog(database_error_dialog_title, &message);
+    std::process::exit(1);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -64,8 +93,7 @@ pub fn run() {
             let db = match Database::new(db_path.to_str().unwrap()) {
                 Ok(db) => db,
                 Err(e) => {
-                    show_database_init_error(app, &db_path, &e);
-                    return Err(Box::new(e));
+                    show_database_init_error_and_exit(&db_path, &e);
                 }
             };
             let settings_store = SettingsStore::new(&app_data_dir);
@@ -102,4 +130,42 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_database_init_error;
+    use crate::database::Database;
+    use std::path::PathBuf;
+
+    #[test]
+    fn format_database_init_error_includes_path_and_error() {
+        let path = PathBuf::from("/tmp/broken.db");
+        let msg = format_database_init_error(&path, &"file is not a database");
+        assert!(msg.contains("/tmp/broken.db"));
+        assert!(msg.contains("file is not a database"));
+        assert!(msg.contains("無法初始化資料庫"));
+    }
+
+    #[test]
+    fn database_new_fails_on_garbage_file() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.temp/tests");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join(format!(
+            "corrupt-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"this is not a sqlite database").expect("write garbage");
+        let err = match Database::new(path.to_str().expect("utf8")) {
+            Ok(_) => panic!("corrupt db should fail to open"),
+            Err(e) => e,
+        };
+        let msg = format_database_init_error(&path, &err);
+        assert!(msg.contains("無法初始化資料庫"));
+        assert!(msg.contains(path.to_str().unwrap()));
+        let _ = std::fs::remove_file(&path);
+    }
 }
