@@ -1,6 +1,6 @@
 # Intelligent DAM — Roadmap
 
-本文件整理 **第一階段 MVP** 完成後的缺口與建議實作順序，並反映 **`main` @ `c433334`** 現況。規格細節見 [SPECIFICATION.md](./SPECIFICATION.md)；安裝與使用見 [README.md](./README.md)。
+本文件整理 **第一階段 MVP** 完成後的缺口與建議實作順序，並反映 **`main` @ `21245f7`** 現況。規格細節見 [SPECIFICATION.md](./SPECIFICATION.md)；安裝與使用見 [README.md](./README.md)。
 
 > 實作變更請透過 Pull Request 送審，**請勿直接 merge 到 main**（合併請威廉明確指示）。細項以 GitHub Issues 為準。
 
@@ -21,12 +21,13 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 
 ## 專案現況 (Status)
 
-基準：**`main` @ `c433334`**（含 PR [#20](https://github.com/william563214/intelligent-dam/pull/20) tag uniqueness）。
+基準：**`main` @ `21245f7`**（含 PR [#28](https://github.com/william563214/intelligent-dam/pull/28) FK on／orphan 清理／遷移硬化／DB init 錯誤對話框；以及 PR [#20](https://github.com/william563214/intelligent-dam/pull/20) tag uniqueness）。
 
 - **第一階段 MVP + wrap-up：已完成**（Issues #1–#5 對應 PR #15–#19）。
 - **第二階段 Automation core：已完成**（Issues #6–#11 對應 PR #21–#25）。
 - **UX polish（#12）：已完成**（PR [#26](https://github.com/william563214/intelligent-dam/pull/26)，`a2c96e6`）。
 - **Tag uniqueness（#20）：已合入** — `(name, category)` 唯一約束 + 原子、可恢復遷移（`c433334`）。
+- **DB hardening（#28）：已合入** — 正式連線 `PRAGMA foreign_keys = ON`、啟動 orphan 清理、Tags 遷移硬化、DB init 錯誤對話框（`21245f7`）。
 - **明確延後（第三階段 / #13）**：ONNX / CLIP、語意搜尋、即時轉碼。
 
 ---
@@ -35,7 +36,7 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 
 以下僅列已於 `src-tauri/src` / `src/`（及 repo 根目錄）**實際確認**的剩餘缺口；已合入功能不再列為缺口。
 
-| 缺口 | `main` @ `c433334` 現況 | 備註 |
+| 缺口 | `main` @ `21245f7` 現況 | 備註 |
 |------|-------------------------|------|
 | Task queue 非持久化 | `task_queue.rs` 為進程內 `VecDeque` / `HashMap`；註明 in-memory、重啟遺失、非 crash-safe | Issue #10 已交付佇列與進度事件；持久化／重啟恢復仍缺 |
 | Near-phash 閾值 ≤8 可能誤判 | `phash.rs` 預設 `near_phash_max_distance = 8`（可用 `IDAM_NEAR_PHASH_MAX_DISTANCE` 覆寫）；文件註明視覺近似但不同片段可能 false-positive | 行為符合 Stash 風格；非阻塞 |
@@ -47,7 +48,7 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 | 無 `PRAGMA user_version` schema 版本 | schema 以 `CREATE TABLE IF NOT EXISTS` + 特製遷移為主；未使用 `user_version` 做版本追蹤 | — |
 | `get_or_create_tag` 非 `ON CONFLICT` | `database.rs` 為 select-then-insert（`SELECT` 後無列再 `INSERT`），非 `INSERT … ON CONFLICT` | 併發下理論上可能撞 UNIQUE |
 
-> 已由此 PR（[#28](https://github.com/william563214/intelligent-dam/pull/28)）修復、不再列為缺口：正式連線 `PRAGMA foreign_keys = ON`＋啟動 orphan 清理；#20 nits（碰撞斷言、`BEGIN` 失敗仍還原 FK、`Tags_mig` 備份寫入 ErrorLog）。
+> 已由 PR [#28](https://github.com/william563214/intelligent-dam/pull/28) 修復、不再列為缺口：正式連線 `PRAGMA foreign_keys = ON`＋啟動 orphan 清理；#20 nits（碰撞斷言、`BEGIN` 失敗仍還原 FK、`Tags_mig` 備份寫入 ErrorLog）。
 
 ---
 
