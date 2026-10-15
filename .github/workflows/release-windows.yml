@@ -1,0 +1,104 @@
+# Build Windows NSIS (.exe) and MSI installers and upload them to an existing GitHub Release
+# Does not create tags or releases and does not edit release notes or draft state
+name: Release Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build from and upload assets to
+        required: true
+        default: v0.1.0
+        type: string
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    env:
+      # workflow_dispatch uses inputs.tag release published uses the release tag
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Verify target release exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Target tag: ${RELEASE_TAG}"
+          gh release view "${RELEASE_TAG}" --json tagName,isDraft,url
+
+      - name: Checkout tag commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # package-lock.json lockfileVersion 3 Node 18+
+          node-version: "20"
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Build frontend
+        # tauri.conf.json has no beforeBuildCommand so the web UI must be built first
+        run: npm run build
+
+      - name: Build Windows installers
+        # --locked keeps Cargo.lock authoritative MSRV 1.83 compatible tree
+        run: npx tauri build --bundles nsis,msi -- --locked
+
+      - name: Upload installers and SHA256SUMS-windows.txt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path .temp/windows-release | Out-Null
+
+          $msiFiles = @(Get-ChildItem -Path "src-tauri/target/release/bundle/msi/*.msi" -ErrorAction SilentlyContinue)
+          $nsisFiles = @(Get-ChildItem -Path "src-tauri/target/release/bundle/nsis/*-setup.exe" -ErrorAction SilentlyContinue)
+
+          if ($msiFiles.Count -eq 0 -or $nsisFiles.Count -eq 0) {
+            Write-Host "Missing MSI or NSIS installer under src-tauri/target/release/bundle"
+            Get-ChildItem -Path "src-tauri/target/release/bundle" -Recurse -File | ForEach-Object { $_.FullName }
+            exit 1
+          }
+
+          $artifacts = @($msiFiles + $nsisFiles)
+          foreach ($file in $artifacts) {
+            Copy-Item -Force -Path $file.FullName -Destination ".temp/windows-release/"
+          }
+
+          $staged = @(
+            Get-ChildItem -Path ".temp/windows-release/*.msi"
+            Get-ChildItem -Path ".temp/windows-release/*-setup.exe"
+          )
+          $sumsPath = ".temp/windows-release/SHA256SUMS-windows.txt"
+          $lines = foreach ($file in $staged) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "{0}  {1}" -f $hash, $file.Name
+          }
+          Set-Content -Path $sumsPath -Value $lines -Encoding ascii
+
+          Write-Host "Uploading to release $env:RELEASE_TAG"
+          Get-ChildItem -Path ".temp/windows-release" | Format-Table Name, Length
+          Get-Content -Path $sumsPath
+
+          # --clobber replaces same-named Windows assets only leaves Linux SHA256SUMS untouched
+          $uploadArgs = @("release", "upload", $env:RELEASE_TAG)
+          $uploadArgs += @($staged | ForEach-Object { $_.FullName })
+          $uploadArgs += @($sumsPath, "--clobber")
+          & gh @uploadArgs
