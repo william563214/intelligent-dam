@@ -35,6 +35,6 @@ tauri-plugin-dialog = "~2.6.0"
 
 # Linux 禁用 rfd gtk3 後備 以免在 tao setup MainContext 下 GtkGlobalThread 死鎖
 # macOS / Windows 使用原生 rfd 對話框 無需 xdg-portal/gtk3 預設特徵
-# default-features = false 後 Win/mac 原生後端仍可編譯 無需額外 feature
+# common-controls-v6 由 tauri-plugin-dialog 提供
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 rfd = { version = "~0.16.0", default-features = false }

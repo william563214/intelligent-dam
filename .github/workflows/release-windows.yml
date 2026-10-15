@@ -55,6 +55,16 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Build frontend if tag lacks beforeBuildCommand
+        # Checkout is the release tag commit (e.g. v0.1.0) which may predate
+        # beforeBuildCommand. Skip when present so tauri build does not double-build.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! node -e "process.exit(require('./src-tauri/tauri.conf.json').build?.beforeBuildCommand?0:1)"; then
+            npm run build
+          fi
+
       - name: Setup Rust toolchain
         # Action pinned to stable-branch tip toolchain pinned to MSRV
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -67,8 +77,9 @@ jobs:
           workspaces: ./src-tauri -> target
 
       - name: Build Windows installers
-        # beforeBuildCommand runs npm run build once avoid a duplicate frontend build
-        # --locked keeps Cargo.lock authoritative MSRV 1.83 compatible tree
+        # Frontend already built above when tag has no beforeBuildCommand
+        # otherwise tauri beforeBuildCommand builds it once during this step
+        # --locked keeps Cargo.lock authoritative for the MSRV 1.83 tree
         run: npx tauri build --bundles nsis,msi -- --locked
 
       - name: Upload installers and SHA256SUMS-windows.txt
