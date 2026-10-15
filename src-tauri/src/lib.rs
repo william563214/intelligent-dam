@@ -73,12 +73,10 @@ fn show_blocking_error_dialog(title: &str, message: &str) {
             .arg(message)
             .status()
         {
-            if status.code().is_some() {
-                return;
-            }
+            // 有 exit code 即視為已嘗試顯示 區塊結束後函式返回
+            let _ = status.code();
         }
         // 無 zenity / kdialog：不呼叫 rfd 僅依賴呼叫端 stderr
-        return;
     }
 
     #[cfg(any(windows, target_os = "macos"))]

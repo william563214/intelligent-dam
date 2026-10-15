@@ -2,7 +2,7 @@ use crate::file_status;
 use crate::phash;
 use rusqlite::{Connection, Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -636,6 +636,7 @@ impl Database {
     }
 
     /// Insert or update by path; returns the stable row id (path-unique).
+    #[cfg(test)]
     pub fn insert_file(
         &self,
         path: &str,
@@ -647,6 +648,7 @@ impl Database {
     }
 
     /// Count Files rows (for path-dedup assertions).
+    #[cfg(test)]
     pub fn count_files(&self) -> SqliteResult<i64> {
         self.conn
             .query_row("SELECT COUNT(*) FROM Files", [], |row| row.get(0))
@@ -1152,6 +1154,7 @@ mod swap_tags_fault {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn open_memory_db() -> Database {
         Database::new(":memory:").expect("open memory db")
