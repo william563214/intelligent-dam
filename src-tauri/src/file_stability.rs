@@ -63,6 +63,7 @@ impl Default for StabilityOptions {
 
 impl StabilityOptions {
     /// Faster timings for unit tests
+    #[cfg(test)]
     pub fn for_tests() -> Self {
         Self {
             poll_interval: Duration::from_millis(40),

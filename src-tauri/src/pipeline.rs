@@ -859,6 +859,7 @@ fn fs_create_dir_all(path: &Path) -> Result<()> {
 }
 
 /// Pure step-order helper used by unit tests
+#[cfg(test)]
 pub fn planned_steps(options: &PipelineOptions) -> Vec<&'static str> {
     let mut steps = Vec::new();
     if options.enable_scrape {

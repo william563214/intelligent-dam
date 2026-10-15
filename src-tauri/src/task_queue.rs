@@ -209,10 +209,12 @@ impl Scheduler {
         id
     }
 
+    #[cfg(test)]
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
 
+    #[cfg(test)]
     pub fn running_len(&self) -> usize {
         self.running.len()
     }
@@ -221,6 +223,7 @@ impl Scheduler {
         self.jobs.get(&id)
     }
 
+    #[cfg(test)]
     pub fn failed_ids(&self) -> Vec<u64> {
         self.jobs
             .values()

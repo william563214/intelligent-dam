@@ -160,7 +160,7 @@ pub fn render_output_path(
         .filter(|p| !p.is_empty() && *p != "." && *p != "..")
         // Drop Windows drive token from parts list we rebuild it below
         .filter(|p| !is_windows_drive_token(p))
-        .map(|p| sanitize_segment(p))
+        .map(sanitize_segment)
         .filter(|p| !p.is_empty())
         .collect();
 
@@ -244,6 +244,7 @@ pub fn move_file(source: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Test helper force the copy+remove fallback path (simulates cross-device rename)
+#[cfg(test)]
 pub fn move_file_via_copy(source: &Path, dest: &Path) -> Result<()> {
     move_file_inner(source, dest, true)
 }

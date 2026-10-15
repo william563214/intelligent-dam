@@ -74,11 +74,13 @@ pub fn hamming_distance(a: u64, b: u64) -> u32 {
 }
 
 /// True when distance is within the MVP near-duplicate threshold.
+#[cfg(test)]
 pub fn is_near_duplicate(a: u64, b: u64) -> bool {
     hamming_distance(a, b) <= near_phash_max_distance()
 }
 
 /// Compare two hex phash strings. Returns None if either fails to parse.
+#[cfg(test)]
 pub fn hex_hamming_distance(a: &str, b: &str) -> Option<u32> {
     let left = parse_phash_hex(a)?;
     let right = parse_phash_hex(b)?;
@@ -230,12 +232,12 @@ fn dct2d_lowfreq(input: &[f64], n: usize, hash_n: usize) -> Vec<f64> {
 fn dct1d(input: &[f64], output: &mut [f64]) {
     let n = input.len();
     let pi_n = std::f64::consts::PI / n as f64;
-    for k in 0..n {
+    for (k, slot) in output.iter_mut().enumerate().take(n) {
         let mut sum = 0.0;
         for (n_idx, &x) in input.iter().enumerate() {
             sum += x * ((n_idx as f64 + 0.5) * k as f64 * pi_n).cos();
         }
-        output[k] = sum;
+        *slot = sum;
     }
 }
 
