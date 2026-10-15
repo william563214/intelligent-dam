@@ -1,0 +1,4 @@
+# 套用在 src-tauri 套件建置 讓 resolver 在依賴宣告較高 MSRV 時可 fallback
+# 搭配已提交的 Cargo.lock 與 --locked 維持 rust-version 1.83 可建置
+[resolver]
+incompatible-rust-versions = "fallback"

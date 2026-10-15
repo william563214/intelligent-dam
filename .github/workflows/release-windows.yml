@@ -66,11 +66,8 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
 
-      - name: Build frontend
-        # tauri.conf.json has no beforeBuildCommand so the web UI must be built first
-        run: npm run build
-
       - name: Build Windows installers
+        # beforeBuildCommand runs npm run build once avoid a duplicate frontend build
         # --locked keeps Cargo.lock authoritative MSRV 1.83 compatible tree
         run: npx tauri build --bundles nsis,msi -- --locked
 

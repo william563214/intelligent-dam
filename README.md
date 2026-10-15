@@ -22,7 +22,7 @@ Intelligent DAM 是一款 Windows 平台下的高效能桌面應用程式，用�
 
 - Windows 10/11 (或 macOS/Linux，Tauri 支援跨平台)
 - Node.js 18+ 和 npm
-- Rust 1.83+（與 `src-tauri/Cargo.toml` 的 `rust-version` 一致；依賴樹中 `pest`／`icu_*` 等宣告的最低版本）
+- Rust 1.83+（與 `src-tauri/Cargo.toml` 的 `rust-version` 一致；依賴樹中 `pest`／`icu_*` 等宣告的最低版本）。**MSRV 1.83 僅在使用已提交的 `src-tauri/Cargo.lock` 並以 `cargo … --locked` 建置時成立**；未鎖定解析時依賴可能拉取較新的 `rust-version`）
 - Python 3.x (用於 AV_Data_Capture)
 - FFmpeg (用於媒體處理)
 

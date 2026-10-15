@@ -12,12 +12,12 @@ name = "intelligent_dam_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-# 與目前 Cargo.lock 對齊 避免 npm/crate minor 漂移
-tauri-build = { version = "2.5", features = [] }
+# 與目前 Cargo.lock 對齊 使用 ~ 釘住相容範圍 避免 minor 漂移
+tauri-build = { version = "~2.5.2", features = [] }
 
 [dependencies]
-tauri = { version = "2.9", features = ["protocol-asset"] }
-tauri-plugin-opener = "2.5"
+tauri = { version = "~2.9.3", features = ["protocol-asset"] }
+tauri-plugin-opener = "~2.5.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -31,9 +31,10 @@ walkdir = "2.4"
 image = "0.24"
 regex = "1.10"
 handlebars = "5"
-tauri-plugin-dialog = "2.6.0"
+tauri-plugin-dialog = "~2.6.0"
 
 # Linux 禁用 rfd gtk3 後備 以免在 tao setup MainContext 下 GtkGlobalThread 死鎖
 # macOS / Windows 使用原生 rfd 對話框 無需 xdg-portal/gtk3 預設特徵
+# default-features = false 後 Win/mac 原生後端仍可編譯 無需額外 feature
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-rfd = { version = "0.16", default-features = false }
+rfd = { version = "~0.16.0", default-features = false }
