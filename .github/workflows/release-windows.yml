@@ -13,16 +13,24 @@ on:
   release:
     types: [published]
 
-permissions:
-  contents: write
+# Least privilege at workflow level job grants contents write for gh upload
+permissions: {}
+
+concurrency:
+  group: release-windows-${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
   build-windows:
     runs-on: windows-latest
+    permissions:
+      contents: write
     env:
       # workflow_dispatch uses inputs.tag release published uses the release tag
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Required before checkout so gh can target this repo without a local git remote
+      GH_REPO: ${{ github.repository }}
     steps:
       - name: Verify target release exists
         shell: bash
@@ -32,12 +40,13 @@ jobs:
           gh release view "${RELEASE_TAG}" --json tagName,isDraft,url
 
       - name: Checkout tag commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           # package-lock.json lockfileVersion 3 Node 18+
           node-version: "20"
@@ -47,10 +56,13 @@ jobs:
         run: npm ci
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Action pinned to stable-branch tip toolchain pinned to MSRV
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: "1.83.0"
 
       - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: ./src-tauri -> target
 
@@ -77,21 +89,25 @@ jobs:
             exit 1
           }
 
+          # Rename spaces to dots so asset names match GitHub Release storage and checksums
           $artifacts = @($msiFiles + $nsisFiles)
           foreach ($file in $artifacts) {
-            Copy-Item -Force -Path $file.FullName -Destination ".temp/windows-release/"
+            $safeName = $file.Name -replace ' ', '.'
+            Copy-Item -Force -Path $file.FullName -Destination (Join-Path ".temp/windows-release" $safeName)
           }
 
           $staged = @(
             Get-ChildItem -Path ".temp/windows-release/*.msi"
             Get-ChildItem -Path ".temp/windows-release/*-setup.exe"
           )
-          $sumsPath = ".temp/windows-release/SHA256SUMS-windows.txt"
+          $sumsPath = (Join-Path (Resolve-Path ".temp/windows-release").Path "SHA256SUMS-windows.txt")
           $lines = foreach ($file in $staged) {
             $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             "{0}  {1}" -f $hash, $file.Name
           }
-          Set-Content -Path $sumsPath -Value $lines -Encoding ascii
+          # LF only so sha256sum -c works on Linux
+          $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+          [System.IO.File]::WriteAllText($sumsPath, (($lines -join "`n") + "`n"), $utf8NoBom)
 
           Write-Host "Uploading to release $env:RELEASE_TAG"
           Get-ChildItem -Path ".temp/windows-release" | Format-Table Name, Length
