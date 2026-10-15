@@ -231,6 +231,7 @@ impl WatcherManager {
     }
 
     /// Stop monitoring if active. Idempotent. Uses [`worker_join_timeout`].
+    #[cfg(test)]
     pub fn stop(&self) -> Result<()> {
         self.stop_with_timeout(worker_join_timeout)
     }
