@@ -15,7 +15,7 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 | **第一階段** MVP 基礎建設 ✅ | （已完成）+ 下方 **MVP wrap-up**（items #1–#5）✅ | Foundation 已落地；wrap-up 已合入 main |
 | **第二階段** 自動化與刮削 ✅ | **Automation core**（items #6–#11）✅ | Watcher、穩定度檢測、pipeline、Handlebars、佇列、去重 |
 | （README／SPEC 未單列） | **UX polish**（#12）✅ | 一鍵整理、批次、錯誤日誌、Settings 選擇器／連線測試 |
-| （發行） | **v0.1.0** ✅ | tag `v0.1.0` @ `6d19ef9`；Linux + Windows 安裝包已上架（見下方） |
+| （發行） | **v0.1.0** ✅ | tag `v0.1.0` @ `6d19ef9`（[#29](https://github.com/william563214/intelligent-dam/pull/29) merge commit）；Linux + Windows 安裝包已上架（見下方） |
 | （README／SPEC 未單列） | **v0.2**（Issues #31–#40） | CI、DB／佇列硬化、整合測試、Watcher／Windows／phash 強化、macOS workflow、Handlebars／碰撞 UI |
 | **第三階段** AI 整合 | **Deferred / Later**（#13） | ONNX / CLIP、語意搜尋、即時轉碼 — **現階段不要開工** |
 
@@ -30,9 +30,9 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 - **UX polish（#12）：已完成**（PR [#26](https://github.com/william563214/intelligent-dam/pull/26)，`a2c96e6`）。
 - **Tag uniqueness（#20）：已合入** — `(name, category)` 唯一約束 + 原子、可恢復遷移（`c433334`）。
 - **DB hardening（#28）：已合入** — 正式連線 `PRAGMA foreign_keys = ON`、啟動 orphan 清理、Tags 遷移硬化、DB init 錯誤對話框（`21245f7`）。
-- **v0.1.0：已發布** — tag [`v0.1.0`](https://github.com/william563214/intelligent-dam/releases/tag/v0.1.0) 指向 `6d19ef9`（PR [#29](https://github.com/william563214/intelligent-dam/pull/29)）。
-  - **Linux**：`.deb`／`.rpm`／`.AppImage`
-  - **Windows**：MSI／NSIS（經 PR [#30](https://github.com/william563214/intelligent-dam/pull/30) `release-windows.yml` 上傳至既有 Release；**未簽章**，安裝時可能觸發 SmartScreen）
+- **v0.1.0：已發布** — tag [`v0.1.0`](https://github.com/william563214/intelligent-dam/releases/tag/v0.1.0) 指向 `6d19ef9`（PR [#29](https://github.com/william563214/intelligent-dam/pull/29) 的 merge commit）。
+  - **Linux**：`.deb`／`.rpm`／`.AppImage`（校驗：`SHA256SUMS`）
+  - **Windows**：MSI／NSIS（經 PR [#30](https://github.com/william563214/intelligent-dam/pull/30) `release-windows.yml` 上傳至既有 Release；**未簽章**，安裝時可能觸發 SmartScreen；校驗：`SHA256SUMS-windows.txt`）
   - **macOS**：本版**未提供**
 - **明確延後（第三階段 / #13）**：ONNX / CLIP、語意搜尋、即時轉碼。
 
@@ -93,16 +93,16 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 
 ### v0.1.0 — RELEASED
 
-- [x] **Release prep** — PR [#29](https://github.com/william563214/intelligent-dam/pull/29)（`6d19ef9`）；tag [`v0.1.0`](https://github.com/william563214/intelligent-dam/releases/tag/v0.1.0)
-- [x] **Linux 安裝包** — `.deb`／`.rpm`／`.AppImage`
-- [x] **Windows 安裝包** — MSI／NSIS；PR [#30](https://github.com/william563214/intelligent-dam/pull/30)（`f40cd0b`，`release-windows.yml`）；**未簽章**／可能觸發 SmartScreen
+- [x] **Release prep** — PR [#29](https://github.com/william563214/intelligent-dam/pull/29) merge commit `6d19ef9`；tag [`v0.1.0`](https://github.com/william563214/intelligent-dam/releases/tag/v0.1.0)
+- [x] **Linux 安裝包** — `.deb`／`.rpm`／`.AppImage`（校驗：`SHA256SUMS`）
+- [x] **Windows 安裝包** — MSI／NSIS；PR [#30](https://github.com/william563214/intelligent-dam/pull/30)（`f40cd0b`，`release-windows.yml`）；**未簽章**／可能觸發 SmartScreen（校驗：`SHA256SUMS-windows.txt`）
 - [ ] **macOS 安裝包** — 本版未提供 → 見 v0.2 Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)
 
 ### v0.2（Issues #31–#40）
 
 建議 PR 順序（可依風險／依賴微調；**#39 可插隊**）：
 
-> build-fixes PR（進行中）→ [#31](https://github.com/william563214/intelligent-dam/issues/31) → [#33](https://github.com/william563214/intelligent-dam/issues/33) → [#32](https://github.com/william563214/intelligent-dam/issues/32) → [#35](https://github.com/william563214/intelligent-dam/issues/35) → [#34](https://github.com/william563214/intelligent-dam/issues/34) → [#36](https://github.com/william563214/intelligent-dam/issues/36) → [#37](https://github.com/william563214/intelligent-dam/issues/37) → [#38](https://github.com/william563214/intelligent-dam/issues/38) → [#39](https://github.com/william563214/intelligent-dam/issues/39) → [#40](https://github.com/william563214/intelligent-dam/issues/40)
+> [#42](https://github.com/william563214/intelligent-dam/pull/42) → [#31](https://github.com/william563214/intelligent-dam/issues/31) → [#33](https://github.com/william563214/intelligent-dam/issues/33) → [#32](https://github.com/william563214/intelligent-dam/issues/32) → [#35](https://github.com/william563214/intelligent-dam/issues/35) → [#34](https://github.com/william563214/intelligent-dam/issues/34) → [#36](https://github.com/william563214/intelligent-dam/issues/36) → [#37](https://github.com/william563214/intelligent-dam/issues/37) → [#38](https://github.com/william563214/intelligent-dam/issues/38) → [#39](https://github.com/william563214/intelligent-dam/issues/39) → [#40](https://github.com/william563214/intelligent-dam/issues/40)
 
 #### 必做
 
@@ -110,18 +110,19 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 - [ ] **33. ON CONFLICT** — Issue [#33](https://github.com/william563214/intelligent-dam/issues/33)：`get_or_create_tag` 改用 `INSERT … ON CONFLICT`
 - [ ] **32. user_version** — Issue [#32](https://github.com/william563214/intelligent-dam/issues/32)：導入 `PRAGMA user_version` 遷移框架
 - [ ] **35. invoke 整合測試** — Issue [#35](https://github.com/william563214/intelligent-dam/issues/35)：臨時 DB 的 Tauri invoke 整合測試（**tauri-driver E2E 延後**，見該 Issue）
-- [ ] **34. 持久化 task queue** — Issue [#34](https://github.com/william563214/intelligent-dam/issues/34)：佇列持久化與重啟恢復
+- [ ] **34. 持久化 task queue** — Issue [#34](https://github.com/william563214/intelligent-dam/issues/34)：佇列持久化與重啟恢復（需 #32）
 
 #### 建議
 
-- [ ] **36. Watcher E2E** — Issue [#36](https://github.com/william563214/intelligent-dam/issues/36)：notify→穩定度→ingest→queue
-- [ ] **37. Windows 寫入完成偵測** — Issue [#37](https://github.com/william563214/intelligent-dam/issues/37)
+- [ ] **36. Watcher E2E** — Issue [#36](https://github.com/william563214/intelligent-dam/issues/36)：notify→穩定度→ingest→queue（需 #35）
+- [ ] **37. Windows 寫入完成偵測** — Issue [#37](https://github.com/william563214/intelligent-dam/issues/37)（需 #36）
 - [ ] **38. Near-phash 誤判** — Issue [#38](https://github.com/william563214/intelligent-dam/issues/38)：閾值調整＋疑似重複確認
 - [ ] **39. macOS workflow** — Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)：未簽章 macOS 安裝檔（**可插隊**）
 
 #### 可延後
 
-- [ ] **40. Handlebars helpers + 碰撞 UI** — Issue [#40](https://github.com/william563214/intelligent-dam/issues/40)
+- [ ] **40. Handlebars helpers + 碰撞 UI** — Issue [#40](https://github.com/william563214/intelligent-dam/issues/40)（需 #35）
+
 
 ### Deferred / Later（第三階段 / Issue #13 — 明確延後，現階段不要開工）
 
