@@ -34,13 +34,9 @@ pub async fn scrape_with_avdc(
     file_path: &Path,
     avdc_path: Option<&str>,
 ) -> Result<ScrapedMetadata> {
-    // 確定 AV_Data_Capture 路徑
+    // 確定 AV_Data_Capture 路徑 尚未設定時不猜測 由呼叫端從 Settings 提供
     let avdc_script = avdc_path
-        .map(|p| PathBuf::from(p))
-        .or_else(|| {
-            // 尚未設定時不猜測路徑 由呼叫端從 Settings 提供
-            None
-        })
+        .map(PathBuf::from)
         .ok_or_else(|| anyhow::anyhow!("AV_Data_Capture path not configured"))?;
 
     // 執行 AV_Data_Capture
@@ -88,12 +84,10 @@ fn find_nfo_file(output_dir: &Path, file_stem: &str) -> Result<PathBuf> {
             
             // 或者查找目錄中第一個 NFO 檔案
             if let Ok(entries) = fs::read_dir(&path) {
-                for nfo_entry in entries {
-                    if let Ok(nfo_entry) = nfo_entry {
-                        let nfo_path = nfo_entry.path();
-                        if nfo_path.extension().and_then(|e| e.to_str()) == Some("nfo") {
-                            return Ok(nfo_path);
-                        }
+                for nfo_entry in entries.flatten() {
+                    let nfo_path = nfo_entry.path();
+                    if nfo_path.extension().and_then(|e| e.to_str()) == Some("nfo") {
+                        return Ok(nfo_path);
                     }
                 }
             }
