@@ -62,15 +62,12 @@ pub struct Database {
 /// 目前程式支援的 schema user_version
 /// 1 = v0.1.0 baseline（含 #20 Tags / #28 FK 硬化）
 /// 2 = #45 NULL-category 唯一索引
-#[allow(non_upper_case_globals)]
-const schema_user_version: i32 = 2;
+const SCHEMA_USER_VERSION: i32 = 2;
 
 /// 既有 v0.1.0 DB（user_version 0）升版後的 baseline
-#[allow(non_upper_case_globals)]
-const schema_baseline_version: i32 = 1;
+const SCHEMA_BASELINE_VERSION: i32 = 1;
 
-#[allow(non_upper_case_globals)]
-const tags_nullsafe_unique_index: &str = "idx_tags_name_ifnull_category";
+const TAGS_NULLSAFE_UNIQUE_INDEX: &str = "idx_tags_name_ifnull_category";
 
 impl Database {
     pub fn new(db_path: &str) -> SqliteResult<Self> {
@@ -82,7 +79,7 @@ impl Database {
 
     fn init_schema(&self) -> SqliteResult<()> {
         let found = self.get_user_version()?;
-        if found > schema_user_version {
+        if found > SCHEMA_USER_VERSION {
             return Err(Self::db_version_too_new_error(found));
         }
 
@@ -92,8 +89,8 @@ impl Database {
         // 舊 DB 或新建 DB 的 user_version 為 0 無損標成 baseline 再跑後續遷移
         let mut version = self.get_user_version()?;
         if version == 0 {
-            self.set_user_version(schema_baseline_version)?;
-            version = schema_baseline_version;
+            self.set_user_version(SCHEMA_BASELINE_VERSION)?;
+            version = SCHEMA_BASELINE_VERSION;
         }
 
         self.apply_pending_migrations(version)?;
@@ -194,20 +191,14 @@ impl Database {
     }
 
     fn db_version_too_new_error(found: i32) -> rusqlite::Error {
-        rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
-                code: rusqlite::ErrorCode::CannotOpen,
-                extended_code: 14,
-            },
-            Some(format!(
-                "資料庫版本 {found} 高於程式支援的 {schema_user_version} 請升級應用程式"
-            )),
-        )
+        rusqlite::Error::InvalidParameterName(format!(
+            "資料庫版本 {found} 高於程式支援的 {SCHEMA_USER_VERSION} 請升級應用程式"
+        ))
     }
 
     fn apply_pending_migrations(&self, from_version: i32) -> SqliteResult<()> {
         let mut version = from_version;
-        while version < schema_user_version {
+        while version < SCHEMA_USER_VERSION {
             let next = version + 1;
             match self.run_migration(next) {
                 Ok(()) => version = next,
@@ -234,13 +225,9 @@ impl Database {
     fn run_migration(&self, target: i32) -> SqliteResult<()> {
         match target {
             2 => self.migration_2_tags_nullsafe_unique(),
-            other => Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error {
-                    code: rusqlite::ErrorCode::Unknown,
-                    extended_code: 1,
-                },
-                Some(format!("unknown schema migration target {other}")),
-            )),
+            other => Err(rusqlite::Error::InvalidParameterName(format!(
+                "unknown schema migration target {other}"
+            ))),
         }
     }
 
@@ -249,6 +236,7 @@ impl Database {
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
             self.merge_duplicate_null_category_tags()?;
+            self.filetags_tags_foreign_key_check_ok()?;
 
             #[cfg(test)]
             if migrate_null_tags_fault::should_fail_after_merge() {
@@ -263,7 +251,7 @@ impl Database {
 
             self.conn.execute(
                 &format!(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS {tags_nullsafe_unique_index}
+                    "CREATE UNIQUE INDEX IF NOT EXISTS {TAGS_NULLSAFE_UNIQUE_INDEX}
                      ON Tags (name, IFNULL(category, ''))"
                 ),
                 [],
@@ -287,6 +275,10 @@ impl Database {
     }
 
     fn merge_duplicate_null_category_tags(&self) -> SqliteResult<()> {
+        // IFNULL(category,'') 會把 '' 與 NULL 視為同一鍵 先正規化再合併
+        self.conn
+            .execute("UPDATE Tags SET category = NULL WHERE category = ''", [])?;
+
         let mut name_stmt = self.conn.prepare(
             "SELECT name FROM Tags
              WHERE category IS NULL
@@ -315,8 +307,10 @@ impl Database {
             let keeper = ids[0];
             for &dup in &ids[1..] {
                 self.conn.execute(
-                    "INSERT OR IGNORE INTO FileTags (file_id, tag_id, confidence)
-                     SELECT file_id, ?1, confidence FROM FileTags WHERE tag_id = ?2",
+                    "INSERT INTO FileTags (file_id, tag_id, confidence)
+                     SELECT file_id, ?1, confidence FROM FileTags WHERE tag_id = ?2
+                     ON CONFLICT(file_id, tag_id) DO UPDATE SET
+                       confidence = max(FileTags.confidence, excluded.confidence)",
                     params![keeper, dup],
                 )?;
                 self.conn
@@ -333,7 +327,7 @@ impl Database {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sqlite_master
              WHERE type = 'index' AND name = ?1",
-            params![tags_nullsafe_unique_index],
+            params![TAGS_NULLSAFE_UNIQUE_INDEX],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -1007,6 +1001,11 @@ impl Database {
         // 與 idx_tags_name_ifnull_category 同一 conflict target
         // SELECT → INSERT ON CONFLICT DO NOTHING RETURNING → 無列再 SELECT
         // 避免每次衝突都寫入並消耗 AUTOINCREMENT
+        // Some("") 正規成 None 與遷移時 ''→NULL 一致
+        let category = match category {
+            Some(ref s) if s.is_empty() => None,
+            other => other,
+        };
         match self.conn.query_row(
             "SELECT id FROM Tags
              WHERE name = ?1 AND IFNULL(category, '') = IFNULL(?2, '')",
@@ -1589,14 +1588,152 @@ mod tests {
                 (12, 'Dup', NULL),
                 (20, 'Other', 'Tag');
             INSERT INTO FileTags (file_id, tag_id, confidence) VALUES
-                (1, 10, 1.0),
-                (1, 11, 0.5),
-                (2, 11, 1.0),
-                (2, 12, 1.0);
+                (1, 10, 0.3),
+                (1, 11, 0.9),
+                (2, 11, 0.5),
+                (2, 12, 0.8);
             PRAGMA user_version = 0;
             ",
         )
         .expect("seed duplicate null tags db");
+    }
+
+    /// 同名 category='' 與 NULL 共存 會撞 IFNULL 唯一鍵
+    fn write_empty_string_and_null_category_db(path: &Path) {
+        let conn = Connection::open(path).expect("open raw db");
+        conn.execute_batch(
+            "
+            CREATE TABLE Files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phash TEXT,
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
+            );
+            CREATE TABLE FileTags (
+                file_id INTEGER,
+                tag_id INTEGER,
+                confidence FLOAT DEFAULT 1.0,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            );
+            CREATE TABLE ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
+            );
+            INSERT INTO Files (id, path, size) VALUES
+                (1, '/tmp/empty-null-a.mp4', 10),
+                (2, '/tmp/empty-null-b.mp4', 20);
+            INSERT INTO Tags (id, name, category) VALUES
+                (1, 'Clash', ''),
+                (2, 'Clash', NULL),
+                (3, 'Solo', '');
+            INSERT INTO FileTags (file_id, tag_id, confidence) VALUES
+                (1, 1, 0.4),
+                (1, 2, 0.7),
+                (2, 2, 1.0),
+                (2, 3, 1.0);
+            PRAGMA user_version = 0;
+            ",
+        )
+        .expect("seed empty-string and null category db");
+    }
+
+    /// pre-#20 legacy Tags（name 唯一）加上殘留 Tags_mig
+    fn write_pre20_with_tags_mig_file_db(path: &Path) {
+        let conn = Connection::open(path).expect("open raw db");
+        conn.execute_batch(
+            "
+            CREATE TABLE Files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phash TEXT,
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE Metadata (
+                file_id INTEGER PRIMARY KEY,
+                title TEXT,
+                studio TEXT,
+                release_date TEXT,
+                summary TEXT,
+                cover_image TEXT,
+                sprite_sheet_path TEXT,
+                source_type TEXT,
+                FOREIGN KEY(file_id) REFERENCES Files(id)
+            );
+            CREATE TABLE Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE NOT NULL,
+                category TEXT
+            );
+            CREATE TABLE Tags_mig (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
+            );
+            CREATE TABLE FileTags (
+                file_id INTEGER,
+                tag_id INTEGER,
+                confidence FLOAT DEFAULT 1.0,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            );
+            CREATE TABLE ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
+            );
+            INSERT INTO Files (id, path, size) VALUES (1, '/tmp/pre20-mig.mp4', 10);
+            INSERT INTO Tags (id, name, category) VALUES (7, 'Legacy', 'Tag');
+            INSERT INTO Tags_mig (id, name, category) VALUES (99, 'Stale', 'Tag');
+            INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (1, 7, 1.0);
+            PRAGMA user_version = 0;
+            ",
+        )
+        .expect("seed pre-#20 with Tags_mig");
+    }
+
+    fn assert_no_foreign_key_check_rows(db: &Database) {
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA foreign_key_check")
+            .expect("fk check prepare");
+        let mut rows = stmt.query([]).expect("fk check query");
+        assert!(
+            rows.next().expect("fk check next").is_none(),
+            "expected no foreign_key_check rows after merge"
+        );
+    }
+
+    fn filetag_confidence(db: &Database, file_id: i64, tag_id: i64) -> f64 {
+        db.conn
+            .query_row(
+                "SELECT confidence FROM FileTags WHERE file_id = ?1 AND tag_id = ?2",
+                params![file_id, tag_id],
+                |row| row.get(0),
+            )
+            .expect("filetag confidence")
     }
 
     fn raw_user_version(path: &Path) -> i32 {
@@ -3021,7 +3158,7 @@ mod tests {
         let db = open_memory_db();
         assert_eq!(
             db.get_user_version().expect("user_version"),
-            schema_user_version
+            SCHEMA_USER_VERSION
         );
         assert!(
             db.tags_nullsafe_index_exists().expect("index check"),
@@ -3039,7 +3176,7 @@ mod tests {
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
         assert_eq!(
             db.get_user_version().expect("user_version"),
-            schema_user_version
+            SCHEMA_USER_VERSION
         );
         assert!(db.tags_nullsafe_index_exists().expect("index"));
         let linked = db.get_file_tags(1).expect("tags");
@@ -3059,7 +3196,7 @@ mod tests {
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
         assert_eq!(
             db.get_user_version().expect("user_version"),
-            schema_user_version
+            SCHEMA_USER_VERSION
         );
 
         let null_count: i64 = db
@@ -3079,14 +3216,86 @@ mod tests {
         let tags_for_1 = db.get_file_tags(1).expect("file 1 tags");
         assert_eq!(tags_for_1.len(), 1);
         assert_eq!(tags_for_1[0].id, 10);
+        assert!((filetag_confidence(&db, 1, 10) - 0.9).abs() < f64::EPSILON);
 
         let tags_for_2 = db.get_file_tags(2).expect("file 2 tags");
         assert_eq!(tags_for_2.len(), 1);
         assert_eq!(tags_for_2[0].id, 10);
+        assert!((filetag_confidence(&db, 2, 10) - 0.8).abs() < f64::EPSILON);
 
         let other = tag_row(&db, 20);
         assert_eq!(other.name, "Other");
         assert!(db.tags_nullsafe_index_exists().expect("index"));
+        assert_no_foreign_key_check_rows(&db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn empty_string_and_null_category_same_name_merge_on_upgrade() {
+        let path = temp_db_path("empty-null-clash");
+        write_empty_string_and_null_category_db(&path);
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(
+            db.get_user_version().expect("user_version"),
+            SCHEMA_USER_VERSION
+        );
+
+        let clash_count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM Tags WHERE name = ?1",
+                params!["Clash"],
+                |row| row.get(0),
+            )
+            .expect("clash count");
+        assert_eq!(clash_count, 1);
+        let clash = tag_row(&db, 1);
+        assert_eq!(clash.name, "Clash");
+        assert!(clash.category.is_none());
+
+        let solo = tag_row(&db, 3);
+        assert_eq!(solo.name, "Solo");
+        assert!(solo.category.is_none());
+
+        let tags_for_1 = db.get_file_tags(1).expect("file 1");
+        assert_eq!(tags_for_1.len(), 1);
+        assert_eq!(tags_for_1[0].id, 1);
+        assert!((filetag_confidence(&db, 1, 1) - 0.7).abs() < f64::EPSILON);
+
+        let tags_for_2 = db.get_file_tags(2).expect("file 2");
+        assert_eq!(tags_for_2.len(), 2);
+        assert!(db.tags_nullsafe_index_exists().expect("index"));
+        assert_no_foreign_key_check_rows(&db);
+
+        let via_empty = db
+            .get_or_create_tag("Clash", Some(String::new()))
+            .expect("empty string normalizes");
+        assert_eq!(via_empty, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pre20_db_with_tags_mig_upgrades_straight_to_v2() {
+        let path = temp_db_path("pre20-tags-mig-v2");
+        write_pre20_with_tags_mig_file_db(&path);
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade to v2");
+        assert_eq!(
+            db.get_user_version().expect("user_version"),
+            SCHEMA_USER_VERSION
+        );
+        assert!(Database::tags_schema_is_name_category_unique(
+            &tags_table_sql(&db)
+        ));
+        assert!(!db.table_exists("Tags_mig").expect("Tags_mig gone"));
+        assert_eq!(tag_row(&db, 7).name, "Legacy");
+        let linked = db.get_file_tags(1).expect("filetags");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].id, 7);
+        assert!(db.tags_nullsafe_index_exists().expect("index"));
+        assert_no_foreign_key_check_rows(&db);
+        assert_eq!(foreign_keys_enabled(&db), 1);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3101,7 +3310,7 @@ mod tests {
             .conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
-                params![tags_nullsafe_unique_index],
+                params![TAGS_NULLSAFE_UNIQUE_INDEX],
                 |row| row.get(0),
             )
             .expect("index sql");
@@ -3109,12 +3318,12 @@ mod tests {
 
         let second = Database::new(path.to_str().expect("utf8")).expect("second");
         assert_eq!(second.get_user_version().expect("v2"), version_first);
-        assert_eq!(version_first, schema_user_version);
+        assert_eq!(version_first, SCHEMA_USER_VERSION);
         let index_sql_second: String = second
             .conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
-                params![tags_nullsafe_unique_index],
+                params![TAGS_NULLSAFE_UNIQUE_INDEX],
                 |row| row.get(0),
             )
             .expect("index sql");
@@ -3143,14 +3352,14 @@ mod tests {
         );
 
         // baseline 已標成 1 但 migration 2 交易回滾 重複列仍在
-        assert_eq!(raw_user_version(&path), schema_baseline_version);
+        assert_eq!(raw_user_version(&path), SCHEMA_BASELINE_VERSION);
         assert_eq!(raw_null_tag_count(&path, "Dup"), 3);
 
         let conn = Connection::open(&path).expect("raw");
         let index_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
-                params![tags_nullsafe_unique_index],
+                params![TAGS_NULLSAFE_UNIQUE_INDEX],
                 |row| row.get(0),
             )
             .expect("index count");
@@ -3160,7 +3369,7 @@ mod tests {
         let db = Database::new(path.to_str().expect("utf8")).expect("retry");
         assert_eq!(
             db.get_user_version().expect("user_version"),
-            schema_user_version
+            SCHEMA_USER_VERSION
         );
         assert_eq!(
             db.conn
@@ -3183,7 +3392,7 @@ mod tests {
             conn.execute_batch("CREATE TABLE Files (id INTEGER PRIMARY KEY);")
                 .expect("create");
             conn.execute(
-                &format!("PRAGMA user_version = {}", schema_user_version + 1),
+                &format!("PRAGMA user_version = {}", SCHEMA_USER_VERSION + 1),
                 [],
             )
             .expect("set version");
@@ -3195,10 +3404,10 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("高於程式支援") || msg.contains(&format!("{}", schema_user_version + 1)),
+            msg.contains("高於程式支援") || msg.contains(&format!("{}", SCHEMA_USER_VERSION + 1)),
             "err={msg}"
         );
-        assert_eq!(raw_user_version(&path), schema_user_version + 1);
+        assert_eq!(raw_user_version(&path), SCHEMA_USER_VERSION + 1);
         let _ = std::fs::remove_file(&path);
     }
 }
