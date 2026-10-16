@@ -813,22 +813,28 @@ impl Database {
     }
 
     pub fn get_or_create_tag(&self, name: &str, category: Option<String>) -> SqliteResult<i64> {
-        // 以 (name, category) 為鍵 IS 可正確比對 NULL category
-        match self.conn.query_row(
-            "SELECT id FROM Tags WHERE name = ?1 AND category IS ?2",
+        // bundled libsqlite3-sys 0.28 / SQLite 3.39.4 支援 RETURNING（≥ 3.35）
+        // DO UPDATE 讓衝突列也會 RETURNING id（DO NOTHING 則不會）
+        // UNIQUE(name, category) 對 NULL 互不衝突 故 NULL category 先查既有列以維持同 id
+        if category.is_none() {
+            match self.conn.query_row(
+                "SELECT id FROM Tags WHERE name = ?1 AND category IS NULL",
+                params![name],
+                |row| row.get(0),
+            ) {
+                Ok(id) => return Ok(id),
+                Err(rusqlite::Error::QueryReturnedNoRows) => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        self.conn.query_row(
+            "INSERT INTO Tags (name, category) VALUES (?1, ?2)
+             ON CONFLICT(name, category) DO UPDATE SET name = excluded.name
+             RETURNING id",
             params![name, category],
             |row| row.get(0),
-        ) {
-            Ok(id) => Ok(id),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                self.conn.execute(
-                    "INSERT INTO Tags (name, category) VALUES (?1, ?2)",
-                    params![name, category],
-                )?;
-                Ok(self.conn.last_insert_rowid())
-            }
-            Err(e) => Err(e),
-        }
+        )
     }
 
     pub fn add_file_tag(&self, file_id: i64, tag_id: i64, confidence: f64) -> SqliteResult<()> {
@@ -1330,6 +1336,89 @@ mod tests {
             .get_or_create_tag("Beach", Some("Tag".to_string()))
             .expect("second");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn get_or_create_tag_repeated_calls_return_same_id() {
+        let db = open_memory_db();
+        let ids: Vec<i64> = (0..16)
+            .map(|_| {
+                db.get_or_create_tag("Repeated", Some("Tag".to_string()))
+                    .expect("upsert")
+            })
+            .collect();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM Tags WHERE name = ?1 AND category = ?2",
+                params!["Repeated", "Tag"],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn get_or_create_tag_concurrent_threads_return_same_id() {
+        let path = temp_db_path("concurrent-got");
+        {
+            let db = Database::new(path.to_str().expect("utf8")).expect("init db");
+            db.conn
+                .busy_timeout(std::time::Duration::from_secs(10))
+                .expect("busy_timeout");
+        }
+
+        let thread_count = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(thread_count));
+        let path = std::sync::Arc::new(path);
+        let handles: Vec<_> = (0..thread_count)
+            .map(|_| {
+                let path = std::sync::Arc::clone(&path);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let db = Database::new(path.to_str().expect("utf8")).expect("open db");
+                    db.conn
+                        .busy_timeout(std::time::Duration::from_secs(10))
+                        .expect("busy_timeout");
+                    barrier.wait();
+                    db.get_or_create_tag("Race", Some("Tag".to_string()))
+                })
+            })
+            .collect();
+
+        let ids: Vec<i64> = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .expect("thread join")
+                    .expect("no UNIQUE error")
+            })
+            .collect();
+        assert!(ids.iter().all(|id| *id == ids[0]));
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("reopen");
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM Tags WHERE name = ?1 AND category = ?2",
+                params!["Race", "Tag"],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(count, 1);
+        let _ = std::fs::remove_file(path.as_path());
+    }
+
+    #[test]
+    fn bundled_sqlite_supports_returning() {
+        // libsqlite3-sys 0.28 bundled 為 3.39.4 RETURNING 需 ≥ 3.35.0（3035000）
+        assert!(
+            rusqlite::version_number() >= 3_035_000,
+            "bundled SQLite {} lacks RETURNING",
+            rusqlite::version()
+        );
     }
 
     #[test]
