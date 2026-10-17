@@ -47,3 +47,15 @@ rfd = { version = "~0.16.0", default-features = false }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Integration tests import `test_support`; skip them unless the feature is on
+# so plain `cargo test` / release clippy do not fail to compile.
+[[test]]
+name = "jobs_persistence"
+path = "tests/jobs_persistence.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "commands_integration"
+path = "tests/commands_integration.rs"
+required-features = ["test-support"]

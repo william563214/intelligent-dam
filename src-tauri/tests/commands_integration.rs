@@ -97,7 +97,11 @@ async fn scan_ingest_lists_files_and_rejects_empty_multi_scan() {
 
     let files = get_all_files(&fx.db).expect("list");
     assert_eq!(files.len(), 1);
-    assert!(files[0].file.path.ends_with("clip.mp4") || files[0].file.path.contains("clip.mp4"));
+    assert!(
+        std::path::Path::new(&files[0].file.path).ends_with("clip.mp4"),
+        "path={}",
+        files[0].file.path
+    );
 }
 
 #[test]
@@ -157,7 +161,7 @@ fn error_log_insert_list_clear() {
 }
 
 #[test]
-fn enqueue_pipeline_empty_noop_and_missing_paths() {
+fn enqueue_pipeline_empty_noop_and_skips_unknown_file_ids() {
     let fx = Fixture::new();
     let settings = AppSettings::default();
 
