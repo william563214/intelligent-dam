@@ -37,7 +37,7 @@ pub struct PipelineOptionsInput {
 }
 
 impl PipelineOptionsInput {
-    fn into_options(self) -> PipelineOptions {
+    pub fn into_options(self) -> PipelineOptions {
         PipelineOptions {
             enable_scrape: self.enable_scrape.unwrap_or(true),
             enable_move: self.enable_move.unwrap_or(true),
@@ -100,11 +100,17 @@ fn normalize_scan_directories(dirs: &[String]) -> Vec<String> {
 
 fn ensure_queue_ready(
     queue: &TaskQueue,
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     db: &Arc<Mutex<Database>>,
 ) -> Result<(), String> {
-    let suppressions = queue.path_suppressions()?;
-    queue.bind_and_start(app.clone(), Arc::clone(db), suppressions)
+    match app {
+        Some(app) => {
+            let suppressions = queue.path_suppressions()?;
+            queue.bind_and_start(app.clone(), Arc::clone(db), suppressions)
+        }
+        // Integration tests: bind DB only so enqueue accounting works without workers
+        None => queue.bind_database(Arc::clone(db)),
+    }
 }
 
 fn log_command_error(
@@ -121,11 +127,11 @@ fn log_command_error(
     }
 }
 
-#[tauri::command]
-pub async fn scan_directory_command(
+/// Scan one directory and ingest into the shared DB (phash best-effort).
+pub async fn scan_directory(
     path: String,
-    db: State<'_, Arc<Mutex<Database>>>,
-    queue: State<'_, Arc<TaskQueue>>,
+    db: &Arc<Mutex<Database>>,
+    queue: &TaskQueue,
 ) -> Result<ScanResult, String> {
     // Directory walk off the async runtime; no DB lock held.
     let scanned = tokio::task::spawn_blocking(move || scanner::scan_directory(path))
@@ -133,6 +139,31 @@ pub async fn scan_directory_command(
         .map_err(|e| format!("Scan task join failed: {}", e))?
         .map_err(|e| format!("Scan failed: {}", e))?;
 
+    finish_scan_import(db, queue, scanned).await
+}
+
+/// Scan multiple directories and ingest. Empty `paths` is an error.
+pub async fn scan_multiple_directories(
+    paths: Vec<String>,
+    db: &Arc<Mutex<Database>>,
+    queue: &TaskQueue,
+) -> Result<ScanResult, String> {
+    if paths.is_empty() {
+        return Err("No directories provided".to_string());
+    }
+
+    let scanned = tokio::task::spawn_blocking(move || scanner::scan_directories(&paths))
+        .await
+        .map_err(|e| format!("Scan task join failed: {}", e))?;
+
+    finish_scan_import(db, queue, scanned).await
+}
+
+async fn finish_scan_import(
+    db: &Arc<Mutex<Database>>,
+    queue: &TaskQueue,
+    scanned: Vec<scanner::ScannedFile>,
+) -> Result<ScanResult, String> {
     let suppressions = queue.path_suppressions().ok();
     let supp_ref = suppressions.as_deref();
 
@@ -177,75 +208,17 @@ pub async fn scan_directory_command(
     })
 }
 
-#[tauri::command]
-pub async fn scan_multiple_directories_command(
-    paths: Vec<String>,
-    db: State<'_, Arc<Mutex<Database>>>,
-    queue: State<'_, Arc<TaskQueue>>,
-) -> Result<ScanResult, String> {
-    if paths.is_empty() {
-        return Err("No directories provided".to_string());
-    }
-
-    let scanned = tokio::task::spawn_blocking(move || scanner::scan_directories(&paths))
-        .await
-        .map_err(|e| format!("Scan task join failed: {}", e))?;
-
-    let suppressions = queue.path_suppressions().ok();
-    let supp_ref = suppressions.as_deref();
-
-    let (imported, jobs) = {
-        let db = db
-            .lock()
-            .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::import_files_pending_phash(&db, &scanned, supp_ref)
-            .map_err(|e| format!("Import failed: {}", e))?
-    };
-
-    if !jobs.is_empty() {
-        let results = tokio::task::spawn_blocking(move || scanner::compute_phash_jobs(jobs))
-            .await
-            .map_err(|e| format!("Phash task join failed: {}", e))?;
-
-        let db = db
-            .lock()
-            .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::write_phashes(&db, &results, supp_ref)
-            .map_err(|e| format!("Failed to write phash: {}", e))?;
-    }
-
-    let file_ids: Vec<i64> = {
-        let db = db
-            .lock()
-            .map_err(|e| format!("Database lock error: {}", e))?;
-        let mut seen = std::collections::HashSet::new();
-        imported
-            .into_iter()
-            .map(|e| e.file_id)
-            .filter(|id| seen.insert(*id) && db.get_file_by_id(*id).is_ok())
-            .collect()
-    };
-
-    Ok(ScanResult {
-        imported_count: file_ids.len(),
-        file_ids,
-    })
-}
-
-#[tauri::command]
-pub async fn get_all_files_command(
-    db: State<'_, Arc<Mutex<Database>>>,
-) -> Result<Vec<FileWithMetadata>, String> {
-    let db = db.lock().map_err(|e| format!("Database lock error: {}", e))?;
-    
+/// List library files with metadata and tags.
+pub fn get_all_files(db: &Arc<Mutex<Database>>) -> Result<Vec<FileWithMetadata>, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
     db.get_files_with_metadata()
         .map_err(|e| format!("Failed to get files: {}", e))
 }
 
-#[tauri::command]
-pub fn get_settings_command(
-    settings_store: State<'_, Mutex<SettingsStore>>,
-) -> Result<AppSettings, String> {
+/// Load settings from the store (defaults when missing).
+pub fn get_settings(settings_store: &Mutex<SettingsStore>) -> Result<AppSettings, String> {
     let store = settings_store
         .lock()
         .map_err(|e| format!("Settings lock error: {}", e))?;
@@ -254,15 +227,11 @@ pub fn get_settings_command(
         .map_err(|e| format!("Failed to load settings: {}", e))
 }
 
-#[tauri::command]
-pub async fn save_settings_command(
+/// Normalize and persist settings. Returns the stored snapshot.
+pub fn save_settings(
+    settings_store: &Mutex<SettingsStore>,
     mut settings: AppSettings,
-    settings_store: State<'_, Mutex<SettingsStore>>,
-    watcher: State<'_, WatcherManager>,
-    queue: State<'_, Arc<TaskQueue>>,
-    app: AppHandle,
-    db: State<'_, Arc<Mutex<Database>>>,
-) -> Result<(), String> {
+) -> Result<AppSettings, String> {
     settings.scan_directories = normalize_scan_directories(&settings.scan_directories);
     if !settings.avdc_path.trim().is_empty() {
         settings.avdc_path = canonicalize_user_path(&settings.avdc_path);
@@ -276,6 +245,134 @@ pub async fn save_settings_command(
             .save(&settings)
             .map_err(|e| format!("Failed to save settings: {}", e))?;
     }
+
+    Ok(settings)
+}
+
+/// Create or fetch a tag id (command-layer wrapper around DB tag CRUD).
+pub fn get_or_create_tag(
+    db: &Arc<Mutex<Database>>,
+    name: &str,
+    category: Option<String>,
+) -> Result<i64, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.get_or_create_tag(name, category)
+        .map_err(|e| format!("Failed to get or create tag: {}", e))
+}
+
+/// Attach an existing tag to a file.
+pub fn add_file_tag(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+    tag_id: i64,
+    confidence: f64,
+) -> Result<(), String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.add_file_tag(file_id, tag_id, confidence)
+        .map_err(|e| format!("Failed to add file tag: {}", e))
+}
+
+/// List tags for a file.
+pub fn get_file_tags(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<Vec<Tag>, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.get_file_tags(file_id)
+        .map_err(|e| format!("Failed to list file tags: {}", e))
+}
+
+/// Clear all tags for a file.
+pub fn clear_file_tags(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<(), String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.clear_file_tags(file_id)
+        .map_err(|e| format!("Failed to clear file tags: {}", e))
+}
+
+/// Insert an error log row (same path command failures use).
+pub fn insert_error_log(
+    db: &Arc<Mutex<Database>>,
+    category: &str,
+    file_id: Option<i64>,
+    path: Option<&str>,
+    message: &str,
+    detail: Option<&str>,
+) -> Result<i64, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.insert_error_log(category, file_id, path, message, detail)
+        .map_err(|e| format!("Failed to insert error log: {}", e))
+}
+
+/// List recent error log entries.
+pub fn get_error_logs(
+    db: &Arc<Mutex<Database>>,
+    limit: Option<i64>,
+) -> Result<Vec<ErrorLogEntry>, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.list_error_logs(limit.unwrap_or(100))
+        .map_err(|e| format!("Failed to list error logs: {}", e))
+}
+
+/// Clear all error log rows; returns deleted count.
+pub fn clear_error_logs(db: &Arc<Mutex<Database>>) -> Result<usize, String> {
+    let db = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    db.clear_error_logs()
+        .map_err(|e| format!("Failed to clear error logs: {}", e))
+}
+
+#[tauri::command]
+pub async fn scan_directory_command(
+    path: String,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+) -> Result<ScanResult, String> {
+    scan_directory(path, &db, &queue).await
+}
+
+#[tauri::command]
+pub async fn scan_multiple_directories_command(
+    paths: Vec<String>,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+) -> Result<ScanResult, String> {
+    scan_multiple_directories(paths, &db, &queue).await
+}
+
+#[tauri::command]
+pub async fn get_all_files_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Vec<FileWithMetadata>, String> {
+    get_all_files(&db)
+}
+
+#[tauri::command]
+pub fn get_settings_command(
+    settings_store: State<'_, Mutex<SettingsStore>>,
+) -> Result<AppSettings, String> {
+    get_settings(&settings_store)
+}
+
+#[tauri::command]
+pub async fn save_settings_command(
+    settings: AppSettings,
+    settings_store: State<'_, Mutex<SettingsStore>>,
+    watcher: State<'_, WatcherManager>,
+    queue: State<'_, Arc<TaskQueue>>,
+    app: AppHandle,
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<(), String> {
+    let settings = save_settings(&settings_store, settings)?;
 
     // Running watcher picks up new scan directories; join off the async runtime
     if watcher.is_running() {
@@ -659,22 +756,14 @@ pub fn get_error_logs_command(
     limit: Option<i64>,
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<Vec<ErrorLogEntry>, String> {
-    let db = db
-        .lock()
-        .map_err(|e| format!("Database lock error: {}", e))?;
-    db.list_error_logs(limit.unwrap_or(100))
-        .map_err(|e| format!("Failed to list error logs: {}", e))
+    get_error_logs(&db, limit)
 }
 
 #[tauri::command]
 pub fn clear_error_logs_command(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<usize, String> {
-    let db = db
-        .lock()
-        .map_err(|e| format!("Database lock error: {}", e))?;
-    db.clear_error_logs()
-        .map_err(|e| format!("Failed to clear error logs: {}", e))
+    clear_error_logs(&db)
 }
 
 /// Enqueue pipeline jobs for selected files through the existing task queue
@@ -694,15 +783,8 @@ pub fn enqueue_pipeline_jobs_command(
             enable_preview: Some(true),
         })
         .into_options();
-    let settings = {
-        let store = settings_store
-            .lock()
-            .map_err(|e| format!("Settings lock error: {}", e))?;
-        store
-            .load()
-            .map_err(|e| format!("Failed to load settings: {}", e))?
-    };
-    enqueue_pipeline_jobs_inner(&app, &db, &queue, &settings, file_ids, base)
+    let settings = get_settings(&settings_store)?;
+    enqueue_pipeline_jobs(Some(&app), &db, &queue, &settings, file_ids, base)
 }
 
 /// One-click organize: enqueue full pipeline for all non-missing library files
@@ -713,14 +795,7 @@ pub fn organize_eligible_files_command(
     queue: State<'_, Arc<TaskQueue>>,
     settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<EnqueueResult, String> {
-    let settings = {
-        let store = settings_store
-            .lock()
-            .map_err(|e| format!("Settings lock error: {}", e))?;
-        store
-            .load()
-            .map_err(|e| format!("Failed to load settings: {}", e))?
-    };
+    let settings = get_settings(&settings_store)?;
     let file_ids = {
         let guard = db
             .lock()
@@ -730,8 +805,8 @@ pub fn organize_eligible_files_command(
             .map_err(|e| format!("Failed to list files: {}", e))?
     };
 
-    enqueue_pipeline_jobs_inner(
-        &app,
+    enqueue_pipeline_jobs(
+        Some(&app),
         &db,
         &queue,
         &settings,
@@ -740,8 +815,11 @@ pub fn organize_eligible_files_command(
     )
 }
 
-fn enqueue_pipeline_jobs_inner(
-    app: &AppHandle,
+/// Enqueue pipeline jobs for selected files through the task queue.
+///
+/// Pass `app: None` to bind the DB without starting workers (integration tests).
+pub fn enqueue_pipeline_jobs(
+    app: Option<&AppHandle>,
     db: &Arc<Mutex<Database>>,
     queue: &Arc<TaskQueue>,
     settings: &AppSettings,

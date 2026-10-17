@@ -14,6 +14,9 @@ mod task_queue;
 mod watcher;
 mod commands;
 
+/// Minimal re-exports for `tests/` command-layer integration tests.
+pub mod test_support;
+
 use database::Database;
 use settings::SettingsStore;
 use std::path::Path;
