@@ -49,7 +49,7 @@ fn fresh_temp_db_applies_user_version_migrations() {
     let db = Database::new(path.to_str().expect("utf8")).expect("open");
     let version = db.read_user_version().expect("user_version");
     assert_eq!(version, current_schema_user_version());
-    assert!(current_schema_user_version() >= 2);
+    assert!(current_schema_user_version() >= 3);
 }
 
 #[test]

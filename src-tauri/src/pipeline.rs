@@ -14,7 +14,7 @@ use crate::path_template::{
 use crate::scraper::{scrape_metadata, to_database_metadata};
 use crate::settings::{AppSettings, SettingsStore};
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,7 @@ const env_skip_move: &str = "IDAM_PIPELINE_SKIP_MOVE";
 const env_skip_preview: &str = "IDAM_PIPELINE_SKIP_PREVIEW";
 
 /// Toggle individual steps (env overrides applied via [`PipelineOptions::from_env`])
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineOptions {
     pub enable_scrape: bool,
     pub enable_move: bool,

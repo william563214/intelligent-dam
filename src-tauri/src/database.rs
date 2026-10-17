@@ -55,6 +55,33 @@ pub struct ErrorLogEntry {
     pub detail: Option<String>,
 }
 
+/// Durable task-queue row (`Jobs` table / #34)
+#[derive(Debug, Clone)]
+pub struct JobRow {
+    pub id: i64,
+    pub status: String,
+    pub job_type: String,
+    pub payload: String,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub error: Option<String>,
+    pub retryable: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Fields for inserting a new `Jobs` row
+#[derive(Debug, Clone)]
+pub struct NewJobRow<'a> {
+    pub status: &'a str,
+    pub job_type: &'a str,
+    pub payload: &'a str,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub error: Option<&'a str>,
+    pub retryable: bool,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -62,7 +89,8 @@ pub struct Database {
 /// 目前程式支援的 schema user_version
 /// 1 = v0.1.0 baseline（含 #20 Tags / #28 FK 硬化）
 /// 2 = #45 NULL-category 唯一索引
-const SCHEMA_USER_VERSION: i32 = 2;
+/// 3 = #34 Jobs 佇列持久化
+const SCHEMA_USER_VERSION: i32 = 3;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
 pub fn current_schema_user_version() -> i32 {
@@ -241,6 +269,7 @@ impl Database {
     fn run_migration(&self, target: i32) -> SqliteResult<()> {
         match target {
             2 => self.migration_2_tags_nullsafe_unique(),
+            3 => self.migration_3_jobs_table(),
             other => {
                 // 用 SqliteFailure 而非 InvalidParameterName
                 // 避免顯示 Invalid parameter name 前綴
@@ -251,6 +280,45 @@ impl Database {
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
                     Some(msg),
                 ))
+            }
+        }
+    }
+
+    /// #34 建立 Jobs 表（queued/running/succeeded/failed/cancelled）
+    fn migration_3_jobs_table(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS Jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+                    ),
+                    type TEXT NOT NULL CHECK (type IN ('pipeline', 'phash')),
+                    payload TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    error TEXT,
+                    retryable INTEGER NOT NULL DEFAULT 1 CHECK (retryable IN (0, 1)),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_jobs_status ON Jobs(status);
+                ",
+            )?;
+            self.set_user_version(3)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after Jobs migration error: {rb}");
+                }
+                Err(e)
             }
         }
     }
@@ -1185,6 +1253,168 @@ impl Database {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Insert a queued job row; returns new `Jobs.id`
+    pub fn insert_job(&self, row: &NewJobRow<'_>) -> SqliteResult<i64> {
+        self.conn.execute(
+            "INSERT INTO Jobs (
+                status, type, payload, attempts, max_attempts, error, retryable
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                row.status,
+                row.job_type,
+                row.payload,
+                row.attempts as i64,
+                row.max_attempts as i64,
+                row.error,
+                if row.retryable { 1i64 } else { 0i64 },
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Persist status / attempts / error for an existing job
+    pub fn update_job_state(
+        &self,
+        id: i64,
+        status: &str,
+        attempts: u32,
+        error: Option<&str>,
+        retryable: bool,
+    ) -> SqliteResult<()> {
+        let n = self.conn.execute(
+            "UPDATE Jobs
+             SET status = ?1,
+                 attempts = ?2,
+                 error = ?3,
+                 retryable = ?4,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?5",
+            params![
+                status,
+                attempts as i64,
+                error,
+                if retryable { 1i64 } else { 0i64 },
+                id,
+            ],
+        )?;
+        if n == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        Ok(())
+    }
+
+    /// Crash recovery: any `running` row becomes `queued` again
+    pub fn reset_running_jobs_to_queued(&self) -> SqliteResult<usize> {
+        let n = self.conn.execute(
+            "UPDATE Jobs
+             SET status = 'queued',
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE status = 'running'",
+            [],
+        )?;
+        Ok(n)
+    }
+
+    /// Mark a job failed (malformed payload / exhausted retries)
+    pub fn mark_job_failed(
+        &self,
+        id: i64,
+        attempts: u32,
+        error: &str,
+        retryable: bool,
+    ) -> SqliteResult<()> {
+        self.update_job_state(id, "failed", attempts, Some(error), retryable)
+    }
+
+    pub fn get_job(&self, id: i64) -> SqliteResult<JobRow> {
+        self.conn.query_row(
+            "SELECT id, status, type, payload, attempts, max_attempts,
+                    error, retryable, created_at, updated_at
+             FROM Jobs WHERE id = ?1",
+            params![id],
+            Self::map_job_row,
+        )
+    }
+
+    pub fn list_jobs_with_status(&self, statuses: &[&str]) -> SqliteResult<Vec<JobRow>> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = statuses
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT id, status, type, payload, attempts, max_attempts,
+                    error, retryable, created_at, updated_at
+             FROM Jobs
+             WHERE status IN ({placeholders})
+             ORDER BY id ASC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows =
+            stmt.query_map(rusqlite::params_from_iter(statuses.iter()), Self::map_job_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn delete_jobs_by_ids(&self, ids: &[i64]) -> SqliteResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("DELETE FROM Jobs WHERE id IN ({placeholders})");
+        let mut stmt = self.conn.prepare(&sql)?;
+        stmt.execute(rusqlite::params_from_iter(ids.iter()))
+    }
+
+    /// Keep newest terminal jobs; delete older succeeded/failed/cancelled rows
+    pub fn prune_terminal_jobs(&self, keep: usize) -> SqliteResult<usize> {
+        let keep = keep.max(1) as i64;
+        let n = self.conn.execute(
+            "DELETE FROM Jobs
+             WHERE status IN ('succeeded', 'failed', 'cancelled')
+               AND id NOT IN (
+                   SELECT id FROM Jobs
+                   WHERE status IN ('succeeded', 'failed', 'cancelled')
+                   ORDER BY id DESC
+                   LIMIT ?1
+               )",
+            params![keep],
+        )?;
+        Ok(n)
+    }
+
+    pub fn jobs_table_exists(&self) -> SqliteResult<bool> {
+        self.table_exists("Jobs")
+    }
+
+    fn map_job_row(row: &rusqlite::Row<'_>) -> SqliteResult<JobRow> {
+        let retryable_i: i64 = row.get(7)?;
+        Ok(JobRow {
+            id: row.get(0)?,
+            status: row.get(1)?,
+            job_type: row.get(2)?,
+            payload: row.get(3)?,
+            attempts: row.get::<_, i64>(4)? as u32,
+            max_attempts: row.get::<_, i64>(5)? as u32,
+            error: row.get(6)?,
+            retryable: retryable_i != 0,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
+    }
+
     pub fn list_error_logs(&self, limit: i64) -> SqliteResult<Vec<ErrorLogEntry>> {
         let limit = limit.clamp(1, 500);
         let mut stmt = self.conn.prepare(
@@ -1509,6 +1739,62 @@ mod tests {
             params![tag_id],
         )
         .expect("insert filetag");
+    }
+
+    /// Schema v2 形狀 DB（有 nullsafe Tags 索引 無 Jobs 表）
+    fn write_v2_shaped_file_db(path: &Path) {
+        let conn = Connection::open(path).expect("open raw db");
+        conn.execute_batch(
+            "
+            CREATE TABLE Files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phash TEXT,
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE Metadata (
+                file_id INTEGER PRIMARY KEY,
+                title TEXT,
+                studio TEXT,
+                release_date TEXT,
+                summary TEXT,
+                cover_image TEXT,
+                sprite_sheet_path TEXT,
+                source_type TEXT,
+                FOREIGN KEY(file_id) REFERENCES Files(id)
+            );
+            CREATE TABLE Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
+            );
+            CREATE UNIQUE INDEX idx_tags_name_ifnull_category
+                ON Tags (name, IFNULL(category, ''));
+            CREATE TABLE FileTags (
+                file_id INTEGER,
+                tag_id INTEGER,
+                confidence FLOAT DEFAULT 1.0,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            );
+            CREATE TABLE ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
+            );
+            INSERT INTO Files (id, path, size) VALUES (1, '/tmp/v2-upgrade.mp4', 10);
+            PRAGMA user_version = 2;
+            ",
+        )
+        .expect("seed v2 shaped db");
     }
 
     /// v0.1.0 形狀 DB user_version=0 且已是 UNIQUE(name, category) 無 nullsafe 索引
@@ -3476,6 +3762,151 @@ mod tests {
             msg.contains("未知的 schema 遷移目標") && msg.contains(&format!("{unknown}")),
             "err={msg}"
         );
+    }
+
+    #[test]
+    fn fresh_db_creates_jobs_table_at_v3() {
+        let db = open_memory_db();
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
+        assert_eq!(SCHEMA_USER_VERSION, 3);
+        assert!(db.jobs_table_exists().expect("Jobs exists"));
+        let sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'Jobs'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("Jobs sql");
+        assert!(sql.contains("CHECK"), "status CHECK missing: {sql}");
+        assert!(sql.contains("'queued'"), "queued status missing: {sql}");
+        assert!(sql.contains("'running'"), "running status missing: {sql}");
+    }
+
+    #[test]
+    fn v2_db_upgrades_to_v3_with_jobs_table() {
+        let path = temp_db_path("v2-to-v3-jobs");
+        write_v2_shaped_file_db(&path);
+        assert_eq!(raw_user_version(&path), 2);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'Jobs'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(n, 0, "v2 fixture must not have Jobs");
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), 3);
+        assert!(db.jobs_table_exists().expect("Jobs"));
+        let file = db.get_file_by_id(1).expect("preserve file");
+        assert_eq!(file.path, "/tmp/v2-upgrade.mp4");
+
+        let id = db
+            .insert_job(&NewJobRow {
+                status: "queued",
+                job_type: "pipeline",
+                payload: "{\"file_id\":1}",
+                attempts: 0,
+                max_attempts: 3,
+                error: None,
+                retryable: true,
+            })
+            .expect("insert job");
+        let row = db.get_job(id).expect("get job");
+        assert_eq!(row.status, "queued");
+        assert_eq!(row.job_type, "pipeline");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn jobs_migration_is_idempotent_on_reopen() {
+        let path = temp_db_path("jobs-idempotent");
+        write_v2_shaped_file_db(&path);
+        let first = Database::new(path.to_str().expect("utf8")).expect("first");
+        assert_eq!(first.get_user_version().expect("v"), 3);
+        drop(first);
+        let second = Database::new(path.to_str().expect("utf8")).expect("second");
+        assert_eq!(second.get_user_version().expect("v"), 3);
+        assert!(second.jobs_table_exists().expect("Jobs"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn jobs_status_check_rejects_pending_alias() {
+        let db = open_memory_db();
+        let err = db
+            .insert_job(&NewJobRow {
+                status: "pending",
+                job_type: "pipeline",
+                payload: "{}",
+                attempts: 0,
+                max_attempts: 3,
+                error: None,
+                retryable: true,
+            })
+            .expect_err("pending must fail CHECK");
+        assert!(
+            err.to_string().to_lowercase().contains("check")
+                || err.to_string().contains("constraint"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn reset_running_jobs_to_queued_and_prune_terminal() {
+        let db = open_memory_db();
+        let a = db
+            .insert_job(&NewJobRow {
+                status: "running",
+                job_type: "pipeline",
+                payload: "{\"file_id\":1}",
+                attempts: 1,
+                max_attempts: 3,
+                error: None,
+                retryable: true,
+            })
+            .expect("a");
+        let b = db
+            .insert_job(&NewJobRow {
+                status: "queued",
+                job_type: "phash",
+                payload: "{\"file_id\":2,\"path\":\"/t\"}",
+                attempts: 0,
+                max_attempts: 3,
+                error: None,
+                retryable: true,
+            })
+            .expect("b");
+        assert_eq!(db.reset_running_jobs_to_queued().expect("reset"), 1);
+        assert_eq!(db.get_job(a).expect("a").status, "queued");
+        assert_eq!(db.get_job(b).expect("b").status, "queued");
+
+        for i in 0..5 {
+            let payload = format!("{{\"file_id\":{i}}}");
+            let _ = db
+                .insert_job(&NewJobRow {
+                    status: "succeeded",
+                    job_type: "pipeline",
+                    payload: &payload,
+                    attempts: 1,
+                    max_attempts: 3,
+                    error: None,
+                    retryable: false,
+                })
+                .expect("term");
+        }
+        let removed = db.prune_terminal_jobs(2).expect("prune");
+        assert!(removed >= 3, "removed={removed}");
+        let left = db
+            .list_jobs_with_status(&["succeeded"])
+            .expect("list")
+            .len();
+        assert_eq!(left, 2);
     }
 }
 

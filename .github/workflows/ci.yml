@@ -84,8 +84,9 @@ jobs:
         working-directory: src-tauri
         # Windows: build.rs uses rustc-link-arg-tests (not the app link line) to
         # add Common-Controls v6 for tests/ only — see tauri-apps/tauri#13419.
-        run: cargo test --locked
+        # test-support: Jobs persistence helpers (not linked in release builds).
+        run: cargo test --locked --features test-support
 
       - name: Cargo clippy
         working-directory: src-tauri
-        run: cargo clippy --locked -- -D warnings
+        run: cargo clippy --locked --features test-support -- -D warnings
