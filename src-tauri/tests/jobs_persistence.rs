@@ -54,7 +54,7 @@ fn mid_run_restart_resumes_without_further_calls() {
         .update_job_state(id as i64, "running", 1, None, true)
         .expect("mark running");
 
-    // Single entry point: recover then resume (no separate drain/enqueue from caller)
+    // Same pending gate as TaskQueue::resume_if_pending; tests drain instead of workers
     let queue2 = TaskQueue::with_concurrency(1);
     let n = queue2
         .recover_and_resume_for_test(Arc::clone(&db))
@@ -65,6 +65,49 @@ fn mid_run_restart_resumes_without_further_calls() {
     assert_eq!(row.status, "succeeded");
     let snap = queue2.status().expect("snap");
     assert_eq!(snap.succeeded, 1);
+    assert_eq!(snap.pending, 0);
+}
+
+#[test]
+fn resume_if_pending_gate_skips_when_no_queued_jobs() {
+    let (_dir, db) = temp_queue_db("resume-empty");
+    let queue = TaskQueue::with_concurrency(1);
+    queue.bind_database(Arc::clone(&db)).expect("bind");
+    assert_eq!(queue.queued_job_count().expect("count"), 0);
+    // Mirrors resume_if_pending early return (no AppHandle needed when empty)
+    let n = queue
+        .recover_and_resume_for_test(Arc::clone(&db))
+        .expect("noop resume");
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn retry_rolls_db_back_when_scheduler_apply_fails() {
+    let (_dir, db) = temp_queue_db("retry-rollback");
+    let queue = TaskQueue::with_options(1, 1);
+    queue.bind_database(Arc::clone(&db)).expect("bind");
+    let id = queue.enqueue(noop_pipeline(5), None).expect("enqueue");
+    queue.arm_fault();
+    let _ = queue.drain_for_test();
+    queue.clear_fault();
+
+    let before = db.lock().unwrap().get_job(id as i64).expect("failed row");
+    assert_eq!(before.status, "failed");
+    let prev_attempts = before.attempts;
+    let prev_error = before.error.clone();
+    let prev_retryable = before.retryable;
+
+    queue.arm_retry_apply_fault();
+    let err = queue.retry(id).expect_err("scheduler apply fault");
+    assert!(err.contains("injected"), "{err}");
+
+    let after = db.lock().unwrap().get_job(id as i64).expect("rolled back");
+    assert_eq!(after.status, "failed");
+    assert_eq!(after.attempts, prev_attempts);
+    assert_eq!(after.error, prev_error);
+    assert_eq!(after.retryable, prev_retryable);
+    let snap = queue.status().expect("snap");
+    assert_eq!(snap.failed, 1);
     assert_eq!(snap.pending, 0);
 }
 

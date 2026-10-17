@@ -87,6 +87,12 @@ jobs:
         # test-support: Jobs persistence helpers (not linked in release builds).
         run: cargo test --locked --features test-support
 
-      - name: Cargo clippy
+      - name: Cargo clippy (test-support)
         working-directory: src-tauri
         run: cargo clippy --locked --features test-support -- -D warnings
+
+      # Matches tauri build / release-windows (no test-support); catches dead_code
+      # and cfg-gated paths that feature-enabled clippy never sees.
+      - name: Cargo clippy (release config)
+        working-directory: src-tauri
+        run: cargo clippy --locked -- -D warnings
