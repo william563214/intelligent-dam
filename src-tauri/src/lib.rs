@@ -121,10 +121,16 @@ pub fn run() {
             let settings_store = SettingsStore::new(&app_data_dir);
 
             // Arc so Watcher ingest worker can share the same mutex
-            app.manage(Arc::new(Mutex::new(db)));
+            let db = Arc::new(Mutex::new(db));
+            let queue = Arc::new(TaskQueue::new());
+            // #34 recover running→queued once after DB init, before any workers start
+            if let Err(e) = queue.bind_database(Arc::clone(&db)) {
+                eprintln!("warn: task queue recovery failed: {e}");
+            }
+            app.manage(db);
             app.manage(Mutex::new(settings_store));
             app.manage(WatcherManager::new());
-            app.manage(Arc::new(TaskQueue::new()));
+            app.manage(queue);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
