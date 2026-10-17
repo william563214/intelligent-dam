@@ -78,11 +78,10 @@ impl Fixture {
 
     fn has_file_named(&self, name: &str) -> bool {
         get_all_files(&self.db).expect("list").iter().any(|f| {
-            f.file.path.ends_with(name)
-                || Path::new(&f.file.path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    == Some(name)
+            Path::new(&f.file.path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                == Some(name)
         })
     }
 }
@@ -125,18 +124,18 @@ fn chunked_write_waits_for_stability_then_ingests_and_enqueues() {
     let dest_writer = dest.clone();
 
     let writer = thread::spawn(move || {
-        // Slow growth so stability cannot pass mid-write
+        // 25ms between chunks vs for_watcher_e2e 100ms x5 (~500ms) — clear margin
         write_chunked(
             &dest_writer,
             10,
             128,
-            Duration::from_millis(80),
+            Duration::from_millis(25),
         );
         *done_flag.lock().expect("done") = true;
     });
 
     // While still growing assert no ingest yet (event-driven samples not fixed sleeps)
-    let growth_deadline = Instant::now() + Duration::from_millis(500);
+    let growth_deadline = Instant::now() + Duration::from_millis(200);
     let mut saw_empty_during_growth = false;
     while Instant::now() < growth_deadline {
         if !*writer_done.lock().expect("flag") {
@@ -230,9 +229,10 @@ fn delete_does_not_ingest_or_crash() {
     while Instant::now() < quiet_deadline {
         assert!(fx.watcher.is_running(), "watcher must stay up after delete");
         assert_eq!(fx.file_count(), count_before, "delete must not add Files rows");
-        assert!(
-            fx.queued_job_count() <= jobs_before + 1,
-            "delete must not flood the queue"
+        assert_eq!(
+            fx.queued_job_count(),
+            jobs_before,
+            "delete must not enqueue additional jobs"
         );
         thread::sleep(poll_interval);
     }
@@ -276,12 +276,24 @@ fn queue_recovers_after_restart_following_watcher_enqueue() {
         .expect("recover+resume");
     assert!(n >= 1, "recovered jobs must execute, n={n}");
 
+    // Drain may auto-retry; wait until the job is terminal (not queued/running)
+    assert!(
+        wait_until(ingest_timeout, || {
+            let status = fx
+                .db
+                .lock()
+                .expect("lock")
+                .get_job(job_id)
+                .expect("row")
+                .status;
+            status == "succeeded" || status == "failed"
+        }),
+        "after recovery job must end succeeded or failed"
+    );
     let row = fx.db.lock().expect("lock").get_job(job_id).expect("row");
     assert!(
-        row.status == "succeeded" || row.status == "failed" || row.status == "queued",
-        "after recovery job must leave bare running state, got {}",
+        row.status == "succeeded" || row.status == "failed",
+        "unexpected terminal status {}",
         row.status
     );
-    // Mid-run reset → drain should have attempted the job (terminal or re-queued retry)
-    assert_ne!(row.status, "running", "running must not stick after recover");
 }

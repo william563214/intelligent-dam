@@ -59,3 +59,8 @@ required-features = ["test-support"]
 name = "commands_integration"
 path = "tests/commands_integration.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "watcher_e2e"
+path = "tests/watcher_e2e.rs"
+required-features = ["test-support"]
