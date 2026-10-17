@@ -231,9 +231,17 @@ impl Database {
     fn run_migration(&self, target: i32) -> SqliteResult<()> {
         match target {
             2 => self.migration_2_tags_nullsafe_unique(),
-            other => Err(rusqlite::Error::InvalidParameterName(format!(
-                "unknown schema migration target {other}"
-            ))),
+            other => {
+                // 用 SqliteFailure 而非 InvalidParameterName
+                // 避免顯示 Invalid parameter name 前綴
+                let msg = format!(
+                    "未知的 schema 遷移目標 user_version={other}（程式僅實作至 {SCHEMA_USER_VERSION}）"
+                );
+                Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                    Some(msg),
+                ))
+            }
         }
     }
 
@@ -3431,6 +3439,33 @@ mod tests {
         );
         assert_eq!(raw_user_version(&path), SCHEMA_USER_VERSION + 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unknown_migration_target_returns_sqlite_misuse() {
+        let db = open_memory_db();
+        let unknown = SCHEMA_USER_VERSION + 99;
+        let err = match db.run_migration(unknown) {
+            Ok(_) => panic!("expected unknown migration target to fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                &err,
+                rusqlite::Error::SqliteFailure(e, Some(_))
+                    if e.extended_code == rusqlite::ffi::SQLITE_MISUSE
+            ),
+            "expected SqliteFailure(MISUSE) got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("Invalid parameter name"),
+            "must not show InvalidParameterName prefix err={msg}"
+        );
+        assert!(
+            msg.contains("未知的 schema 遷移目標") && msg.contains(&format!("{unknown}")),
+            "err={msg}"
+        );
     }
 }
 
