@@ -8,8 +8,12 @@ pub use crate::commands::{
     ScanResult,
 };
 pub use crate::database::{
-    current_schema_user_version, Database, ErrorLogEntry, FileWithMetadata, Metadata, Tag,
+    current_schema_user_version, Database, ErrorLogEntry, FileWithMetadata, JobRow, Metadata,
+    NewJobRow, Tag,
 };
 pub use crate::pipeline::PipelineOptions;
 pub use crate::settings::{AppSettings, SettingsStore};
-pub use crate::task_queue::TaskQueue;
+pub use crate::task_queue::{
+    arm_execute_fault_for_test, clear_execute_fault_for_test, env_max_attempts, max_terminal_jobs,
+    JobKind, TaskQueue,
+};

@@ -82,7 +82,10 @@ fn show_blocking_error_dialog(title: &str, message: &str) {
         // 無 zenity / kdialog：不呼叫 rfd 僅依賴呼叫端 stderr
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    // Omit rfd under cfg(test) so `cargo test --lib` harnesses do not import
+    // TaskDialogIndirect (comctl32 v6). Release builds and `tests/*` binaries
+    // still link rfd; the latter get Common-Controls via rustc-link-arg-tests.
+    #[cfg(all(any(windows, target_os = "macos"), not(test)))]
     {
         let _ = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
