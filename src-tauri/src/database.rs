@@ -191,9 +191,15 @@ impl Database {
     }
 
     fn db_version_too_new_error(found: i32) -> rusqlite::Error {
-        rusqlite::Error::InvalidParameterName(format!(
-            "資料庫版本 {found} 高於程式支援的 {SCHEMA_USER_VERSION} 請升級應用程式"
-        ))
+        // 用 SqliteFailure 而非 InvalidParameterName
+        // 避免對話框顯示 Invalid parameter name 前綴
+        let msg = format!(
+            "此資料庫由較新版應用程式建立（user_version={found}）目前程式僅支援至 {SCHEMA_USER_VERSION} 請升級應用程式後再開啟"
+        );
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+            Some(msg),
+        )
     }
 
     fn apply_pending_migrations(&self, from_version: i32) -> SqliteResult<()> {
@@ -3402,9 +3408,25 @@ mod tests {
             Ok(_) => panic!("expected refuse newer db"),
             Err(e) => e,
         };
+        assert!(
+            matches!(
+                &err,
+                rusqlite::Error::SqliteFailure(e, Some(_))
+                    if e.extended_code == rusqlite::ffi::SQLITE_CANTOPEN
+            ),
+            "expected SqliteFailure(CANTOPEN) got {err:?}"
+        );
         let msg = err.to_string();
         assert!(
-            msg.contains("高於程式支援") || msg.contains(&format!("{}", SCHEMA_USER_VERSION + 1)),
+            !msg.contains("Invalid parameter name"),
+            "dialog must not show InvalidParameterName prefix err={msg}"
+        );
+        assert!(
+            msg.contains("較新版應用程式") && msg.contains("請升級應用程式"),
+            "err={msg}"
+        );
+        assert!(
+            msg.contains(&format!("{}", SCHEMA_USER_VERSION + 1)),
             "err={msg}"
         );
         assert_eq!(raw_user_version(&path), SCHEMA_USER_VERSION + 1);
