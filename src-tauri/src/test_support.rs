@@ -12,6 +12,8 @@ pub use crate::database::{
     current_schema_user_version, Database, ErrorLogEntry, FileWithMetadata, JobRow, Metadata,
     NewJobRow, Tag,
 };
+pub use crate::file_stability::StabilityOptions;
 pub use crate::pipeline::PipelineOptions;
 pub use crate::settings::{AppSettings, SettingsStore};
 pub use crate::task_queue::{max_terminal_jobs, JobKind, TaskQueue};
+pub use crate::watcher::{WatcherManager, WatcherOptions, WatcherStatus};

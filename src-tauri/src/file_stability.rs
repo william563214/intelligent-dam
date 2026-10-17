@@ -62,14 +62,25 @@ impl Default for StabilityOptions {
 }
 
 impl StabilityOptions {
-    /// Faster timings for unit tests
-    #[cfg(test)]
+    /// Faster timings for unit and integration tests
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests() -> Self {
         Self {
             poll_interval: Duration::from_millis(40),
             stable_checks: 3,
             timeout: Duration::from_millis(800),
             missing_grace: Duration::from_millis(200),
+        }
+    }
+
+    /// Watcher e2e timings short enough for CI still long enough to observe growth
+    #[cfg(feature = "test-support")]
+    pub fn for_watcher_e2e() -> Self {
+        Self {
+            poll_interval: Duration::from_millis(50),
+            stable_checks: 3,
+            timeout: Duration::from_secs(15),
+            missing_grace: Duration::from_secs(2),
         }
     }
 }
