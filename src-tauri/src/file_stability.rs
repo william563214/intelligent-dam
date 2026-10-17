@@ -73,12 +73,13 @@ impl StabilityOptions {
         }
     }
 
-    /// Watcher e2e timings short enough for CI still long enough to observe growth
+    /// Watcher e2e: 100ms x5 (~500ms unchanged) so chunked writes with ~25ms
+    /// pauses cannot pass the gate mid-growth (clear margin vs growth cadence)
     #[cfg(feature = "test-support")]
     pub fn for_watcher_e2e() -> Self {
         Self {
-            poll_interval: Duration::from_millis(50),
-            stable_checks: 3,
+            poll_interval: Duration::from_millis(100),
+            stable_checks: 5,
             timeout: Duration::from_secs(15),
             missing_grace: Duration::from_secs(2),
         }
