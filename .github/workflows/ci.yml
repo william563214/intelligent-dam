@@ -80,9 +80,9 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
 
-      - name: Cargo test (lib)
+      - name: Cargo test (lib + integration)
         working-directory: src-tauri
-        run: cargo test --lib --locked
+        run: cargo test --locked
 
       - name: Cargo clippy
         working-directory: src-tauri
