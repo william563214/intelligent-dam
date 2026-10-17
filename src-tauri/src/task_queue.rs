@@ -23,16 +23,20 @@
 //! [`pipeline::options_for_existing_file`] so already-scraped / already-previewed
 //! work is skipped (avoids wiping scrape_failed or re-running a finished scrape).
 //!
-//! # Durability
-//! The queue is **in-memory only** and is **not crash-safe** across process
-//! restart. Pending / running / failed job records are lost when the app exits;
-//! file `status` in SQLite remains the durable source of truth.
+//! # Durability (#34)
+//! Jobs are persisted in the SQLite `Jobs` table. Enqueue and every status
+//! change are written to DB **before** the matching `task-queue-progress` event
+//! is emitted. On startup recovery (after DB init, before workers start), rows
+//! with status `running` are reset to `queued` and reloaded. Issue wording
+//! "pending" maps to the in-memory / DB status `queued` (no translation layer).
+//! Terminal history is pruned in both memory and DB (`max_terminal_jobs`).
+//! Malformed payloads load as `failed` + ErrorLog rather than panicking.
 
 use crate::database::Database;
 use crate::path_suppression::PathSuppression;
 use crate::pipeline::{self, PipelineOptions};
 use crate::scanner::{self, PhashJob};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,10 +52,16 @@ const queue_event_name: &str = "task-queue-progress";
 const env_concurrency: &str = "IDAM_QUEUE_CONCURRENCY";
 
 #[allow(non_upper_case_globals)]
+const env_max_attempts: &str = "IDAM_QUEUE_MAX_ATTEMPTS";
+
+#[allow(non_upper_case_globals)]
 const default_concurrency: usize = 2;
 
 #[allow(non_upper_case_globals)]
 const default_max_attempts: u32 = 3;
+
+#[allow(non_upper_case_globals)]
+const error_log_category_queue: &str = "queue";
 
 /// Cap retained terminal jobs (succeeded / failed / cancelled) to bound memory
 #[allow(non_upper_case_globals)]
@@ -82,6 +92,70 @@ impl JobKind {
             JobKind::Pipeline { .. } => "pipeline",
             JobKind::Phash { .. } => "phash",
         }
+    }
+
+    fn to_payload_json(&self) -> Result<String, String> {
+        match self {
+            JobKind::Pipeline { file_id, options } => {
+                let body = PipelineJobPayload {
+                    file_id: *file_id,
+                    options: options.clone(),
+                };
+                serde_json::to_string(&body).map_err(|e| format!("serialize pipeline payload: {e}"))
+            }
+            JobKind::Phash { file_id, path } => {
+                let body = PhashJobPayload {
+                    file_id: *file_id,
+                    path: path.to_string_lossy().into_owned(),
+                };
+                serde_json::to_string(&body).map_err(|e| format!("serialize phash payload: {e}"))
+            }
+        }
+    }
+
+    fn from_db(job_type: &str, payload: &str) -> Result<Self, String> {
+        match job_type {
+            "pipeline" => {
+                let body: PipelineJobPayload = serde_json::from_str(payload)
+                    .map_err(|e| format!("invalid pipeline payload: {e}"))?;
+                Ok(JobKind::Pipeline {
+                    file_id: body.file_id,
+                    options: body.options,
+                })
+            }
+            "phash" => {
+                let body: PhashJobPayload = serde_json::from_str(payload)
+                    .map_err(|e| format!("invalid phash payload: {e}"))?;
+                Ok(JobKind::Phash {
+                    file_id: body.file_id,
+                    path: PathBuf::from(body.path),
+                })
+            }
+            other => Err(format!("unknown job type '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PipelineJobPayload {
+    file_id: i64,
+    options: PipelineOptions,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PhashJobPayload {
+    file_id: i64,
+    path: String,
+}
+
+fn parse_job_state(status: &str) -> Result<JobState, String> {
+    match status {
+        "queued" => Ok(JobState::Queued),
+        "running" => Ok(JobState::Running),
+        "succeeded" => Ok(JobState::Succeeded),
+        "failed" => Ok(JobState::Failed),
+        "cancelled" => Ok(JobState::Cancelled),
+        other => Err(format!("unknown job status '{other}'")),
     }
 }
 
@@ -186,6 +260,7 @@ impl Scheduler {
         self.concurrency
     }
 
+    #[cfg(test)]
     pub fn enqueue(
         &mut self,
         kind: JobKind,
@@ -194,7 +269,7 @@ impl Scheduler {
     ) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
-        let record = JobRecord {
+        self.ingest_record(JobRecord {
             id,
             kind,
             state: JobState::Queued,
@@ -203,10 +278,23 @@ impl Scheduler {
             attempts: 0,
             max_attempts: max_attempts.max(1),
             stop_flag,
-        };
-        self.jobs.insert(id, record);
-        self.pending.push_back(id);
+        });
         id
+    }
+
+    /// Load or adopt a job with a durable id (from SQLite `Jobs.id`)
+    pub fn ingest_record(&mut self, record: JobRecord) {
+        let id = record.id;
+        self.next_id = self.next_id.max(id.saturating_add(1));
+        if record.state == JobState::Queued {
+            if !self.pending.iter().any(|p| *p == id) {
+                self.pending.push_back(id);
+            }
+        } else if record.state == JobState::Running {
+            self.running.insert(id);
+            self.running_files.insert(record.kind.file_id());
+        }
+        self.jobs.insert(id, record);
     }
 
     #[cfg(test)]
@@ -288,16 +376,41 @@ impl Scheduler {
         chosen
     }
 
-    pub fn complete_success(&mut self, id: u64) -> Option<JobRecord> {
+    pub fn complete_success(&mut self, id: u64) -> Option<(JobRecord, Vec<u64>)> {
         self.finish(id, JobState::Succeeded, None, false)
     }
 
-    pub fn complete_failed(&mut self, id: u64, error: String, retryable: bool) -> Option<JobRecord> {
+    pub fn complete_failed(
+        &mut self,
+        id: u64,
+        error: String,
+        retryable: bool,
+    ) -> Option<(JobRecord, Vec<u64>)> {
         self.finish(id, JobState::Failed, Some(error), retryable)
     }
 
-    pub fn complete_cancelled(&mut self, id: u64, message: Option<String>) -> Option<JobRecord> {
+    pub fn complete_cancelled(
+        &mut self,
+        id: u64,
+        message: Option<String>,
+    ) -> Option<(JobRecord, Vec<u64>)> {
         self.finish(id, JobState::Cancelled, message, false)
+    }
+
+    /// After a retryable failure with attempts remaining, return to `queued`
+    pub fn requeue_after_failure(&mut self, id: u64, error: String) -> Option<JobRecord> {
+        let job = self.jobs.get_mut(&id)?;
+        if job.state != JobState::Running {
+            return None;
+        }
+        let file_id = job.kind.file_id();
+        job.state = JobState::Queued;
+        job.error = Some(error);
+        job.retryable = true;
+        self.running.remove(&id);
+        self.running_files.remove(&file_id);
+        self.pending.push_back(id);
+        Some(job.clone())
     }
 
     fn finish(
@@ -306,7 +419,7 @@ impl Scheduler {
         state: JobState,
         error: Option<String>,
         retryable: bool,
-    ) -> Option<JobRecord> {
+    ) -> Option<(JobRecord, Vec<u64>)> {
         let job = self.jobs.get_mut(&id)?;
         let file_id = job.kind.file_id();
         job.state = state;
@@ -315,12 +428,12 @@ impl Scheduler {
         self.running.remove(&id);
         self.running_files.remove(&file_id);
         let out = job.clone();
-        self.prune_terminal_history();
-        Some(out)
+        let pruned = self.prune_terminal_history();
+        Some((out, pruned))
     }
 
-    /// Drop oldest terminal jobs when over [`max_terminal_jobs`]
-    fn prune_terminal_history(&mut self) {
+    /// Drop oldest terminal jobs when over [`max_terminal_jobs`]; returns removed ids
+    fn prune_terminal_history(&mut self) -> Vec<u64> {
         let mut terminal: Vec<u64> = self
             .jobs
             .values()
@@ -333,13 +446,16 @@ impl Scheduler {
             .map(|j| j.id)
             .collect();
         if terminal.len() <= max_terminal_jobs {
-            return;
+            return Vec::new();
         }
         terminal.sort_unstable();
         let remove_count = terminal.len() - max_terminal_jobs;
+        let mut removed = Vec::with_capacity(remove_count);
         for id in terminal.into_iter().take(remove_count) {
             self.jobs.remove(&id);
+            removed.push(id);
         }
+        removed
     }
 
     /// Re-queue a failed job if attempts remain
@@ -421,6 +537,17 @@ fn concurrency_from_env() -> usize {
     }
 }
 
+fn max_attempts_from_env() -> u32 {
+    match std::env::var(env_max_attempts) {
+        Ok(v) => v
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(default_max_attempts)
+            .max(1),
+        Err(_) => default_max_attempts,
+    }
+}
+
 struct QueueInner {
     scheduler: Scheduler,
 }
@@ -435,6 +562,8 @@ pub struct TaskQueue {
     suppressions: Arc<Mutex<Arc<PathSuppression>>>,
     app: Mutex<Option<AppHandle>>,
     db: Mutex<Option<Arc<Mutex<Database>>>>,
+    /// Startup recovery runs once after DB bind, before workers start
+    recovered: AtomicBool,
 }
 
 impl TaskQueue {
@@ -453,6 +582,7 @@ impl TaskQueue {
             suppressions: Arc::new(Mutex::new(Arc::new(PathSuppression::default()))),
             app: Mutex::new(None),
             db: Mutex::new(None),
+            recovered: AtomicBool::new(false),
         }
     }
 
@@ -464,18 +594,19 @@ impl TaskQueue {
             .map_err(|e| format!("queue suppressions lock: {}", e))
     }
 
-    /// Bind the shared DB without starting workers (integration tests / dry enqueue).
+    /// Bind the shared DB without starting workers (startup recovery / integration tests).
     pub fn bind_database(&self, db: Arc<Mutex<Database>>) -> Result<(), String> {
         *self
             .db
             .lock()
-            .map_err(|e| format!("queue db lock: {}", e))? = Some(db);
-        Ok(())
+            .map_err(|e| format!("queue db lock: {}", e))? = Some(Arc::clone(&db));
+        self.recover_from_database_once(&db)
     }
 
     /// Bind runtime deps and ensure worker threads are running.
     /// `suppressions` should be the same Arc the Watcher uses so moves stay suppressed.
     /// Re-binding updates the shared suppressions pointer used by existing workers.
+    /// Recovery runs once after DB bind and **before** workers start.
     pub fn bind_and_start(
         &self,
         app: AppHandle,
@@ -497,7 +628,167 @@ impl TaskQueue {
                 .map_err(|e| format!("queue suppressions lock: {}", e))? =
                 Arc::clone(&suppressions);
         }
+        self.recover_from_database_once(&db)?;
         self.ensure_workers(app, db)
+    }
+
+    /// Reset `running`→`queued`, load durable jobs into the in-memory scheduler once.
+    fn recover_from_database_once(&self, db: &Arc<Mutex<Database>>) -> Result<(), String> {
+        if self.recovered.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        let rows = {
+            let guard = db
+                .lock()
+                .map_err(|e| format!("Database lock error: {}", e))?;
+            let reset = guard
+                .reset_running_jobs_to_queued()
+                .map_err(|e| format!("reset running jobs: {}", e))?;
+            if reset > 0 {
+                eprintln!("task_queue: reset {reset} running job(s) to queued");
+            }
+            let _ = guard.prune_terminal_jobs(max_terminal_jobs);
+            guard
+                .list_jobs_with_status(&[
+                    "queued",
+                    "running",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                ])
+                .map_err(|e| format!("list jobs: {}", e))?
+        };
+
+        let mut loaded = Vec::new();
+        for row in rows {
+            match Self::job_record_from_row(&row) {
+                Ok(record) => loaded.push(record),
+                Err(err_msg) => {
+                    let detail = format!(
+                        "type={} payload={}",
+                        row.job_type,
+                        row.payload.chars().take(200).collect::<String>()
+                    );
+                    if let Ok(guard) = db.lock() {
+                        let _ = guard.mark_job_failed(
+                            row.id,
+                            row.attempts,
+                            &err_msg,
+                            false,
+                        );
+                        if let Err(e) = guard.insert_error_log(
+                            error_log_category_queue,
+                            None,
+                            None,
+                            &format!("job {} load failed: {err_msg}", row.id),
+                            Some(&detail),
+                        ) {
+                            eprintln!("task_queue: ErrorLog after bad job payload: {e}");
+                        }
+                    }
+                    loaded.push(JobRecord {
+                        id: row.id as u64,
+                        kind: JobKind::Pipeline {
+                            file_id: 0,
+                            options: PipelineOptions {
+                                enable_scrape: false,
+                                enable_move: false,
+                                enable_preview: false,
+                            },
+                        },
+                        state: JobState::Failed,
+                        error: Some(err_msg),
+                        retryable: false,
+                        attempts: row.attempts,
+                        max_attempts: row.max_attempts.max(1),
+                        stop_flag: None,
+                    });
+                }
+            }
+        }
+
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|e| format!("queue lock: {}", e))?;
+            for record in loaded {
+                inner.scheduler.ingest_record(record);
+            }
+            let _ = inner.scheduler.prune_terminal_history();
+        }
+
+        // Align DB prune with in-memory prune after load
+        if let Ok(guard) = db.lock() {
+            let _ = guard.prune_terminal_jobs(max_terminal_jobs);
+        }
+        Ok(())
+    }
+
+    fn job_record_from_row(row: &crate::database::JobRow) -> Result<JobRecord, String> {
+        let state = parse_job_state(&row.status)?;
+        // After reset, running should not appear; treat stray running as queued
+        let state = if state == JobState::Running {
+            JobState::Queued
+        } else {
+            state
+        };
+        let kind = JobKind::from_db(&row.job_type, &row.payload)?;
+        Ok(JobRecord {
+            id: row.id as u64,
+            kind,
+            state,
+            error: row.error.clone(),
+            retryable: row.retryable,
+            attempts: row.attempts,
+            max_attempts: row.max_attempts.max(1),
+            stop_flag: None,
+        })
+    }
+
+    fn with_db<F, T>(&self, f: F) -> Result<T, String>
+    where
+        F: FnOnce(&Database) -> Result<T, String>,
+    {
+        let slot = self
+            .db
+            .lock()
+            .map_err(|e| format!("queue db lock: {}", e))?;
+        let db = slot
+            .as_ref()
+            .ok_or_else(|| "task queue database not bound".to_string())?;
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        f(&guard)
+    }
+
+    fn persist_record(&self, job: &JobRecord) -> Result<(), String> {
+        self.with_db(|db| {
+            db.update_job_state(
+                job.id as i64,
+                job.state.as_str(),
+                job.attempts,
+                job.error.as_deref(),
+                job.retryable,
+            )
+            .map_err(|e| format!("persist job {}: {}", job.id, e))
+        })
+    }
+
+    #[cfg(test)]
+    fn delete_pruned_jobs(&self, pruned: &[u64]) -> Result<(), String> {
+        let db = {
+            let slot = self
+                .db
+                .lock()
+                .map_err(|e| format!("queue db lock: {}", e))?;
+            slot.as_ref()
+                .ok_or_else(|| "task queue database not bound".to_string())?
+                .clone()
+        };
+        delete_pruned_job_ids(&db, pruned)
     }
 
     fn ensure_workers(
@@ -540,23 +831,45 @@ impl TaskQueue {
         Ok(())
     }
 
-    /// Enqueue a job; returns job id. Wakes a worker.
+    /// Enqueue a job; returns job id. Persists then emits. Wakes a worker.
     pub fn enqueue(
         &self,
         kind: JobKind,
         stop_flag: Option<Arc<AtomicBool>>,
     ) -> Result<u64, String> {
-        let (id, attempt) = {
+        let max_attempts = max_attempts_from_env();
+        let payload = kind.to_payload_json()?;
+        let id = self.with_db(|db| {
+            db.insert_job(&crate::database::NewJobRow {
+                status: JobState::Queued.as_str(),
+                job_type: kind.label(),
+                payload: &payload,
+                attempts: 0,
+                max_attempts,
+                error: None,
+                retryable: true,
+            })
+            .map(|id| id as u64)
+            .map_err(|e| format!("insert job: {}", e))
+        })?;
+
+        {
             let mut guard = self
                 .inner
                 .lock()
                 .map_err(|e| format!("queue lock: {}", e))?;
-            let id = guard
-                .scheduler
-                .enqueue(kind.clone(), stop_flag, default_max_attempts);
-            (id, 0u32)
-        };
-        self.emit_queue_event(&kind, id, JobState::Queued, attempt, None, true);
+            guard.scheduler.ingest_record(JobRecord {
+                id,
+                kind: kind.clone(),
+                state: JobState::Queued,
+                error: None,
+                retryable: true,
+                attempts: 0,
+                max_attempts,
+                stop_flag,
+            });
+        }
+        self.emit_queue_event(&kind, id, JobState::Queued, 0, None, true);
         self.wake_workers();
         Ok(id)
     }
@@ -594,23 +907,24 @@ impl TaskQueue {
     }
 
     pub fn retry(&self, job_id: u64) -> Result<u64, String> {
-        let (kind, attempt) = {
+        let job = {
             let mut guard = self
                 .inner
                 .lock()
                 .map_err(|e| format!("queue lock: {}", e))?;
             guard.scheduler.retry(job_id)?;
-            let job = guard
+            guard
                 .scheduler
                 .get(job_id)
-                .ok_or_else(|| format!("Unknown job {}", job_id))?;
-            (job.kind.clone(), job.attempts)
+                .ok_or_else(|| format!("Unknown job {}", job_id))?
+                .clone()
         };
+        self.persist_record(&job)?;
         self.emit_queue_event(
-            &kind,
+            &job.kind,
             job_id,
             JobState::Queued,
-            attempt,
+            job.attempts,
             Some("retry queued".to_string()),
             true,
         );
@@ -709,6 +1023,9 @@ fn worker_loop(
             continue;
         };
 
+        if let Err(e) = persist_job_state(&db, &job) {
+            eprintln!("task_queue: persist running failed for {}: {}", job.id, e);
+        }
         emit_progress(&app, &job, JobState::Running, None, job.retryable);
 
         let supp = suppressions
@@ -716,30 +1033,113 @@ fn worker_loop(
             .ok()
             .map(|g| Arc::clone(&g))
             .unwrap_or_else(|| Arc::new(PathSuppression::default()));
-        let outcome = execute_job(&job, &app, &db, supp.as_ref());
+        let outcome = execute_job(&job, Some(&app), &db, supp.as_ref());
 
-        let finished = {
+        let (finished, pruned, write_exhaustion_log) = {
             let mut guard = match inner.lock() {
                 Ok(g) => g,
                 Err(_) => break,
             };
             match outcome {
-                ExecOutcome::Success => guard.scheduler.complete_success(job.id),
+                ExecOutcome::Success => {
+                    let result = guard.scheduler.complete_success(job.id);
+                    match result {
+                        Some((rec, pruned)) => (Some(rec), pruned, false),
+                        None => (None, Vec::new(), false),
+                    }
+                }
                 ExecOutcome::Failed { error, retryable } => {
-                    guard.scheduler.complete_failed(job.id, error, retryable)
+                    if retryable && job.attempts < job.max_attempts {
+                        let rec = guard.scheduler.requeue_after_failure(job.id, error);
+                        (rec, Vec::new(), false)
+                    } else {
+                        let result =
+                            guard
+                                .scheduler
+                                .complete_failed(job.id, error, retryable);
+                        match result {
+                            Some((rec, pruned)) => (Some(rec), pruned, true),
+                            None => (None, Vec::new(), false),
+                        }
+                    }
                 }
                 ExecOutcome::Cancelled { message } => {
-                    guard.scheduler.complete_cancelled(job.id, message)
+                    let result = guard.scheduler.complete_cancelled(job.id, message);
+                    match result {
+                        Some((rec, pruned)) => (Some(rec), pruned, false),
+                        None => (None, Vec::new(), false),
+                    }
                 }
             }
         };
 
-        if let Some(rec) = finished {
-            emit_progress(&app, &rec, rec.state, rec.error.clone(), rec.retryable);
+        if let Some(ref rec) = finished {
+            if let Err(e) = persist_job_state(&db, rec) {
+                eprintln!("task_queue: persist finish failed for {}: {}", rec.id, e);
+            }
+            if write_exhaustion_log {
+                if let Ok(guard) = db.lock() {
+                    let msg = format!(
+                        "job {} exhausted retries ({}/{}): {}",
+                        rec.id,
+                        rec.attempts,
+                        rec.max_attempts,
+                        rec.error.as_deref().unwrap_or("unknown")
+                    );
+                    if let Err(e) = guard.insert_error_log(
+                        error_log_category_queue,
+                        Some(rec.kind.file_id()),
+                        None,
+                        &msg,
+                        Some(rec.kind.label()),
+                    ) {
+                        eprintln!("task_queue: ErrorLog on retry exhaustion: {e}");
+                    }
+                }
+            }
+            if let Err(e) = delete_pruned_job_ids(&db, &pruned) {
+                eprintln!("task_queue: prune delete failed: {e}");
+            }
+            let message = if rec.state == JobState::Queued {
+                Some("auto-retry queued".to_string())
+            } else {
+                rec.error.clone()
+            };
+            emit_progress(&app, rec, rec.state, message, rec.retryable);
         }
 
         wake.1.notify_all();
     }
+}
+
+fn persist_job_state(db: &Arc<Mutex<Database>>, job: &JobRecord) -> Result<(), String> {
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    guard
+        .update_job_state(
+            job.id as i64,
+            job.state.as_str(),
+            job.attempts,
+            job.error.as_deref(),
+            job.retryable,
+        )
+        .map_err(|e| format!("update job {}: {}", job.id, e))
+}
+
+fn delete_pruned_job_ids(db: &Arc<Mutex<Database>>, pruned: &[u64]) -> Result<(), String> {
+    if pruned.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<i64> = pruned.iter().map(|id| *id as i64).collect();
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    guard
+        .delete_jobs_by_ids(&ids)
+        .map_err(|e| format!("delete pruned jobs: {}", e))?;
+    let _ = guard.prune_terminal_jobs(max_terminal_jobs);
+    Ok(())
 }
 
 enum ExecOutcome {
@@ -750,7 +1150,7 @@ enum ExecOutcome {
 
 fn execute_job(
     job: &JobRecord,
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     db: &Arc<Mutex<Database>>,
     suppressions: &PathSuppression,
 ) -> ExecOutcome {
@@ -765,12 +1165,23 @@ fn execute_job(
         };
     }
 
+    #[cfg(test)]
+    if execute_fault::should_fail() {
+        return ExecOutcome::Failed {
+            error: "injected execute fault".to_string(),
+            retryable: true,
+        };
+    }
+
     match &job.kind {
         JobKind::Pipeline { file_id, options } => {
             // Re-soften from DB on every run (including retry) so scrape_failed /
             // already-moved / already-previewed rows do not re-run the full chain
             let effective = {
-                let settings = pipeline::load_settings(app);
+                let settings = match app {
+                    Some(app) => pipeline::load_settings(app),
+                    None => crate::settings::AppSettings::default(),
+                };
                 match db.lock() {
                     Ok(guard) => pipeline::options_for_existing_file(
                         &guard,
@@ -785,6 +1196,13 @@ fn execute_job(
             if effective.is_noop() {
                 return ExecOutcome::Success;
             }
+
+            let Some(app) = app else {
+                return ExecOutcome::Failed {
+                    error: "app handle required for non-noop pipeline".to_string(),
+                    retryable: true,
+                };
+            };
 
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 pipeline::run_for_file(
@@ -880,6 +1298,119 @@ fn emit_progress(
         retryable,
     };
     let _ = app.emit(queue_event_name, payload);
+}
+
+#[cfg(test)]
+mod execute_fault {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FAIL: AtomicBool = AtomicBool::new(false);
+
+    pub fn arm() {
+        FAIL.store(true, Ordering::SeqCst);
+    }
+
+    pub fn clear() {
+        FAIL.store(false, Ordering::SeqCst);
+    }
+
+    pub fn should_fail() -> bool {
+        FAIL.load(Ordering::SeqCst)
+    }
+}
+
+impl TaskQueue {
+    /// Synchronously claim and finish pending jobs without worker threads (tests).
+    #[cfg(test)]
+    pub fn drain_for_test(&self) -> Result<usize, String> {
+        let db = {
+            let slot = self
+                .db
+                .lock()
+                .map_err(|e| format!("queue db lock: {}", e))?;
+            slot.as_ref()
+                .ok_or_else(|| "task queue database not bound".to_string())?
+                .clone()
+        };
+        let suppressions = self.path_suppressions()?;
+        let mut finished_count = 0usize;
+        loop {
+            let job = {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|e| format!("queue lock: {}", e))?;
+                guard.scheduler.dispatch_one()
+            };
+            let Some(job) = job else {
+                break;
+            };
+            self.persist_record(&job)?;
+            let outcome = execute_job(&job, None, &db, suppressions.as_ref());
+            let (finished, pruned, write_exhaustion_log) = {
+                let mut guard = self
+                    .inner
+                    .lock()
+                    .map_err(|e| format!("queue lock: {}", e))?;
+                match outcome {
+                    ExecOutcome::Success => match guard.scheduler.complete_success(job.id) {
+                        Some((rec, pruned)) => (Some(rec), pruned, false),
+                        None => (None, Vec::new(), false),
+                    },
+                    ExecOutcome::Failed { error, retryable } => {
+                        if retryable && job.attempts < job.max_attempts {
+                            (
+                                guard.scheduler.requeue_after_failure(job.id, error),
+                                Vec::new(),
+                                false,
+                            )
+                        } else {
+                            match guard.scheduler.complete_failed(job.id, error, retryable) {
+                                Some((rec, pruned)) => (Some(rec), pruned, true),
+                                None => (None, Vec::new(), false),
+                            }
+                        }
+                    }
+                    ExecOutcome::Cancelled { message } => {
+                        match guard.scheduler.complete_cancelled(job.id, message) {
+                            Some((rec, pruned)) => (Some(rec), pruned, false),
+                            None => (None, Vec::new(), false),
+                        }
+                    }
+                }
+            };
+            if let Some(ref rec) = finished {
+                self.persist_record(rec)?;
+                if write_exhaustion_log {
+                    let _ = self.with_db(|db| {
+                        let msg = format!(
+                            "job {} exhausted retries ({}/{}): {}",
+                            rec.id,
+                            rec.attempts,
+                            rec.max_attempts,
+                            rec.error.as_deref().unwrap_or("unknown")
+                        );
+                        db.insert_error_log(
+                            error_log_category_queue,
+                            Some(rec.kind.file_id()),
+                            None,
+                            &msg,
+                            Some(rec.kind.label()),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Ok(())
+                    });
+                }
+                self.delete_pruned_jobs(&pruned)?;
+                finished_count = finished_count.saturating_add(1);
+                // Auto-retry leaves job queued — continue draining
+                if rec.state == JobState::Queued {
+                    continue;
+                }
+            }
+        }
+        Ok(finished_count)
+    }
 }
 
 #[cfg(test)]
@@ -1227,5 +1758,166 @@ mod tests {
         let snap = s.status_snapshot();
         assert_eq!(snap.succeeded, 20);
         assert_eq!(snap.pending, 0);
+    }
+
+    fn temp_queue_db(label: &str) -> (tempfile::TempDir, Arc<Mutex<Database>>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(format!("{label}.db"));
+        let db = Database::new(path.to_str().expect("utf8")).expect("db");
+        (dir, Arc::new(Mutex::new(db)))
+    }
+
+    fn noop_pipeline(file_id: i64) -> JobKind {
+        JobKind::Pipeline {
+            file_id,
+            options: PipelineOptions {
+                enable_scrape: false,
+                enable_move: false,
+                enable_preview: false,
+            },
+        }
+    }
+
+    #[test]
+    fn enqueue_persists_queued_row_before_status_visible() {
+        let (_dir, db) = temp_queue_db("enqueue-persist");
+        let queue = TaskQueue::with_concurrency(1);
+        queue.bind_database(Arc::clone(&db)).expect("bind");
+        let id = queue.enqueue(noop_pipeline(9), None).expect("enqueue");
+        let row = db.lock().unwrap().get_job(id as i64).expect("row");
+        assert_eq!(row.status, "queued");
+        assert_eq!(row.job_type, "pipeline");
+        assert!(row.payload.contains("\"file_id\":9"));
+        let status = queue.status().expect("status");
+        assert_eq!(status.pending, 1);
+        assert_eq!(status.jobs[0].job_id, id);
+    }
+
+    #[test]
+    fn mid_run_restart_resets_running_and_completes() {
+        let (_dir, db) = temp_queue_db("restart-complete");
+        let queue = TaskQueue::with_concurrency(1);
+        queue.bind_database(Arc::clone(&db)).expect("bind");
+        let id = queue.enqueue(noop_pipeline(3), None).expect("enqueue");
+
+        // Simulate crash while running
+        db.lock()
+            .unwrap()
+            .update_job_state(id as i64, "running", 1, None, true)
+            .expect("mark running");
+
+        // New process: fresh in-memory queue recovers from DB
+        let queue2 = TaskQueue::with_concurrency(1);
+        queue2.bind_database(Arc::clone(&db)).expect("recover");
+        let row = db.lock().unwrap().get_job(id as i64).expect("row");
+        assert_eq!(row.status, "queued", "running must reset to queued");
+        assert!(queue2.has_active_pipeline(3).expect("active"));
+
+        let n = queue2.drain_for_test().expect("drain");
+        assert!(n >= 1);
+        let row = db.lock().unwrap().get_job(id as i64).expect("done");
+        assert_eq!(row.status, "succeeded");
+        let snap = queue2.status().expect("snap");
+        assert_eq!(snap.succeeded, 1);
+        assert_eq!(snap.pending, 0);
+    }
+
+    #[test]
+    fn retry_exhaustion_marks_failed_and_writes_error_log() {
+        let (_dir, db) = temp_queue_db("retry-exhaust");
+        std::env::set_var(env_max_attempts, "1");
+        let queue = TaskQueue::with_concurrency(1);
+        queue.bind_database(Arc::clone(&db)).expect("bind");
+        let id = queue.enqueue(noop_pipeline(4), None).expect("enqueue");
+        execute_fault::arm();
+        let _ = queue.drain_for_test();
+        execute_fault::clear();
+        std::env::remove_var(env_max_attempts);
+
+        let row = db.lock().unwrap().get_job(id as i64).expect("row");
+        assert_eq!(row.status, "failed");
+        assert!(row.error.as_deref().unwrap_or("").contains("injected"));
+        let logs = db.lock().unwrap().list_error_logs(20).expect("logs");
+        assert!(
+            logs.iter().any(|e| {
+                e.category == "queue" && e.message.contains("exhausted")
+            }),
+            "logs={logs:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_payload_on_load_becomes_failed_with_error_log() {
+        let (_dir, db) = temp_queue_db("bad-payload");
+        let id = {
+            let guard = db.lock().unwrap();
+            guard
+                .insert_job(&crate::database::NewJobRow {
+                    status: "queued",
+                    job_type: "pipeline",
+                    payload: "not-json",
+                    attempts: 0,
+                    max_attempts: 3,
+                    error: None,
+                    retryable: true,
+                })
+                .expect("insert")
+        };
+        let queue = TaskQueue::with_concurrency(1);
+        queue.bind_database(Arc::clone(&db)).expect("recover");
+        let row = db.lock().unwrap().get_job(id).expect("row");
+        assert_eq!(row.status, "failed");
+        assert!(row.error.as_deref().unwrap_or("").contains("invalid"));
+        let logs = db.lock().unwrap().list_error_logs(10).expect("logs");
+        assert!(
+            logs.iter()
+                .any(|e| e.category == "queue" && e.message.contains("load failed")),
+            "logs={logs:?}"
+        );
+        let snap = queue.status().expect("snap");
+        assert_eq!(snap.failed, 1);
+        assert_eq!(snap.pending, 0);
+    }
+
+    #[test]
+    fn terminal_prune_deletes_from_db() {
+        let (_dir, db) = temp_queue_db("prune-db");
+        let queue = TaskQueue::with_concurrency(1);
+        queue.bind_database(Arc::clone(&db)).expect("bind");
+        let mut first_id = None;
+        for i in 0..(max_terminal_jobs as i64 + 5) {
+            let id = queue.enqueue(noop_pipeline(100 + i), None).expect("enq");
+            if first_id.is_none() {
+                first_id = Some(id);
+            }
+            queue.drain_for_test().expect("drain");
+        }
+        let oldest = first_id.expect("id");
+        let missing = db.lock().unwrap().get_job(oldest as i64);
+        assert!(missing.is_err(), "oldest terminal job should be pruned from DB");
+        let remaining = db
+            .lock()
+            .unwrap()
+            .list_jobs_with_status(&["succeeded"])
+            .expect("list")
+            .len();
+        assert!(remaining <= max_terminal_jobs);
+    }
+
+    #[test]
+    fn active_pipeline_dedupe_survives_db_backed_enqueue() {
+        let (_dir, db) = temp_queue_db("dedupe");
+        let queue = TaskQueue::with_concurrency(1);
+        queue.bind_database(Arc::clone(&db)).expect("bind");
+        let a = queue.enqueue(noop_pipeline(7), None).expect("a");
+        assert!(queue.has_active_pipeline(7).expect("active"));
+        let b = queue.enqueue(noop_pipeline(8), None).expect("b");
+        assert_ne!(a, b);
+        let queued = db
+            .lock()
+            .unwrap()
+            .list_jobs_with_status(&["queued"])
+            .expect("list");
+        assert_eq!(queued.len(), 2);
     }
 }
