@@ -566,6 +566,9 @@ pub struct TaskQueue {
     max_attempts: u32,
     /// Injected execute failures for tests (`test-support` / arm_fault)
     execute_fault: Arc<AtomicBool>,
+    /// Injected scheduler-retry failure after DB write (`test-support`)
+    #[cfg(feature = "test-support")]
+    retry_apply_fault: Arc<AtomicBool>,
 }
 
 impl TaskQueue {
@@ -573,6 +576,7 @@ impl TaskQueue {
         Self::with_options(concurrency_from_env(), max_attempts_from_env())
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_concurrency(concurrency: usize) -> Self {
         Self::with_options(concurrency, default_max_attempts)
     }
@@ -591,6 +595,8 @@ impl TaskQueue {
             recovered: AtomicBool::new(false),
             max_attempts: max_attempts.max(1),
             execute_fault: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "test-support")]
+            retry_apply_fault: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -611,6 +617,12 @@ impl TaskQueue {
         self.execute_fault.store(false, Ordering::SeqCst);
     }
 
+    /// Arm injected scheduler-retry failure after a successful DB write
+    #[cfg(feature = "test-support")]
+    pub fn arm_retry_apply_fault(&self) {
+        self.retry_apply_fault.store(true, Ordering::SeqCst);
+    }
+
     /// Shared PathSuppression used by Watcher moves and phash near-dedup orphans.
     pub fn path_suppressions(&self) -> Result<Arc<PathSuppression>, String> {
         self.suppressions
@@ -626,6 +638,28 @@ impl TaskQueue {
             .lock()
             .map_err(|e| format!("queue db lock: {}", e))? = Some(Arc::clone(&db));
         self.recover_from_database_once(&db)
+    }
+
+    /// After recovery, start workers when any jobs remain queued.
+    ///
+    /// Suppressions lookup failures are logged and treated as a soft skip
+    /// (same as the former inline setup branch). `bind_and_start` errors
+    /// propagate to the caller for ErrorLog handling.
+    pub fn resume_if_pending(
+        &self,
+        app: AppHandle,
+        db: Arc<Mutex<Database>>,
+    ) -> Result<(), String> {
+        if self.queued_job_count().unwrap_or(0) == 0 {
+            return Ok(());
+        }
+        match self.path_suppressions() {
+            Ok(suppressions) => self.bind_and_start(app, db, suppressions),
+            Err(e) => {
+                eprintln!("warn: task queue suppressions for resume: {e}");
+                Ok(())
+            }
+        }
     }
 
     /// Bind runtime deps and ensure worker threads are running.
@@ -826,19 +860,6 @@ impl TaskQueue {
         f(&guard)
     }
 
-    fn persist_record(&self, job: &JobRecord) -> Result<(), String> {
-        self.with_db(|db| {
-            db.update_job_state(
-                job.id as i64,
-                job.state.as_str(),
-                job.attempts,
-                job.error.as_deref(),
-                job.retryable,
-            )
-            .map_err(|e| format!("persist job {}: {}", job.id, e))
-        })
-    }
-
     #[cfg(feature = "test-support")]
     fn delete_pruned_jobs(&self, pruned: &[u64]) -> Result<(), String> {
         let db = {
@@ -970,8 +991,8 @@ impl TaskQueue {
     }
 
     pub fn retry(&self, job_id: u64) -> Result<u64, String> {
-        // Validate before any mutation
-        {
+        // Validate and snapshot failed fields for possible DB rollback
+        let previous = {
             let guard = self
                 .inner
                 .lock()
@@ -990,7 +1011,8 @@ impl TaskQueue {
             if !job.retryable {
                 return Err(format!("Job {} is not retryable", job_id));
             }
-        }
+            (job.attempts, job.error.clone(), job.retryable)
+        };
 
         // Persist queued + reset attempts before touching in-memory scheduler
         self.with_db(|db| {
@@ -1004,17 +1026,52 @@ impl TaskQueue {
             .map_err(|e| format!("persist retry for job {}: {}", job_id, e))
         })?;
 
-        let job = {
+        let apply_result = {
             let mut guard = self
                 .inner
                 .lock()
                 .map_err(|e| format!("queue lock: {}", e))?;
-            guard.scheduler.retry(job_id)?;
-            guard
-                .scheduler
-                .get(job_id)
-                .ok_or_else(|| format!("Unknown job {}", job_id))?
-                .clone()
+            #[cfg(feature = "test-support")]
+            if self.retry_apply_fault.swap(false, Ordering::SeqCst) {
+                Err("injected scheduler retry failure".to_string())
+            } else {
+                guard
+                    .scheduler
+                    .retry(job_id)
+                    .map(|job| (*job).clone())
+            }
+            #[cfg(not(feature = "test-support"))]
+            {
+                guard
+                    .scheduler
+                    .retry(job_id)
+                    .map(|job| (*job).clone())
+            }
+        };
+
+        let job = match apply_result {
+            Ok(job) => job,
+            Err(e) => {
+                if let Err(rb) = self.with_db(|db| {
+                    db.update_job_state(
+                        job_id as i64,
+                        JobState::Failed.as_str(),
+                        previous.0,
+                        previous.1.as_deref(),
+                        previous.2,
+                    )
+                    .map_err(|rb| format!("rollback retry for job {}: {}", job_id, rb))
+                }) {
+                    eprintln!(
+                        "warn: retry scheduler failed for job {job_id}: {e}; DB rollback also failed: {rb}"
+                    );
+                } else {
+                    eprintln!(
+                        "warn: retry scheduler failed for job {job_id}: {e}; rolled DB row back to failed"
+                    );
+                }
+                return Err(e);
+            }
         };
         self.emit_queue_event(
             &job.kind,
@@ -1412,6 +1469,19 @@ fn emit_progress(
 
 #[cfg(feature = "test-support")]
 impl TaskQueue {
+    fn persist_record(&self, job: &JobRecord) -> Result<(), String> {
+        self.with_db(|db| {
+            db.update_job_state(
+                job.id as i64,
+                job.state.as_str(),
+                job.attempts,
+                job.error.as_deref(),
+                job.retryable,
+            )
+            .map_err(|e| format!("persist job {}: {}", job.id, e))
+        })
+    }
+
     /// Synchronously claim and finish pending jobs without worker threads (tests).
     pub fn drain_for_test(&self) -> Result<usize, String> {
         let db = {
@@ -1471,11 +1541,13 @@ impl TaskQueue {
     }
 
     /// Recover from DB then run any queued jobs (no further caller action needed).
+    /// Uses the same pending gate as [`Self::resume_if_pending`].
     pub fn recover_and_resume_for_test(
         &self,
         db: Arc<Mutex<Database>>,
     ) -> Result<usize, String> {
         self.bind_database(db)?;
+        // Same gate as resume_if_pending (production starts workers; tests drain)
         if self.queued_job_count()? == 0 {
             return Ok(0);
         }

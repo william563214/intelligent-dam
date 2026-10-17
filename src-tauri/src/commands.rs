@@ -250,6 +250,7 @@ pub fn save_settings(
 }
 
 /// Create or fetch a tag id (command-layer wrapper around DB tag CRUD).
+#[cfg(feature = "test-support")]
 pub fn get_or_create_tag(
     db: &Arc<Mutex<Database>>,
     name: &str,
@@ -263,6 +264,7 @@ pub fn get_or_create_tag(
 }
 
 /// Attach an existing tag to a file.
+#[cfg(feature = "test-support")]
 pub fn add_file_tag(
     db: &Arc<Mutex<Database>>,
     file_id: i64,
@@ -277,6 +279,7 @@ pub fn add_file_tag(
 }
 
 /// List tags for a file.
+#[cfg(feature = "test-support")]
 pub fn get_file_tags(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<Vec<Tag>, String> {
     let db = db
         .lock()
@@ -286,6 +289,7 @@ pub fn get_file_tags(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<Vec<Tag>
 }
 
 /// Clear all tags for a file.
+#[cfg(feature = "test-support")]
 pub fn clear_file_tags(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<(), String> {
     let db = db
         .lock()
@@ -295,6 +299,7 @@ pub fn clear_file_tags(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<(), St
 }
 
 /// Insert an error log row (same path command failures use).
+#[cfg(feature = "test-support")]
 pub fn insert_error_log(
     db: &Arc<Mutex<Database>>,
     category: &str,

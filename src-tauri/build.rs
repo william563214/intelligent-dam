@@ -18,8 +18,11 @@ fn main() {
 /// Note: `rustc-link-arg-tests` does not apply to `cargo test --lib` harnesses.
 /// Those already pass on Windows for this crate; only `tests/` needed the fix.
 fn embed_windows_common_controls_for_integration_tests() {
-    let target = std::env::var("TARGET").unwrap_or_default();
-    if !target.contains("windows-msvc") {
+    // Prefer Cargo cfg env vars over `cfg!(windows)` so cross-compile host
+    // does not decide; only MSVC Windows targets need the SxS link arg.
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if os != "windows" || env != "msvc" {
         return;
     }
     println!(
