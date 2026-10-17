@@ -82,8 +82,9 @@ jobs:
 
       - name: Cargo test (lib + integration)
         working-directory: src-tauri
-        # Windows: build.rs uses rustc-link-arg-tests (not the app link line) to
-        # add Common-Controls v6 for tests/ only — see tauri-apps/tauri#13419.
+        # Windows: build.rs embeds Common-Controls v6 via rustc-link-arg (+
+        # rustc-link-arg-tests) so lib and tests/ harnesses can load
+        # (STATUS_ENTRYPOINT_NOT_FOUND without it — tauri-apps/tauri#13419).
         run: cargo test --locked
 
       - name: Cargo clippy
