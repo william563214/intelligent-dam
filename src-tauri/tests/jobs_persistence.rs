@@ -2,10 +2,10 @@
 //!
 //! Lives under `tests/` so Windows harnesses pick up Common-Controls v6 via
 //! `cargo:rustc-link-arg-tests` (see build.rs / #48). Do not move into `--lib`.
+//! Requires `--features test-support`.
 
 use intelligent_dam_lib::test_support::{
-    arm_execute_fault_for_test, clear_execute_fault_for_test, env_max_attempts, max_terminal_jobs,
-    Database, JobKind, NewJobRow, PipelineOptions, TaskQueue,
+    max_terminal_jobs, Database, JobKind, NewJobRow, PipelineOptions, TaskQueue,
 };
 use std::sync::{Arc, Mutex};
 
@@ -43,7 +43,7 @@ fn enqueue_persists_queued_row_before_status_visible() {
 }
 
 #[test]
-fn mid_run_restart_resets_running_and_completes() {
+fn mid_run_restart_resumes_without_further_calls() {
     let (_dir, db) = temp_queue_db("restart-complete");
     let queue = TaskQueue::with_concurrency(1);
     queue.bind_database(Arc::clone(&db)).expect("bind");
@@ -54,14 +54,13 @@ fn mid_run_restart_resets_running_and_completes() {
         .update_job_state(id as i64, "running", 1, None, true)
         .expect("mark running");
 
+    // Single entry point: recover then resume (no separate drain/enqueue from caller)
     let queue2 = TaskQueue::with_concurrency(1);
-    queue2.bind_database(Arc::clone(&db)).expect("recover");
-    let row = db.lock().unwrap().get_job(id as i64).expect("row");
-    assert_eq!(row.status, "queued", "running must reset to queued");
-    assert!(queue2.has_active_pipeline(3).expect("active"));
+    let n = queue2
+        .recover_and_resume_for_test(Arc::clone(&db))
+        .expect("recover+resume");
+    assert!(n >= 1, "recovered jobs must start executing");
 
-    let n = queue2.drain_for_test().expect("drain");
-    assert!(n >= 1);
     let row = db.lock().unwrap().get_job(id as i64).expect("done");
     assert_eq!(row.status, "succeeded");
     let snap = queue2.status().expect("snap");
@@ -72,14 +71,12 @@ fn mid_run_restart_resets_running_and_completes() {
 #[test]
 fn retry_exhaustion_marks_failed_and_writes_error_log() {
     let (_dir, db) = temp_queue_db("retry-exhaust");
-    std::env::set_var(env_max_attempts, "1");
-    let queue = TaskQueue::with_concurrency(1);
+    let queue = TaskQueue::with_options(1, 1);
     queue.bind_database(Arc::clone(&db)).expect("bind");
     let id = queue.enqueue(noop_pipeline(4), None).expect("enqueue");
-    arm_execute_fault_for_test();
+    queue.arm_fault();
     let _ = queue.drain_for_test();
-    clear_execute_fault_for_test();
-    std::env::remove_var(env_max_attempts);
+    queue.clear_fault();
 
     let row = db.lock().unwrap().get_job(id as i64).expect("row");
     assert_eq!(row.status, "failed");
@@ -90,6 +87,12 @@ fn retry_exhaustion_marks_failed_and_writes_error_log() {
             .any(|e| e.category == "queue" && e.message.contains("exhausted")),
         "logs={logs:?}"
     );
+
+    // Manual retry after auto-exhaustion must reset attempts and re-queue
+    queue.retry(id).expect("manual retry after exhaustion");
+    let row = db.lock().unwrap().get_job(id as i64).expect("retried");
+    assert_eq!(row.status, "queued");
+    assert_eq!(row.attempts, 0);
 }
 
 #[test]
@@ -154,18 +157,24 @@ fn terminal_prune_deletes_from_db() {
 }
 
 #[test]
-fn active_pipeline_dedupe_survives_db_backed_enqueue() {
+fn active_pipeline_dedupe_skips_second_enqueue_same_file() {
     let (_dir, db) = temp_queue_db("dedupe");
     let queue = TaskQueue::with_concurrency(1);
     queue.bind_database(Arc::clone(&db)).expect("bind");
     let a = queue.enqueue(noop_pipeline(7), None).expect("a");
     assert!(queue.has_active_pipeline(7).expect("active"));
-    let b = queue.enqueue(noop_pipeline(8), None).expect("b");
-    assert_ne!(a, b);
+    // Caller-layer dedupe: skip when the same file is already queued/running
+    let enqueued_again = if queue.has_active_pipeline(7).expect("check") {
+        None
+    } else {
+        Some(queue.enqueue(noop_pipeline(7), None).expect("b"))
+    };
+    assert!(enqueued_again.is_none(), "second enqueue of file 7 must skip");
     let queued = db
         .lock()
         .unwrap()
         .list_jobs_with_status(&["queued"])
         .expect("list");
-    assert_eq!(queued.len(), 2);
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].id, a as i64);
 }

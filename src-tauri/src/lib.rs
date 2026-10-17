@@ -15,6 +15,7 @@ mod watcher;
 mod commands;
 
 /// Minimal re-exports for `tests/` command-layer integration tests.
+#[cfg(feature = "test-support")]
 pub mod test_support;
 
 use database::Database;
@@ -126,9 +127,54 @@ pub fn run() {
             // Arc so Watcher ingest worker can share the same mutex
             let db = Arc::new(Mutex::new(db));
             let queue = Arc::new(TaskQueue::new());
-            // #34 recover running→queued once after DB init, before any workers start
-            if let Err(e) = queue.bind_database(Arc::clone(&db)) {
-                eprintln!("warn: task queue recovery failed: {e}");
+            // #34 recover running→queued once after DB init, then resume if work remains
+            match queue.bind_database(Arc::clone(&db)) {
+                Ok(()) => {
+                    let queued = queue.queued_job_count().unwrap_or(0);
+                    if queued > 0 {
+                        match queue.path_suppressions() {
+                            Ok(suppressions) => {
+                                if let Err(e) = queue.bind_and_start(
+                                    app.handle().clone(),
+                                    Arc::clone(&db),
+                                    suppressions,
+                                ) {
+                                    eprintln!("warn: task queue resume failed: {e}");
+                                    if let Ok(guard) = db.lock() {
+                                        if let Err(log_err) = guard.insert_error_log(
+                                            "queue",
+                                            None,
+                                            None,
+                                            &format!("task queue resume failed: {e}"),
+                                            None,
+                                        ) {
+                                            eprintln!(
+                                                "warn: ErrorLog after resume failure: {log_err}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warn: task queue suppressions for resume: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warn: task queue recovery failed: {e}");
+                    if let Ok(guard) = db.lock() {
+                        if let Err(log_err) = guard.insert_error_log(
+                            "queue",
+                            None,
+                            None,
+                            &format!("task queue recovery failed: {e}"),
+                            None,
+                        ) {
+                            eprintln!("warn: ErrorLog after recovery failure: {log_err}");
+                        }
+                    }
+                }
             }
             app.manage(db);
             app.manage(Mutex::new(settings_store));
