@@ -130,33 +130,19 @@ pub fn run() {
             // #34 recover running→queued once after DB init, then resume if work remains
             match queue.bind_database(Arc::clone(&db)) {
                 Ok(()) => {
-                    let queued = queue.queued_job_count().unwrap_or(0);
-                    if queued > 0 {
-                        match queue.path_suppressions() {
-                            Ok(suppressions) => {
-                                if let Err(e) = queue.bind_and_start(
-                                    app.handle().clone(),
-                                    Arc::clone(&db),
-                                    suppressions,
-                                ) {
-                                    eprintln!("warn: task queue resume failed: {e}");
-                                    if let Ok(guard) = db.lock() {
-                                        if let Err(log_err) = guard.insert_error_log(
-                                            "queue",
-                                            None,
-                                            None,
-                                            &format!("task queue resume failed: {e}"),
-                                            None,
-                                        ) {
-                                            eprintln!(
-                                                "warn: ErrorLog after resume failure: {log_err}"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("warn: task queue suppressions for resume: {e}");
+                    if let Err(e) =
+                        queue.resume_if_pending(app.handle().clone(), Arc::clone(&db))
+                    {
+                        eprintln!("warn: task queue resume failed: {e}");
+                        if let Ok(guard) = db.lock() {
+                            if let Err(log_err) = guard.insert_error_log(
+                                "queue",
+                                None,
+                                None,
+                                &format!("task queue resume failed: {e}"),
+                                None,
+                            ) {
+                                eprintln!("warn: ErrorLog after resume failure: {log_err}");
                             }
                         }
                     }

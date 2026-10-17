@@ -66,7 +66,10 @@ pub struct JobRow {
     pub max_attempts: u32,
     pub error: Option<String>,
     pub retryable: bool,
+    // Populated from DB; reserved for future UI / diagnostics
+    #[allow(dead_code)]
     pub created_at: String,
+    #[allow(dead_code)]
     pub updated_at: String,
 }
 
@@ -93,6 +96,7 @@ pub struct Database {
 const SCHEMA_USER_VERSION: i32 = 3;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
+#[cfg(any(test, feature = "test-support"))]
 pub fn current_schema_user_version() -> i32 {
     SCHEMA_USER_VERSION
 }
@@ -217,6 +221,7 @@ impl Database {
     }
 
     /// 讀取 PRAGMA user_version（整合測試與診斷用）
+    #[cfg(any(test, feature = "test-support"))]
     pub fn read_user_version(&self) -> SqliteResult<i32> {
         self.get_user_version()
     }
@@ -1326,6 +1331,7 @@ impl Database {
         self.update_job_state(id, "failed", attempts, Some(error), retryable)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn get_job(&self, id: i64) -> SqliteResult<JobRow> {
         self.conn.query_row(
             "SELECT id, status, type, payload, attempts, max_attempts,
@@ -1395,6 +1401,7 @@ impl Database {
         Ok(n)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn jobs_table_exists(&self) -> SqliteResult<bool> {
         self.table_exists("Jobs")
     }
