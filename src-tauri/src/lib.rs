@@ -15,6 +15,7 @@ mod watcher;
 mod commands;
 
 /// Minimal re-exports for `tests/` command-layer integration tests.
+#[cfg(feature = "test-support")]
 pub mod test_support;
 
 use database::Database;
@@ -82,7 +83,10 @@ fn show_blocking_error_dialog(title: &str, message: &str) {
         // 無 zenity / kdialog：不呼叫 rfd 僅依賴呼叫端 stderr
     }
 
-    #[cfg(any(windows, target_os = "macos"))]
+    // Omit rfd under cfg(test) so `cargo test --lib` harnesses do not import
+    // TaskDialogIndirect (comctl32 v6). Release builds and `tests/*` binaries
+    // still link rfd; the latter get Common-Controls via rustc-link-arg-tests.
+    #[cfg(all(any(windows, target_os = "macos"), not(test)))]
     {
         let _ = rfd::MessageDialog::new()
             .set_level(rfd::MessageLevel::Error)
@@ -121,10 +125,61 @@ pub fn run() {
             let settings_store = SettingsStore::new(&app_data_dir);
 
             // Arc so Watcher ingest worker can share the same mutex
-            app.manage(Arc::new(Mutex::new(db)));
+            let db = Arc::new(Mutex::new(db));
+            let queue = Arc::new(TaskQueue::new());
+            // #34 recover running→queued once after DB init, then resume if work remains
+            match queue.bind_database(Arc::clone(&db)) {
+                Ok(()) => {
+                    let queued = queue.queued_job_count().unwrap_or(0);
+                    if queued > 0 {
+                        match queue.path_suppressions() {
+                            Ok(suppressions) => {
+                                if let Err(e) = queue.bind_and_start(
+                                    app.handle().clone(),
+                                    Arc::clone(&db),
+                                    suppressions,
+                                ) {
+                                    eprintln!("warn: task queue resume failed: {e}");
+                                    if let Ok(guard) = db.lock() {
+                                        if let Err(log_err) = guard.insert_error_log(
+                                            "queue",
+                                            None,
+                                            None,
+                                            &format!("task queue resume failed: {e}"),
+                                            None,
+                                        ) {
+                                            eprintln!(
+                                                "warn: ErrorLog after resume failure: {log_err}"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("warn: task queue suppressions for resume: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warn: task queue recovery failed: {e}");
+                    if let Ok(guard) = db.lock() {
+                        if let Err(log_err) = guard.insert_error_log(
+                            "queue",
+                            None,
+                            None,
+                            &format!("task queue recovery failed: {e}"),
+                            None,
+                        ) {
+                            eprintln!("warn: ErrorLog after recovery failure: {log_err}");
+                        }
+                    }
+                }
+            }
+            app.manage(db);
             app.manage(Mutex::new(settings_store));
             app.manage(WatcherManager::new());
-            app.manage(Arc::new(TaskQueue::new()));
+            app.manage(queue);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

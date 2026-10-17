@@ -1,5 +1,6 @@
 //! Minimal public surface for command-layer integration tests.
 //! Not a stable application API — prefer `#[tauri::command]` wrappers in production.
+//! Gated behind the `test-support` cargo feature (enabled in CI test/clippy).
 
 pub use crate::commands::{
     add_file_tag, clear_error_logs, clear_file_tags, enqueue_pipeline_jobs, get_all_files,
@@ -8,8 +9,9 @@ pub use crate::commands::{
     ScanResult,
 };
 pub use crate::database::{
-    current_schema_user_version, Database, ErrorLogEntry, FileWithMetadata, Metadata, Tag,
+    current_schema_user_version, Database, ErrorLogEntry, FileWithMetadata, JobRow, Metadata,
+    NewJobRow, Tag,
 };
 pub use crate::pipeline::PipelineOptions;
 pub use crate::settings::{AppSettings, SettingsStore};
-pub use crate::task_queue::TaskQueue;
+pub use crate::task_queue::{max_terminal_jobs, JobKind, TaskQueue};
