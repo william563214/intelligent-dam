@@ -11,6 +11,11 @@ rust-version = "1.83"
 name = "intelligent_dam_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+# Test-only helpers (drain_for_test, arm_fault, test_support re-exports). Not for release.
+test-support = []
+
 [build-dependencies]
 # 與目前 Cargo.lock 對齊 使用 ~ 釘住相容範圍 避免 minor 漂移
 tauri-build = { version = "~2.5.2", features = [] }

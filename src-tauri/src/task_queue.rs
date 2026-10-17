@@ -10,8 +10,10 @@
 //! - **Dispatch**: each worker wake takes **exactly one** job via [`Scheduler::dispatch_one`].
 //!   Jobs are marked `Running` only when a worker actually claims them.
 //! - **Failures**: jobs are marked `Failed` with an error string and `retryable`
-//!   flag; errors are never swallowed. Callers may `retry` a failed job (new
-//!   attempt) without inventing success. Abort / stop_flag → `Cancelled`, not retry.
+//!   flag; errors are never swallowed. Auto-retry requeues while attempts remain
+//!   then marks failed + ErrorLog. Manual [`TaskQueue::retry`] resets the attempt
+//!   count so operators can try again after exhaustion. Abort / stop_flag →
+//!   `Cancelled`, not retry.
 //! - Pipeline still honors scrape_failed / PathSuppression / stop_flag from #19/#23.
 //!
 //! # `completed_with_errors` vs queue Failed / retry
@@ -52,7 +54,7 @@ const queue_event_name: &str = "task-queue-progress";
 const env_concurrency: &str = "IDAM_QUEUE_CONCURRENCY";
 
 #[allow(non_upper_case_globals)]
-pub const env_max_attempts: &str = "IDAM_QUEUE_MAX_ATTEMPTS";
+const env_max_attempts: &str = "IDAM_QUEUE_MAX_ATTEMPTS";
 
 #[allow(non_upper_case_globals)]
 const default_concurrency: usize = 2;
@@ -458,7 +460,7 @@ impl Scheduler {
         removed
     }
 
-    /// Re-queue a failed job if attempts remain
+    /// Re-queue a failed retryable job, resetting the attempt count for a fresh run
     pub fn retry(&mut self, id: u64) -> Result<&JobRecord, String> {
         let job = self
             .jobs
@@ -474,12 +476,8 @@ impl Scheduler {
         if !job.retryable {
             return Err(format!("Job {} is not retryable", id));
         }
-        if job.attempts >= job.max_attempts {
-            return Err(format!(
-                "Job {} exhausted attempts ({}/{})",
-                id, job.attempts, job.max_attempts
-            ));
-        }
+        // Manual retry always gets a fresh attempt budget (auto-retry may have exhausted)
+        job.attempts = 0;
         job.state = JobState::Queued;
         job.error = None;
         self.pending.push_back(id);
@@ -564,14 +562,22 @@ pub struct TaskQueue {
     db: Mutex<Option<Arc<Mutex<Database>>>>,
     /// Startup recovery runs once after DB bind, before workers start
     recovered: AtomicBool,
+    /// Default max_attempts for newly enqueued jobs (per-queue, not process env in tests)
+    max_attempts: u32,
+    /// Injected execute failures for tests (`test-support` / arm_fault)
+    execute_fault: Arc<AtomicBool>,
 }
 
 impl TaskQueue {
     pub fn new() -> Self {
-        Self::with_concurrency(concurrency_from_env())
+        Self::with_options(concurrency_from_env(), max_attempts_from_env())
     }
 
     pub fn with_concurrency(concurrency: usize) -> Self {
+        Self::with_options(concurrency, default_max_attempts)
+    }
+
+    pub fn with_options(concurrency: usize, max_attempts: u32) -> Self {
         Self {
             inner: Arc::new(Mutex::new(QueueInner {
                 scheduler: Scheduler::new(concurrency),
@@ -583,7 +589,26 @@ impl TaskQueue {
             app: Mutex::new(None),
             db: Mutex::new(None),
             recovered: AtomicBool::new(false),
+            max_attempts: max_attempts.max(1),
+            execute_fault: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Count jobs currently in `queued` state (memory scheduler)
+    pub fn queued_job_count(&self) -> Result<usize, String> {
+        Ok(self.status()?.pending)
+    }
+
+    /// Arm injected execute failures (per-queue; safe for parallel tests)
+    #[cfg(feature = "test-support")]
+    pub fn arm_fault(&self) {
+        self.execute_fault.store(true, Ordering::SeqCst);
+    }
+
+    /// Clear injected execute failures
+    #[cfg(feature = "test-support")]
+    pub fn clear_fault(&self) {
+        self.execute_fault.store(false, Ordering::SeqCst);
     }
 
     /// Shared PathSuppression used by Watcher moves and phash near-dedup orphans.
@@ -634,10 +659,35 @@ impl TaskQueue {
 
     /// Reset `running`→`queued`, load durable jobs into the in-memory scheduler once.
     fn recover_from_database_once(&self, db: &Arc<Mutex<Database>>) -> Result<(), String> {
-        if self.recovered.swap(true, Ordering::SeqCst) {
+        if self.recovered.load(Ordering::SeqCst) {
             return Ok(());
         }
 
+        let result = self.recover_from_database_inner(db);
+        match &result {
+            Ok(()) => {
+                self.recovered.store(true, Ordering::SeqCst);
+            }
+            Err(e) => {
+                if let Ok(guard) = db.lock() {
+                    if let Err(log_err) = guard.insert_error_log(
+                        error_log_category_queue,
+                        None,
+                        None,
+                        &format!("task queue recovery failed: {e}"),
+                        None,
+                    ) {
+                        eprintln!("task_queue: ErrorLog after recovery failure: {log_err}");
+                    }
+                } else {
+                    eprintln!("task_queue: recovery failed (db lock): {e}");
+                }
+            }
+        }
+        result
+    }
+
+    fn recover_from_database_inner(&self, db: &Arc<Mutex<Database>>) -> Result<(), String> {
         let rows = {
             let guard = db
                 .lock()
@@ -670,13 +720,25 @@ impl TaskQueue {
                         row.job_type,
                         row.payload.chars().take(200).collect::<String>()
                     );
-                    if let Ok(guard) = db.lock() {
-                        let _ = guard.mark_job_failed(
+                    {
+                        let guard = db
+                            .lock()
+                            .map_err(|e| format!("Database lock error: {}", e))?;
+                        if let Err(e) = guard.mark_job_failed(
                             row.id,
                             row.attempts,
                             &err_msg,
                             false,
-                        );
+                        ) {
+                            eprintln!(
+                                "task_queue: mark_job_failed for bad payload id={}: {e}",
+                                row.id
+                            );
+                            return Err(format!(
+                                "mark_job_failed for job {}: {e}",
+                                row.id
+                            ));
+                        }
                         if let Err(e) = guard.insert_error_log(
                             error_log_category_queue,
                             None,
@@ -777,6 +839,7 @@ impl TaskQueue {
         })
     }
 
+    #[cfg(feature = "test-support")]
     fn delete_pruned_jobs(&self, pruned: &[u64]) -> Result<(), String> {
         let db = {
             let slot = self
@@ -819,10 +882,11 @@ impl TaskQueue {
             let app = app.clone();
             let db = Arc::clone(&db);
             let suppressions = Arc::clone(&self.suppressions);
+            let execute_fault = Arc::clone(&self.execute_fault);
             let handle = thread::Builder::new()
                 .name(format!("dam-task-queue-{}", i))
                 .spawn(move || {
-                    worker_loop(inner, wake, shutdown, app, db, suppressions);
+                    worker_loop(inner, wake, shutdown, app, db, suppressions, execute_fault);
                 })
                 .map_err(|e| format!("Failed to spawn queue worker: {}", e))?;
             workers.push(handle);
@@ -836,7 +900,7 @@ impl TaskQueue {
         kind: JobKind,
         stop_flag: Option<Arc<AtomicBool>>,
     ) -> Result<u64, String> {
-        let max_attempts = max_attempts_from_env();
+        let max_attempts = self.max_attempts;
         let payload = kind.to_payload_json()?;
         let id = self.with_db(|db| {
             db.insert_job(&crate::database::NewJobRow {
@@ -906,6 +970,40 @@ impl TaskQueue {
     }
 
     pub fn retry(&self, job_id: u64) -> Result<u64, String> {
+        // Validate before any mutation
+        {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|e| format!("queue lock: {}", e))?;
+            let job = guard
+                .scheduler
+                .get(job_id)
+                .ok_or_else(|| format!("Unknown job id {}", job_id))?;
+            if job.state != JobState::Failed {
+                return Err(format!(
+                    "Job {} is {:?} (only Failed can retry)",
+                    job_id,
+                    job.state.as_str()
+                ));
+            }
+            if !job.retryable {
+                return Err(format!("Job {} is not retryable", job_id));
+            }
+        }
+
+        // Persist queued + reset attempts before touching in-memory scheduler
+        self.with_db(|db| {
+            db.update_job_state(
+                job_id as i64,
+                JobState::Queued.as_str(),
+                0,
+                None,
+                true,
+            )
+            .map_err(|e| format!("persist retry for job {}: {}", job_id, e))
+        })?;
+
         let job = {
             let mut guard = self
                 .inner
@@ -918,7 +1016,6 @@ impl TaskQueue {
                 .ok_or_else(|| format!("Unknown job {}", job_id))?
                 .clone()
         };
-        self.persist_record(&job)?;
         self.emit_queue_event(
             &job.kind,
             job_id,
@@ -995,6 +1092,58 @@ impl Drop for TaskQueue {
     }
 }
 
+/// Apply an execute outcome to the scheduler (shared by workers and test drain).
+fn apply_exec_outcome(
+    scheduler: &mut Scheduler,
+    job: &JobRecord,
+    outcome: ExecOutcome,
+) -> (Option<JobRecord>, Vec<u64>, bool) {
+    match outcome {
+        ExecOutcome::Success => match scheduler.complete_success(job.id) {
+            Some((rec, pruned)) => (Some(rec), pruned, false),
+            None => (None, Vec::new(), false),
+        },
+        ExecOutcome::Failed { error, retryable } => {
+            if retryable && job.attempts < job.max_attempts {
+                (
+                    scheduler.requeue_after_failure(job.id, error),
+                    Vec::new(),
+                    false,
+                )
+            } else {
+                match scheduler.complete_failed(job.id, error, retryable) {
+                    Some((rec, pruned)) => (Some(rec), pruned, true),
+                    None => (None, Vec::new(), false),
+                }
+            }
+        }
+        ExecOutcome::Cancelled { message } => match scheduler.complete_cancelled(job.id, message)
+        {
+            Some((rec, pruned)) => (Some(rec), pruned, false),
+            None => (None, Vec::new(), false),
+        },
+    }
+}
+
+fn write_exhaustion_error_log(db: &Database, rec: &JobRecord) {
+    let msg = format!(
+        "job {} exhausted retries ({}/{}): {}",
+        rec.id,
+        rec.attempts,
+        rec.max_attempts,
+        rec.error.as_deref().unwrap_or("unknown")
+    );
+    if let Err(e) = db.insert_error_log(
+        error_log_category_queue,
+        Some(rec.kind.file_id()),
+        None,
+        &msg,
+        Some(rec.kind.label()),
+    ) {
+        eprintln!("task_queue: ErrorLog on retry exhaustion: {e}");
+    }
+}
+
 fn worker_loop(
     inner: Arc<Mutex<QueueInner>>,
     wake: Arc<(Mutex<()>, Condvar)>,
@@ -1002,6 +1151,7 @@ fn worker_loop(
     app: AppHandle,
     db: Arc<Mutex<Database>>,
     suppressions: Arc<Mutex<Arc<PathSuppression>>>,
+    execute_fault: Arc<AtomicBool>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
         // Claim exactly one job — never mark more Running than this worker will run
@@ -1032,44 +1182,20 @@ fn worker_loop(
             .ok()
             .map(|g| Arc::clone(&g))
             .unwrap_or_else(|| Arc::new(PathSuppression::default()));
-        let outcome = execute_job(&job, Some(&app), &db, supp.as_ref());
+        let outcome = execute_job(
+            &job,
+            Some(&app),
+            &db,
+            supp.as_ref(),
+            execute_fault.as_ref(),
+        );
 
         let (finished, pruned, write_exhaustion_log) = {
             let mut guard = match inner.lock() {
                 Ok(g) => g,
                 Err(_) => break,
             };
-            match outcome {
-                ExecOutcome::Success => {
-                    let result = guard.scheduler.complete_success(job.id);
-                    match result {
-                        Some((rec, pruned)) => (Some(rec), pruned, false),
-                        None => (None, Vec::new(), false),
-                    }
-                }
-                ExecOutcome::Failed { error, retryable } => {
-                    if retryable && job.attempts < job.max_attempts {
-                        let rec = guard.scheduler.requeue_after_failure(job.id, error);
-                        (rec, Vec::new(), false)
-                    } else {
-                        let result =
-                            guard
-                                .scheduler
-                                .complete_failed(job.id, error, retryable);
-                        match result {
-                            Some((rec, pruned)) => (Some(rec), pruned, true),
-                            None => (None, Vec::new(), false),
-                        }
-                    }
-                }
-                ExecOutcome::Cancelled { message } => {
-                    let result = guard.scheduler.complete_cancelled(job.id, message);
-                    match result {
-                        Some((rec, pruned)) => (Some(rec), pruned, false),
-                        None => (None, Vec::new(), false),
-                    }
-                }
-            }
+            apply_exec_outcome(&mut guard.scheduler, &job, outcome)
         };
 
         if let Some(ref rec) = finished {
@@ -1078,22 +1204,7 @@ fn worker_loop(
             }
             if write_exhaustion_log {
                 if let Ok(guard) = db.lock() {
-                    let msg = format!(
-                        "job {} exhausted retries ({}/{}): {}",
-                        rec.id,
-                        rec.attempts,
-                        rec.max_attempts,
-                        rec.error.as_deref().unwrap_or("unknown")
-                    );
-                    if let Err(e) = guard.insert_error_log(
-                        error_log_category_queue,
-                        Some(rec.kind.file_id()),
-                        None,
-                        &msg,
-                        Some(rec.kind.label()),
-                    ) {
-                        eprintln!("task_queue: ErrorLog on retry exhaustion: {e}");
-                    }
+                    write_exhaustion_error_log(&guard, rec);
                 }
             }
             if let Err(e) = delete_pruned_job_ids(&db, &pruned) {
@@ -1152,6 +1263,7 @@ fn execute_job(
     app: Option<&AppHandle>,
     db: &Arc<Mutex<Database>>,
     suppressions: &PathSuppression,
+    execute_fault: &AtomicBool,
 ) -> ExecOutcome {
     if job
         .stop_flag
@@ -1164,7 +1276,7 @@ fn execute_job(
         };
     }
 
-    if execute_fault::should_fail() {
+    if execute_fault.load(Ordering::SeqCst) {
         return ExecOutcome::Failed {
             error: "injected execute fault".to_string(),
             retryable: true,
@@ -1298,34 +1410,7 @@ fn emit_progress(
     let _ = app.emit(queue_event_name, payload);
 }
 
-mod execute_fault {
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    static FAIL: AtomicBool = AtomicBool::new(false);
-
-    pub fn arm() {
-        FAIL.store(true, Ordering::SeqCst);
-    }
-
-    pub fn clear() {
-        FAIL.store(false, Ordering::SeqCst);
-    }
-
-    pub fn should_fail() -> bool {
-        FAIL.load(Ordering::SeqCst)
-    }
-}
-
-/// Arm injected execute failures (integration / unit tests only)
-pub fn arm_execute_fault_for_test() {
-    execute_fault::arm();
-}
-
-/// Clear injected execute failures
-pub fn clear_execute_fault_for_test() {
-    execute_fault::clear();
-}
-
+#[cfg(feature = "test-support")]
 impl TaskQueue {
     /// Synchronously claim and finish pending jobs without worker threads (tests).
     pub fn drain_for_test(&self) -> Result<usize, String> {
@@ -1352,60 +1437,27 @@ impl TaskQueue {
                 break;
             };
             self.persist_record(&job)?;
-            let outcome = execute_job(&job, None, &db, suppressions.as_ref());
+            let outcome = execute_job(
+                &job,
+                None,
+                &db,
+                suppressions.as_ref(),
+                self.execute_fault.as_ref(),
+            );
             let (finished, pruned, write_exhaustion_log) = {
                 let mut guard = self
                     .inner
                     .lock()
                     .map_err(|e| format!("queue lock: {}", e))?;
-                match outcome {
-                    ExecOutcome::Success => match guard.scheduler.complete_success(job.id) {
-                        Some((rec, pruned)) => (Some(rec), pruned, false),
-                        None => (None, Vec::new(), false),
-                    },
-                    ExecOutcome::Failed { error, retryable } => {
-                        if retryable && job.attempts < job.max_attempts {
-                            (
-                                guard.scheduler.requeue_after_failure(job.id, error),
-                                Vec::new(),
-                                false,
-                            )
-                        } else {
-                            match guard.scheduler.complete_failed(job.id, error, retryable) {
-                                Some((rec, pruned)) => (Some(rec), pruned, true),
-                                None => (None, Vec::new(), false),
-                            }
-                        }
-                    }
-                    ExecOutcome::Cancelled { message } => {
-                        match guard.scheduler.complete_cancelled(job.id, message) {
-                            Some((rec, pruned)) => (Some(rec), pruned, false),
-                            None => (None, Vec::new(), false),
-                        }
-                    }
-                }
+                apply_exec_outcome(&mut guard.scheduler, &job, outcome)
             };
             if let Some(ref rec) = finished {
                 self.persist_record(rec)?;
                 if write_exhaustion_log {
-                    let _ = self.with_db(|db| {
-                        let msg = format!(
-                            "job {} exhausted retries ({}/{}): {}",
-                            rec.id,
-                            rec.attempts,
-                            rec.max_attempts,
-                            rec.error.as_deref().unwrap_or("unknown")
-                        );
-                        db.insert_error_log(
-                            error_log_category_queue,
-                            Some(rec.kind.file_id()),
-                            None,
-                            &msg,
-                            Some(rec.kind.label()),
-                        )
-                        .map_err(|e| e.to_string())?;
+                    self.with_db(|db| {
+                        write_exhaustion_error_log(db, rec);
                         Ok(())
-                    });
+                    })?;
                 }
                 self.delete_pruned_jobs(&pruned)?;
                 finished_count = finished_count.saturating_add(1);
@@ -1416,6 +1468,18 @@ impl TaskQueue {
             }
         }
         Ok(finished_count)
+    }
+
+    /// Recover from DB then run any queued jobs (no further caller action needed).
+    pub fn recover_and_resume_for_test(
+        &self,
+        db: Arc<Mutex<Database>>,
+    ) -> Result<usize, String> {
+        self.bind_database(db)?;
+        if self.queued_job_count()? == 0 {
+            return Ok(0);
+        }
+        self.drain_for_test()
     }
 }
 
@@ -1544,20 +1608,23 @@ mod tests {
 
         s.retry(id).expect("retry");
         assert_eq!(s.get(id).unwrap().state, JobState::Queued);
+        assert_eq!(s.get(id).unwrap().attempts, 0);
         assert_eq!(s.pending_len(), 1);
 
         let again = s.dispatch_one().expect("retry run");
-        assert_eq!(again.attempts, 2);
+        assert_eq!(again.attempts, 1);
     }
 
     #[test]
-    fn retry_respects_max_attempts_and_non_retryable() {
+    fn manual_retry_resets_attempts_after_exhaustion() {
         let mut s = Scheduler::new(1);
         let id = s.enqueue(pipeline_kind(1), None, 1);
         let _ = s.dispatch_one();
         s.complete_failed(id, "once".to_string(), true);
-        let err = s.retry(id).unwrap_err();
-        assert!(err.contains("exhausted"), "{}", err);
+        // Auto-budget exhausted (1/1) but manual retry still works and resets attempts
+        s.retry(id).expect("manual retry after exhaustion");
+        assert_eq!(s.get(id).unwrap().state, JobState::Queued);
+        assert_eq!(s.get(id).unwrap().attempts, 0);
 
         let id2 = s.enqueue(pipeline_kind(2), None, 3);
         let _ = s.dispatch_one();
