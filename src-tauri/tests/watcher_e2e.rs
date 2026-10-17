@@ -219,6 +219,11 @@ fn delete_does_not_ingest_or_crash() {
         wait_until(ingest_timeout, || fx.has_file_named("soon-gone.mp4")),
         "precondition ingest"
     );
+    // Wait for enqueue to finish before snapshotting (DB row can land first)
+    assert!(
+        wait_until(ingest_timeout, || fx.queued_job_count() >= 1),
+        "precondition enqueue"
+    );
     let count_before = fx.file_count();
     let jobs_before = fx.queued_job_count();
 
