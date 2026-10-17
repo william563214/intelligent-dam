@@ -80,8 +80,11 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
 
-      - name: Cargo test (lib + integration)
+      - name: Cargo test (lib + command integration)
         working-directory: src-tauri
+        # Command integration tests live in-lib (`commands_integration_tests`) so
+        # Windows avoids STATUS_ENTRYPOINT_NOT_FOUND when linking a cdylib crate
+        # from a separate tests/ binary. `cargo test --locked` still runs them.
         run: cargo test --locked
 
       - name: Cargo clippy
