@@ -80,9 +80,11 @@ jobs:
         with:
           workspaces: ./src-tauri -> target
 
-      - name: Cargo test (lib)
+      - name: Cargo test (lib + integration)
         working-directory: src-tauri
-        run: cargo test --lib --locked
+        # Windows: build.rs uses rustc-link-arg-tests (not the app link line) to
+        # add Common-Controls v6 for tests/ only — see tauri-apps/tauri#13419.
+        run: cargo test --locked
 
       - name: Cargo clippy
         working-directory: src-tauri

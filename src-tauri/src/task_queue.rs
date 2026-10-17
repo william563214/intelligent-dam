@@ -464,6 +464,15 @@ impl TaskQueue {
             .map_err(|e| format!("queue suppressions lock: {}", e))
     }
 
+    /// Bind the shared DB without starting workers (integration tests / dry enqueue).
+    pub fn bind_database(&self, db: Arc<Mutex<Database>>) -> Result<(), String> {
+        *self
+            .db
+            .lock()
+            .map_err(|e| format!("queue db lock: {}", e))? = Some(db);
+        Ok(())
+    }
+
     /// Bind runtime deps and ensure worker threads are running.
     /// `suppressions` should be the same Arc the Watcher uses so moves stay suppressed.
     /// Re-binding updates the shared suppressions pointer used by existing workers.

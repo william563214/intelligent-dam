@@ -64,6 +64,11 @@ pub struct Database {
 /// 2 = #45 NULL-category 唯一索引
 const SCHEMA_USER_VERSION: i32 = 2;
 
+/// 對外查詢目前程式支援的 schema user_version（整合測試用）
+pub fn current_schema_user_version() -> i32 {
+    SCHEMA_USER_VERSION
+}
+
 /// 既有 v0.1.0 DB（user_version 0）升版後的 baseline
 const SCHEMA_BASELINE_VERSION: i32 = 1;
 
@@ -181,6 +186,11 @@ impl Database {
     fn get_user_version(&self) -> SqliteResult<i32> {
         self.conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
+    }
+
+    /// 讀取 PRAGMA user_version（整合測試與診斷用）
+    pub fn read_user_version(&self) -> SqliteResult<i32> {
+        self.get_user_version()
     }
 
     fn set_user_version(&self, version: i32) -> SqliteResult<()> {
