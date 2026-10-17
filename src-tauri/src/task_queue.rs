@@ -657,6 +657,17 @@ impl TaskQueue {
             Ok(suppressions) => self.bind_and_start(app, db, suppressions),
             Err(e) => {
                 eprintln!("warn: task queue suppressions for resume: {e}");
+                if let Ok(guard) = db.lock() {
+                    if let Err(log_err) = guard.insert_error_log(
+                        error_log_category_queue,
+                        None,
+                        None,
+                        &format!("task queue suppressions for resume: {e}"),
+                        None,
+                    ) {
+                        eprintln!("warn: ErrorLog after suppressions failure: {log_err}");
+                    }
+                }
                 Ok(())
             }
         }
@@ -990,6 +1001,22 @@ impl TaskQueue {
         )
     }
 
+    /// Apply in-memory scheduler retry (optional test fault runs first).
+    fn apply_scheduler_retry(&self, job_id: u64) -> Result<JobRecord, String> {
+        #[cfg(feature = "test-support")]
+        if self.retry_apply_fault.swap(false, Ordering::SeqCst) {
+            return Err("injected scheduler retry failure".to_string());
+        }
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("queue lock: {}", e))?;
+        guard
+            .scheduler
+            .retry(job_id)
+            .map(|job| (*job).clone())
+    }
+
     pub fn retry(&self, job_id: u64) -> Result<u64, String> {
         // Validate and snapshot failed fields for possible DB rollback
         let previous = {
@@ -1026,28 +1053,7 @@ impl TaskQueue {
             .map_err(|e| format!("persist retry for job {}: {}", job_id, e))
         })?;
 
-        let apply_result = {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|e| format!("queue lock: {}", e))?;
-            #[cfg(feature = "test-support")]
-            if self.retry_apply_fault.swap(false, Ordering::SeqCst) {
-                Err("injected scheduler retry failure".to_string())
-            } else {
-                guard
-                    .scheduler
-                    .retry(job_id)
-                    .map(|job| (*job).clone())
-            }
-            #[cfg(not(feature = "test-support"))]
-            {
-                guard
-                    .scheduler
-                    .retry(job_id)
-                    .map(|job| (*job).clone())
-            }
-        };
+        let apply_result = self.apply_scheduler_retry(job_id);
 
         let job = match apply_result {
             Ok(job) => job,
