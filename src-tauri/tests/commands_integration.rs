@@ -1,12 +1,12 @@
 //! Command-layer integration tests against temporary SQLite + settings.
 //!
-//! Lives under `#[cfg(test)]` inside the lib (not `tests/`) because Windows
-//! linking of integration-test binaries against a `cdylib` Tauri lib fails with
-//! `STATUS_ENTRYPOINT_NOT_FOUND`. Coverage and tempfile isolation are unchanged.
+//! Uses injected State-style handles (`Arc<Mutex<Database>>`, etc.) rather than
+//! a full UI. tauri-driver WebDriver E2E is intentionally deferred (see #35).
 //!
-//! tauri-driver WebDriver E2E is intentionally deferred (see #35).
+//! Windows: `build.rs` embeds Common-Controls v6 so this harness can load
+//! (avoids STATUS_ENTRYPOINT_NOT_FOUND via TaskDialogIndirect / comctl32).
 
-use crate::test_support::{
+use intelligent_dam_lib::test_support::{
     add_file_tag, clear_error_logs, clear_file_tags, current_schema_user_version,
     enqueue_pipeline_jobs, get_all_files, get_error_logs, get_file_tags, get_or_create_tag,
     get_settings, insert_error_log, save_settings, scan_directory, scan_multiple_directories,
