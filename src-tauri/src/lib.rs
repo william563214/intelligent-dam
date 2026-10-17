@@ -14,11 +14,8 @@ mod task_queue;
 mod watcher;
 mod commands;
 
-/// Minimal re-exports for command-layer integration tests.
+/// Minimal re-exports for `tests/` command-layer integration tests.
 pub mod test_support;
-
-#[cfg(test)]
-mod commands_integration_tests;
 
 use database::Database;
 use settings::SettingsStore;
