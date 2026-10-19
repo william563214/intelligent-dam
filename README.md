@@ -58,6 +58,20 @@ sudo yum install ffmpeg      # CentOS/RHEL
 1. 下載 [AV_Data_Capture](https://github.com/YEreed/AV_Data_Capture)
 2. 在應用程式的「設定」頁面中配置 AV_Data_Capture 的路徑
 
+## 環境變數（正式發行亦生效）
+
+Watcher 寫入完成偵測（`file_stability`）可透過下列變數覆寫；未設定時使用括號內預設。數值過低會被抬到下限並在 stderr 印出一次 warn；無法解析的值會忽略並 warn。
+
+| 變數 | 預設 | 下限 | 說明 |
+| --- | --- | --- | --- |
+| `IDAM_STABILITY_POLL_MS` | 500 | 50 | 輪詢間隔（毫秒） |
+| `IDAM_STABILITY_CHECKS` | 3 | 2 | 連續不變的 size+mtime 次數 |
+| `IDAM_STABILITY_TIMEOUT_SECS` | 120 | 5 | 總等待逾時（秒） |
+| `IDAM_STABILITY_MISSING_GRACE_MS` | 5000 | 1 | 路徑暫時消失的寬限（毫秒） |
+| `IDAM_STABILITY_HELD_DEGRADE_MS` | 30000 | — | size+mtime 已穩定但 writer probe 仍 Held 時，超過此時間則 warn 後降級為穩定；`0` 關閉降級 |
+
+其他既有覆寫（節錄）：`IDAM_NEAR_PHASH_MAX_DISTANCE`、`IDAM_QUEUE_CONCURRENCY`、`IDAM_PIPELINE_*`。
+
 ## 開發模式
 
 ```bash
