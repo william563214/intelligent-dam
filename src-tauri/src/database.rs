@@ -136,6 +136,7 @@ pub struct Database {
 /// 2 = #45 NULL-category 唯一索引
 /// 3 = #34 Jobs 佇列持久化
 /// 4 = #38 SuspectedDuplicates（near-phash 疑似重複）
+/// 5 = #38 DuplicateTombstones + Files.organized_at（durable organized）
 const SCHEMA_USER_VERSION: i32 = 5;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
@@ -375,7 +376,7 @@ impl Database {
         }
     }
 
-    /// #38 DuplicateTombstones（確認重複後的 path/phash 墓碑；含 size 以免誤擋同路徑新檔）
+    /// #38 DuplicateTombstones + Files.organized_at（確認重複墓碑；durable organized）
     fn migration_5_duplicate_tombstones(&self) -> SqliteResult<()> {
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
@@ -430,6 +431,46 @@ impl Database {
                     "warn: DuplicateTombstones.keeper_phash present (legacy); unused by app"
                 );
             }
+            // Durable organized marker — survives Jobs terminal prune (max 200).
+            let has_organized_at: bool = {
+                let mut stmt = self.conn.prepare("PRAGMA table_info(Files)")?;
+                let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                let mut found = false;
+                for c in cols {
+                    if c? == "organized_at" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_organized_at {
+                self.conn.execute(
+                    "ALTER TABLE Files ADD COLUMN organized_at DATETIME",
+                    [],
+                )?;
+            }
+            // Backfill from existing Metadata / FileTags / succeeded pipeline jobs
+            self.conn.execute_batch(
+                "
+                UPDATE Files SET organized_at = CURRENT_TIMESTAMP
+                WHERE organized_at IS NULL
+                  AND (
+                    id IN (SELECT file_id FROM Metadata)
+                    OR id IN (SELECT file_id FROM FileTags)
+                    OR id IN (
+                        SELECT CAST(
+                            CASE WHEN json_valid(payload)
+                                 THEN json_extract(payload, '$.file_id')
+                                 ELSE NULL END
+                            AS INTEGER
+                        )
+                        FROM Jobs
+                        WHERE type = 'pipeline' AND status = 'succeeded'
+                    )
+                  );
+                ",
+            )?;
             self.set_user_version(5)?;
             self.conn.execute("COMMIT", [])?;
             Ok(())
@@ -1098,7 +1139,7 @@ impl Database {
     /// Find another Files row whose phash is within `max_distance` of `phash_hex`.
     /// Considers any `id != exclude_file_id` (order-independent with multi-worker phash).
     /// Skips candidates already suspected-of this file (prevents reverse re-flag).
-    /// Caller must always act on the **larger** id (exact delete / near flag).
+    /// Caller may only auto-act on the just-phashed `exclude_file_id` (never on the match).
     pub fn find_near_phash_duplicate(
         &self,
         exclude_file_id: i64,
@@ -1156,29 +1197,40 @@ impl Database {
         Ok(best)
     }
 
-    /// Larger id / smaller id pair (legacy helper for tests).
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn near_phash_victim_keeper(self_id: i64, other_id: i64) -> (i64, i64) {
-        if other_id > self_id {
-            (other_id, self_id)
-        } else {
-            (self_id, other_id)
-        }
-    }
-
-    /// Organized = Metadata / FileTags / succeeded pipeline job.
+    /// Organized = Files.organized_at set, or Metadata / FileTags still present.
     ///
-    /// Limitation (N3): scrape/move done *outside* the durable Jobs queue does not
-    /// write a Jobs row, so those rows only count as organized once Metadata/FileTags
-    /// exist (or once a succeeded pipeline job is registered).
+    /// `organized_at` is the durable signal (survives Jobs prune). Metadata/FileTags
+    /// remain as live signals for rows organized before the column existed.
     pub fn is_organized_file(&self, file_id: i64) -> SqliteResult<bool> {
+        if self.file_has_organized_at(file_id)? {
+            return Ok(true);
+        }
         if self.has_metadata_row(file_id)? {
             return Ok(true);
         }
         if self.has_file_tags(file_id)? {
             return Ok(true);
         }
-        self.has_succeeded_pipeline_job(file_id)
+        Ok(false)
+    }
+
+    fn file_has_organized_at(&self, file_id: i64) -> SqliteResult<bool> {
+        let v: Option<String> = self.conn.query_row(
+            "SELECT organized_at FROM Files WHERE id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(v.filter(|s| !s.trim().is_empty()).is_some())
+    }
+
+    /// Persist organized marker (scrape/move success). Idempotent.
+    pub fn mark_file_organized(&self, file_id: i64) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE Files SET organized_at = COALESCE(organized_at, CURRENT_TIMESTAMP)
+             WHERE id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
     }
 
     pub fn has_file_tags(&self, file_id: i64) -> SqliteResult<bool> {
@@ -1199,11 +1251,13 @@ impl Database {
             return Ok(0);
         }
         // Exact match via json_extract — do not use instr('"file_id":1') (matches 12, 123…).
+        // json_valid guards so one corrupt payload cannot break all dedup lookups.
         self.conn.query_row(
             &format!(
                 "SELECT COUNT(*) FROM Jobs
                  WHERE type = 'pipeline'
                    AND status IN ({statuses})
+                   AND json_valid(payload)
                    AND CAST(json_extract(payload, '$.file_id') AS INTEGER) = ?1"
             ),
             params![file_id],
@@ -1211,94 +1265,24 @@ impl Database {
         )
     }
 
-    /// Active durable pipeline job (queued/running) for this file_id.
-    pub fn has_active_pipeline_job(&self, file_id: i64) -> SqliteResult<bool> {
-        Ok(self.count_pipeline_jobs_with_file_id(file_id, "'queued', 'running'")? > 0)
+    /// Pipeline job currently executing (`status='running'`).
+    ///
+    /// Own `queued` pipeline does **not** count — watcher enqueues pipeline before
+    /// phash completes, so treating queued as busy would invert #38 victims.
+    pub fn has_running_pipeline_job(&self, file_id: i64) -> SqliteResult<bool> {
+        Ok(self.count_pipeline_jobs_with_file_id(file_id, "'running'")? > 0)
     }
 
-    /// Succeeded pipeline job — counts as organized (e.g. move-only, no scrape Metadata).
-    pub fn has_succeeded_pipeline_job(&self, file_id: i64) -> SqliteResult<bool> {
-        Ok(self.count_pipeline_jobs_with_file_id(file_id, "'succeeded'")? > 0)
-    }
-
-    /// True when the row is safe to auto-delete as an exact duplicate.
-    pub fn is_provisional_for_dedup(&self, file_id: i64) -> SqliteResult<bool> {
+    /// THE RULE: auto delete/flag may only target this just-phashed row when it is
+    /// not organized and does not have a running pipeline job.
+    pub fn may_auto_act_on_self(&self, file_id: i64) -> SqliteResult<bool> {
         if self.is_organized_file(file_id)? {
             return Ok(false);
         }
-        if self.has_active_pipeline_job(file_id)? {
+        if self.has_running_pipeline_job(file_id)? {
             return Ok(false);
         }
         Ok(true)
-    }
-
-    /// Choose exact-dup victim/keeper. `None` → do not auto-delete (downgrade to Suspected).
-    ///
-    /// - Prefer deleting larger when provisional (`!organized && !busy`).
-    /// - If larger is organized and smaller is provisional, delete smaller.
-    /// - Keeper being busy does **not** block deleting a provisional victim.
-    /// - If the only provisional row's counterpart is busy (not organized), abort
-    ///   (re-judge via Suspected / rescan) rather than deleting the free row.
-    pub fn choose_exact_dedup_victim(
-        &self,
-        self_id: i64,
-        other_id: i64,
-    ) -> SqliteResult<Option<(i64, i64)>> {
-        let (larger, smaller) = if other_id > self_id {
-            (other_id, self_id)
-        } else {
-            (self_id, other_id)
-        };
-        let larger_org = self.is_organized_file(larger)?;
-        let smaller_org = self.is_organized_file(smaller)?;
-        let larger_prov = self.is_provisional_for_dedup(larger)?;
-        let smaller_prov = self.is_provisional_for_dedup(smaller)?;
-
-        if larger_org && smaller_org {
-            return Ok(None);
-        }
-        // Prefer larger provisional (keeper may be busy — still OK)
-        if larger_prov {
-            return Ok(Some((larger, smaller)));
-        }
-        // Organized larger → delete provisional smaller
-        if larger_org && smaller_prov {
-            return Ok(Some((smaller, larger)));
-        }
-        // Larger busy (not organized) + smaller provisional → do not delete smaller
-        Ok(None)
-    }
-
-    /// Near / exact-downgrade: prefer flagging the non-busy side; both busy → None.
-    /// Among non-busy, prefer the un-organized row.
-    pub fn choose_near_suspect_victim(
-        &self,
-        self_id: i64,
-        other_id: i64,
-    ) -> SqliteResult<Option<(i64, i64)>> {
-        let (larger, smaller) = if other_id > self_id {
-            (other_id, self_id)
-        } else {
-            (self_id, other_id)
-        };
-        let larger_busy = self.has_active_pipeline_job(larger)?;
-        let smaller_busy = self.has_active_pipeline_job(smaller)?;
-        if larger_busy && smaller_busy {
-            return Ok(None);
-        }
-        if larger_busy && !smaller_busy {
-            return Ok(Some((smaller, larger)));
-        }
-        if smaller_busy && !larger_busy {
-            return Ok(Some((larger, smaller)));
-        }
-        let larger_org = self.is_organized_file(larger)?;
-        let smaller_org = self.is_organized_file(smaller)?;
-        if larger_org && !smaller_org {
-            Ok(Some((smaller, larger)))
-        } else {
-            Ok(Some((larger, smaller)))
-        }
     }
 
     /// True when `file_id` has any SuspectedDuplicates row pointing at `keeper_id`.
@@ -2327,7 +2311,7 @@ impl Database {
         Ok(())
     }
 
-    /// 刮削成功後在同一交易寫入 metadata tags 與 status
+    /// 刮削成功後在同一交易寫入 metadata tags、status 與 organized_at
     pub fn persist_scrape_success(
         &self,
         metadata: &Metadata,
@@ -2340,6 +2324,7 @@ impl Database {
             self.update_metadata(metadata)?;
             self.apply_scraped_tags(metadata.file_id, tags, actors)?;
             self.update_file_status(metadata.file_id, status)?;
+            self.mark_file_organized(metadata.file_id)?;
             self.get_file_tags(metadata.file_id)
         })();
         match outcome {
