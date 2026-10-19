@@ -1348,6 +1348,29 @@ fn execute_job(
 
     match &job.kind {
         JobKind::Pipeline { file_id, options } => {
+            // Soft-skip before requiring AppHandle: exact-dedup may have deleted the
+            // row, or near-phash flagged suspected_duplicate, while this job was queued.
+            // Must be Success (not Failed+retry) so the queue does not thrash.
+            if let Ok(guard) = db.lock() {
+                match guard.get_file_by_id(*file_id) {
+                    Err(_) => {
+                        eprintln!(
+                            "task_queue: soft-skip pipeline file_id {} (row gone; exact dedup)",
+                            file_id
+                        );
+                        return ExecOutcome::Success;
+                    }
+                    Ok(file) if crate::file_status::blocks_auto_pipeline(&file.status) => {
+                        eprintln!(
+                            "task_queue: soft-skip pipeline file_id {} status={}",
+                            file_id, file.status
+                        );
+                        return ExecOutcome::Success;
+                    }
+                    Ok(_) => {}
+                }
+            }
+
             // Re-soften from DB on every run (including retry) so scrape_failed /
             // already-moved / already-previewed rows do not re-run the full chain
             let effective = {

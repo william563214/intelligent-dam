@@ -794,7 +794,11 @@ fn step_move(
         } else {
             guard
                 .update_file_path(file_id, &new_path_str)
-                .map_err(|e| anyhow::anyhow!("Failed to update Files.path: {}", e))
+                .map_err(|e| anyhow::anyhow!("Failed to update Files.path: {}", e))?;
+            // Move success = organized (durable; survives Jobs prune)
+            guard
+                .mark_file_organized(file_id)
+                .map_err(|e| anyhow::anyhow!("Failed to mark organized_at: {}", e))
         }
     };
 

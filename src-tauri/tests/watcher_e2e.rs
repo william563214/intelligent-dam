@@ -5,7 +5,7 @@
 
 use fs4::FileExt;
 use intelligent_dam_lib::test_support::{
-    get_all_files, Database, TaskQueue, WatcherManager, WatcherOptions,
+    get_all_files, Database, PipelineOptions, TaskQueue, WatcherManager, WatcherOptions,
 };
 use std::fs::{self, File};
 use std::io::Write;
@@ -25,12 +25,27 @@ struct Fixture {
     watch_dir: PathBuf,
     db: Arc<Mutex<Database>>,
     /// Kept alive so bind_database / enqueue share one queue for the session
-    _queue: Arc<TaskQueue>,
+    queue: Arc<TaskQueue>,
     watcher: WatcherManager,
 }
 
 impl Fixture {
     fn new(label: &str) -> Self {
+        Self::with_options(label, WatcherOptions::for_tests())
+    }
+
+    /// Auto-pipeline on (non-noop) so watcher enqueues pipeline after phash.
+    fn with_auto_pipeline(label: &str) -> Self {
+        let mut opts = WatcherOptions::for_tests();
+        opts.pipeline_override = Some(PipelineOptions {
+            enable_scrape: true,
+            enable_move: false,
+            enable_preview: false,
+        });
+        Self::with_options(label, opts)
+    }
+
+    fn with_options(label: &str, options: WatcherOptions) -> Self {
         let temp = tempfile::tempdir().expect("tempdir");
         let watch_dir = temp.path().join("watch");
         fs::create_dir_all(&watch_dir).expect("mkdir watch");
@@ -44,7 +59,7 @@ impl Fixture {
                 vec![watch_dir.clone()],
                 Arc::clone(&db),
                 Arc::clone(&queue),
-                WatcherOptions::for_tests(),
+                options,
             )
             .expect("start watcher");
         assert!(status.running);
@@ -55,7 +70,7 @@ impl Fixture {
             temp,
             watch_dir,
             db,
-            _queue: queue,
+            queue,
             watcher,
         }
     }
@@ -445,4 +460,168 @@ fn queue_recovers_after_restart_following_watcher_enqueue() {
         "unexpected terminal status {}",
         row.status
     );
+}
+
+/// B1 + THE RULE: organized keeper K; drop exact + near copies with auto pipeline on.
+/// New rows are deleted/flagged; K unchanged; queued pipelines soft-skip (succeeded, not Failed).
+#[test]
+fn auto_pipeline_exact_deleted_near_flagged_keeper_untouched() {
+    let fx = Fixture::with_auto_pipeline("dedup_rule");
+    let keeper_phash = "0000000000000000";
+    let near_phash = "000000000000000f"; // hamming distance 4
+
+    // Organized keeper outside the watch tree (not re-ingested)
+    let lib = fx.temp.path().join("library");
+    fs::create_dir_all(&lib).expect("lib");
+    let keeper_path = lib.join("keeper.mp4");
+    fs::write(&keeper_path, b"organized-keeper-bytes").expect("write k");
+    let keeper_id = {
+        let guard = fx.db.lock().expect("lock");
+        let (id, _) = guard
+            .upsert_file(
+                keeper_path.to_str().expect("utf8"),
+                22,
+                Some(keeper_phash.into()),
+            )
+            .expect("insert k");
+        guard.mark_file_organized(id).expect("organized_at");
+        id
+    };
+
+    let exact_path = fx.path("exact-copy.mp4");
+    let near_path = fx.path("near-copy.mp4");
+    fs::write(&exact_path, b"exact-copy-stub-bytes!!").expect("exact");
+    fs::write(
+        PathBuf::from(format!("{}.phash", exact_path.display())),
+        keeper_phash,
+    )
+    .expect("exact sidecar");
+    fs::write(&near_path, b"near-copy-stub-bytes!!!").expect("near");
+    fs::write(
+        PathBuf::from(format!("{}.phash", near_path.display())),
+        near_phash,
+    )
+    .expect("near sidecar");
+
+    assert!(
+        wait_until(ingest_timeout, || {
+            fx.has_file_named("exact-copy.mp4") && fx.has_file_named("near-copy.mp4")
+        }),
+        "both copies should ingest before phash drain"
+    );
+
+    let (exact_id, near_id) = {
+        let files = get_all_files(&fx.db).expect("list");
+        let exact = files
+            .iter()
+            .find(|f| {
+                Path::new(&f.file.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    == Some("exact-copy.mp4")
+            })
+            .expect("exact row")
+            .file
+            .id;
+        let near = files
+            .iter()
+            .find(|f| {
+                Path::new(&f.file.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    == Some("near-copy.mp4")
+            })
+            .expect("near row")
+            .file
+            .id;
+        (exact, near)
+    };
+    assert_ne!(exact_id, keeper_id);
+    assert_ne!(near_id, keeper_id);
+
+    // Wait until watcher has enqueued phash+pipeline for both (4 jobs) or at least
+    // one pipeline each — then drain so phash runs before pipeline (same-file serial).
+    assert!(
+        wait_until(ingest_timeout, || fx.queued_job_count() >= 4),
+        "expected phash+pipeline for each copy, got {}",
+        fx.queued_job_count()
+    );
+
+    let finished = fx.queue.drain_for_test().expect("drain");
+    assert!(finished >= 4, "drain finished {finished}");
+
+    // Exact deleted; near flagged; keeper untouched
+    assert!(
+        fx.db.lock().expect("lock").get_file_by_id(exact_id).is_err(),
+        "exact copy must be auto-deleted"
+    );
+    let near_row = fx
+        .db
+        .lock()
+        .expect("lock")
+        .get_file_by_id(near_id)
+        .expect("near survives as suspected");
+    assert_eq!(near_row.status, "suspected_duplicate");
+    let keeper = fx
+        .db
+        .lock()
+        .expect("lock")
+        .get_file_by_id(keeper_id)
+        .expect("keeper");
+    assert_ne!(keeper.status, "suspected_duplicate");
+    assert!(
+        fx.db
+            .lock()
+            .expect("lock")
+            .is_organized_file(keeper_id)
+            .expect("org"),
+        "keeper remains organized"
+    );
+    assert!(
+        fx.db
+            .lock()
+            .expect("lock")
+            .get_pending_suspected_duplicate(keeper_id)
+            .expect("q")
+            .is_none(),
+        "keeper must never be auto-flagged"
+    );
+
+    // Pipeline jobs for both copies: succeeded soft-skip (not Failed / not retried)
+    let jobs = fx
+        .db
+        .lock()
+        .expect("lock")
+        .list_jobs_with_status(&["succeeded", "failed", "queued", "running"])
+        .expect("jobs");
+    let pipeline_for = |fid: i64| {
+        jobs.iter()
+            .filter(|j| {
+                j.job_type == "pipeline"
+                    && j.payload.contains(&format!("\"file_id\":{fid}"))
+            })
+            .collect::<Vec<_>>()
+    };
+    let exact_pipes = pipeline_for(exact_id);
+    let near_pipes = pipeline_for(near_id);
+    assert!(
+        !exact_pipes.is_empty(),
+        "exact must have had a pipeline job enqueued"
+    );
+    assert!(
+        !near_pipes.is_empty(),
+        "near must have had a pipeline job enqueued"
+    );
+    for j in exact_pipes.iter().chain(near_pipes.iter()) {
+        assert_eq!(
+            j.status, "succeeded",
+            "pipeline for file_id payload {} must soft-skip as succeeded, got {} err={:?}",
+            j.payload, j.status, j.error
+        );
+        assert!(
+            j.error.is_none() || j.error.as_deref() == Some(""),
+            "soft-skip must not record a failure error: {:?}",
+            j.error
+        );
+    }
 }

@@ -134,10 +134,12 @@ pub fn calculate_phash(file_path: &Path) -> Result<String> {
 }
 
 /// Evaluate phash against existing rows.
-/// Exact: auto-delete only a provisional row (no Metadata/FileTags/active pipeline);
-/// never delete organized rows; if unsafe → Suspected.
-/// Near: prefer flagging the un-organized row.
-/// Phash tombstone: only provisional rows without Metadata.
+///
+/// THE RULE: automatic exact-delete or near-flag may only target `file_id` (the row
+/// just imported/phashed this pass), and only when it is not organized and does not
+/// have a running pipeline job. The matched older/existing row is never deleted or
+/// flagged automatically. If `file_id` is organized or running → no automatic action.
+/// Phash tombstone: only provisional rows without Metadata (still only `file_id`).
 /// Already-ignored (victim, keeper) pairs are treated as Distinct.
 fn apply_near_phash_policy(
     db: &Database,
@@ -219,60 +221,56 @@ fn apply_exact_dedup(
     suppressions: Option<&PathSuppression>,
     write_phash_on_suspected: bool,
 ) -> Result<Option<NearPhashDecision>> {
-    match db.choose_exact_dedup_victim(file_id, other_id)? {
-        None => {
-            eprintln!(
-                "phash dedup: exact match file_id {} other {} but neither safe to auto-delete \
-                 (organized/in-progress) — downgrading to suspected",
-                file_id, other_id
-            );
-            apply_near_suspect(
-                db,
-                file_id,
-                other_id,
-                distance,
-                phash_hex,
-                write_phash_on_suspected,
-            )
+    // THE RULE: only the just-phashed row may be deleted; never the matched other.
+    if !db.may_auto_act_on_self(file_id)? {
+        eprintln!(
+            "phash dedup: exact match file_id {} other {} — just-phashed row organized/running; \
+             no automatic action",
+            file_id, other_id
+        );
+        if write_phash_on_suspected {
+            let _ = db.update_file_phash(file_id, phash_hex);
         }
-        Some((victim_id, keeper_id)) => {
-            if db.is_ignored_suspected_pair(victim_id, keeper_id)? {
-                eprintln!(
-                    "phash dedup: skip exact delete victim {} keeper {} (already ignored)",
-                    victim_id, keeper_id
-                );
-                if write_phash_on_suspected {
-                    let _ = db.update_file_phash(file_id, phash_hex);
-                }
-                return Ok(None);
-            }
-            if write_phash_on_suspected {
-                let _ = db.update_file_phash(file_id, phash_hex);
-            }
-            let orphan_path = db.get_file_by_id(victim_id)?.path;
-            eprintln!(
-                "phash dedup: exact match victim {} path {} (keeper {} distance 0); \
-                 removing provisional row; PathSuppress orphan",
-                victim_id, orphan_path, keeper_id
-            );
-            db.delete_file_record(victim_id)?;
-            let path_buf = PathBuf::from(&orphan_path);
-            if let Some(supp) = suppressions {
-                supp.suppress(&path_buf);
-            } else {
-                eprintln!(
-                    "phash dedup: warning - no PathSuppression bound; orphan {} may re-ingest",
-                    orphan_path
-                );
-            }
-            Ok(Some(NearPhashDecision::Exact {
-                victim_id,
-                keeper_id,
-                distance,
-                path: path_buf,
-            }))
-        }
+        return Ok(None);
     }
+
+    let victim_id = file_id;
+    let keeper_id = other_id;
+    if db.is_ignored_suspected_pair(victim_id, keeper_id)? {
+        eprintln!(
+            "phash dedup: skip exact delete victim {} keeper {} (already ignored)",
+            victim_id, keeper_id
+        );
+        if write_phash_on_suspected {
+            let _ = db.update_file_phash(file_id, phash_hex);
+        }
+        return Ok(None);
+    }
+    if write_phash_on_suspected {
+        let _ = db.update_file_phash(file_id, phash_hex);
+    }
+    let orphan_path = db.get_file_by_id(victim_id)?.path;
+    eprintln!(
+        "phash dedup: exact match victim {} path {} (keeper {} distance 0); \
+         removing provisional just-phashed row; PathSuppress orphan",
+        victim_id, orphan_path, keeper_id
+    );
+    db.delete_file_record(victim_id)?;
+    let path_buf = PathBuf::from(&orphan_path);
+    if let Some(supp) = suppressions {
+        supp.suppress(&path_buf);
+    } else {
+        eprintln!(
+            "phash dedup: warning - no PathSuppression bound; orphan {} may re-ingest",
+            orphan_path
+        );
+    }
+    Ok(Some(NearPhashDecision::Exact {
+        victim_id,
+        keeper_id,
+        distance,
+        path: path_buf,
+    }))
 }
 
 fn apply_near_suspect(
@@ -283,16 +281,21 @@ fn apply_near_suspect(
     phash_hex: &str,
     write_phash_on_suspected: bool,
 ) -> Result<Option<NearPhashDecision>> {
-    let Some((victim_id, keeper_id)) = db.choose_near_suspect_victim(file_id, other_id)? else {
+    // THE RULE: only flag the just-phashed row; never the matched other.
+    if !db.may_auto_act_on_self(file_id)? {
         eprintln!(
-            "phash dedup: both sides busy for file_id {} other {} — defer suspect mark",
+            "phash dedup: near match file_id {} other {} — just-phashed row organized/running; \
+             no automatic action",
             file_id, other_id
         );
         if write_phash_on_suspected {
             let _ = db.update_file_phash(file_id, phash_hex);
         }
         return Ok(None);
-    };
+    }
+
+    let victim_id = file_id;
+    let keeper_id = other_id;
 
     if db.is_ignored_suspected_pair(victim_id, keeper_id)? {
         eprintln!(
@@ -324,12 +327,7 @@ fn apply_near_suspect(
     );
     if write_phash_on_suspected {
         let _ = db.update_file_phash(file_id, phash_hex);
-        let phash_arg = if victim_id == file_id {
-            Some(phash_hex)
-        } else {
-            None
-        };
-        db.mark_suspected_duplicate_atomic(victim_id, keeper_id, distance, phash_arg)?;
+        db.mark_suspected_duplicate_atomic(victim_id, keeper_id, distance, Some(phash_hex))?;
     } else {
         db.mark_suspected_duplicate_atomic(victim_id, keeper_id, distance, None)?;
     }
@@ -421,46 +419,48 @@ pub fn import_files_pending_phash(
             }
         };
 
-        // Precomputed phash: exact skip or mark suspected
-        if let Some(ref hash) = record.phash {
-            if !hash.trim().is_empty() {
-                let allow_tombstone = is_new && !db.has_metadata_row(record.id).unwrap_or(true);
-                match apply_near_phash_policy(
-                    db,
-                    record.id,
-                    hash,
-                    suppressions,
-                    max_distance,
-                    false,
-                    allow_tombstone,
-                ) {
-                    // Self deleted → skip import entry
-                    Ok(Some(NearPhashDecision::Exact { victim_id, .. }))
-                    | Ok(Some(NearPhashDecision::Tombstoned { victim_id, .. }))
-                        if victim_id == record.id =>
-                    {
-                        continue;
-                    }
-                    // Self flagged as suspected → keep in imported, no pipeline yet
-                    Ok(Some(NearPhashDecision::Suspected { victim_id, .. }))
-                        if victim_id == record.id =>
-                    {
-                        imported.push(ImportedFile {
-                            file_id: record.id,
-                            is_new,
-                        });
-                        continue;
-                    }
-                    // Victim was the other row (or no decision): survivor continues normally
-                    Ok(Some(NearPhashDecision::Exact { .. }))
-                    | Ok(Some(NearPhashDecision::Suspected { .. }))
-                    | Ok(Some(NearPhashDecision::Tombstoned { .. }))
-                    | Ok(None) => {}
-                    Err(e) => {
-                        eprintln!(
-                            "phash dedup check failed for {}: {:#}",
-                            path_str, e
-                        );
+        // Precomputed phash: auto-act only on newly imported rows (rescan of an
+        // existing hashed row must not re-trigger delete/flag).
+        if is_new {
+            if let Some(ref hash) = record.phash {
+                if !hash.trim().is_empty() {
+                    let allow_tombstone = !db.has_metadata_row(record.id).unwrap_or(true);
+                    match apply_near_phash_policy(
+                        db,
+                        record.id,
+                        hash,
+                        suppressions,
+                        max_distance,
+                        false,
+                        allow_tombstone,
+                    ) {
+                        // Self deleted → skip import entry
+                        Ok(Some(NearPhashDecision::Exact { victim_id, .. }))
+                        | Ok(Some(NearPhashDecision::Tombstoned { victim_id, .. }))
+                            if victim_id == record.id =>
+                        {
+                            continue;
+                        }
+                        // Self flagged as suspected → keep in imported, no pipeline yet
+                        Ok(Some(NearPhashDecision::Suspected { victim_id, .. }))
+                            if victim_id == record.id =>
+                        {
+                            imported.push(ImportedFile {
+                                file_id: record.id,
+                                is_new,
+                            });
+                            continue;
+                        }
+                        Ok(Some(NearPhashDecision::Exact { .. }))
+                        | Ok(Some(NearPhashDecision::Suspected { .. }))
+                        | Ok(Some(NearPhashDecision::Tombstoned { .. }))
+                        | Ok(None) => {}
+                        Err(e) => {
+                            eprintln!(
+                                "phash dedup check failed for {}: {:#}",
+                                path_str, e
+                            );
+                        }
                     }
                 }
             }
@@ -497,9 +497,17 @@ pub fn import_files_pending_phash(
 }
 
 /// Run ffmpeg phash for pending jobs. No DB access.
+///
+/// Under `test-support`, a sidecar `<path>.phash` (hex string) short-circuits ffmpeg
+/// so watcher e2e can lock exact/near policy without real video encodes.
 pub fn compute_phash_jobs(jobs: Vec<PhashJob>) -> Vec<(i64, Option<String>)> {
     let mut results = Vec::with_capacity(jobs.len());
     for job in jobs {
+        #[cfg(feature = "test-support")]
+        if let Some(h) = read_test_phash_sidecar(&job.path) {
+            results.push((job.file_id, Some(h)));
+            continue;
+        }
         let hash = match calculate_phash(&job.path) {
             Ok(h) => Some(h),
             Err(e) => {
@@ -515,9 +523,28 @@ pub fn compute_phash_jobs(jobs: Vec<PhashJob>) -> Vec<(i64, Option<String>)> {
     results
 }
 
+#[cfg(feature = "test-support")]
+fn read_test_phash_sidecar(path: &Path) -> Option<String> {
+    let sidecar = {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".phash");
+        PathBuf::from(s)
+    };
+    let raw = std::fs::read_to_string(&sidecar).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Short-lock friendly write-back of computed phashes.
 /// Exact → remove provisional + PathSuppress; near → suspected_duplicate (keep).
 /// Only clears processing→ready on surviving non-suspected rows.
+///
+/// Rescan: if the row already had a non-empty phash, write/update only — no
+/// automatic delete/flag (simplest correct option under THE RULE).
 pub fn write_phashes(
     db: &Database,
     results: &[(i64, Option<String>)],
@@ -527,84 +554,98 @@ pub fn write_phashes(
     let mut outcomes = Vec::with_capacity(results.len());
     for (file_id, phash_opt) in results {
         // Row may already be gone (e.g. concurrent dedup)
-        if db.get_file_by_id(*file_id).is_err() {
-            continue;
-        }
+        let existing = match db.get_file_by_id(*file_id) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
 
         if let Some(hash) = phash_opt {
-            let allow_tombstone = !db.has_metadata_row(*file_id).unwrap_or(true);
-            match apply_near_phash_policy(
-                db,
-                *file_id,
-                hash,
-                suppressions,
-                max_distance,
-                true,
-                allow_tombstone,
-            ) {
-                Ok(Some(NearPhashDecision::Exact {
-                    victim_id,
-                    keeper_id,
-                    distance,
-                    path,
-                })) if victim_id == *file_id => {
-                    outcomes.push((
-                        *file_id,
-                        PhashApplyOutcome::SkippedDuplicate {
-                            keeper_id,
-                            distance,
-                            path,
-                        },
-                    ));
-                    continue;
+            let already_hashed = existing
+                .phash
+                .as_ref()
+                .map(|h| !h.trim().is_empty())
+                .unwrap_or(false);
+            if already_hashed {
+                // Rescan of an existing hashed row: no auto delete/flag
+                if let Err(e) = db.update_file_phash(*file_id, hash) {
+                    eprintln!("Failed to write phash for file_id {}: {}", file_id, e);
                 }
-                Ok(Some(NearPhashDecision::Suspected {
-                    victim_id,
-                    keeper_id,
-                    distance,
-                })) if victim_id == *file_id => {
-                    outcomes.push((
-                        *file_id,
-                        PhashApplyOutcome::SuspectedDuplicate {
-                            keeper_id,
-                            distance,
-                        },
-                    ));
-                    continue;
-                }
-                Ok(Some(NearPhashDecision::Tombstoned {
-                    victim_id,
-                    keeper_id,
-                    path,
-                })) if victim_id == *file_id => {
-                    outcomes.push((
-                        *file_id,
-                        PhashApplyOutcome::Tombstoned { keeper_id, path },
-                    ));
-                    continue;
-                }
-                // Survivor (victim was the other row) or Distinct: write phash + clear processing
-                Ok(Some(NearPhashDecision::Exact { .. }))
-                | Ok(Some(NearPhashDecision::Suspected { .. }))
-                | Ok(Some(NearPhashDecision::Tombstoned { .. }))
-                | Ok(None) => {
-                    if let Err(e) = db.update_file_phash(*file_id, hash) {
-                        eprintln!("Failed to write phash for file_id {}: {}", file_id, e);
+                outcomes.push((*file_id, PhashApplyOutcome::Written));
+            } else {
+                let allow_tombstone = !db.has_metadata_row(*file_id).unwrap_or(true);
+                match apply_near_phash_policy(
+                    db,
+                    *file_id,
+                    hash,
+                    suppressions,
+                    max_distance,
+                    true,
+                    allow_tombstone,
+                ) {
+                    Ok(Some(NearPhashDecision::Exact {
+                        victim_id,
+                        keeper_id,
+                        distance,
+                        path,
+                    })) if victim_id == *file_id => {
+                        outcomes.push((
+                            *file_id,
+                            PhashApplyOutcome::SkippedDuplicate {
+                                keeper_id,
+                                distance,
+                                path,
+                            },
+                        ));
+                        continue;
                     }
-                    outcomes.push((*file_id, PhashApplyOutcome::Written));
-                }
-                Err(e) => {
-                    eprintln!(
-                        "phash dedup failed for file_id {}: {:#} (batch continues)",
-                        file_id, e
-                    );
-                    if let Err(pe) = db.update_file_phash(*file_id, hash) {
+                    Ok(Some(NearPhashDecision::Suspected {
+                        victim_id,
+                        keeper_id,
+                        distance,
+                    })) if victim_id == *file_id => {
+                        outcomes.push((
+                            *file_id,
+                            PhashApplyOutcome::SuspectedDuplicate {
+                                keeper_id,
+                                distance,
+                            },
+                        ));
+                        continue;
+                    }
+                    Ok(Some(NearPhashDecision::Tombstoned {
+                        victim_id,
+                        keeper_id,
+                        path,
+                    })) if victim_id == *file_id => {
+                        outcomes.push((
+                            *file_id,
+                            PhashApplyOutcome::Tombstoned { keeper_id, path },
+                        ));
+                        continue;
+                    }
+                    // No auto-action (or Distinct): write phash + clear processing
+                    Ok(Some(NearPhashDecision::Exact { .. }))
+                    | Ok(Some(NearPhashDecision::Suspected { .. }))
+                    | Ok(Some(NearPhashDecision::Tombstoned { .. }))
+                    | Ok(None) => {
+                        if let Err(e) = db.update_file_phash(*file_id, hash) {
+                            eprintln!("Failed to write phash for file_id {}: {}", file_id, e);
+                        }
+                        outcomes.push((*file_id, PhashApplyOutcome::Written));
+                    }
+                    Err(e) => {
                         eprintln!(
-                            "Failed to write phash for file_id {} after dedup err: {}",
-                            file_id, pe
+                            "phash dedup failed for file_id {}: {:#} (batch continues)",
+                            file_id, e
                         );
+                        if let Err(pe) = db.update_file_phash(*file_id, hash) {
+                            eprintln!(
+                                "Failed to write phash for file_id {} after dedup err: {}",
+                                file_id, pe
+                            );
+                        }
+                        outcomes.push((*file_id, PhashApplyOutcome::Written));
                     }
-                    outcomes.push((*file_id, PhashApplyOutcome::Written));
                 }
             }
         } else {
@@ -1222,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn write_phashes_newer_first_still_catches_exact_and_near() {
+    fn write_phashes_acts_only_on_just_phashed_regardless_of_id_order() {
         let db = open_memory_db();
         let older = db
             .insert_file("/tmp/order-older.mp4", 1, None)
@@ -1232,7 +1273,8 @@ mod tests {
             .expect("newer");
         assert!(newer > older);
 
-        // Exact: write newer first, then older — newer must be deleted
+        // Exact: newer phashed first (no match yet); older then matches → older deleted.
+        // Matched existing newer is never the auto-victim.
         let exact = "aaaaaaaaaaaaaaaa";
         write_phashes(
             &db,
@@ -1249,8 +1291,14 @@ mod tests {
             test_near_phash_max_distance,
         )
         .expect("older second");
-        assert!(db.get_file_by_id(newer).is_err(), "exact must delete newer");
-        assert!(db.get_file_by_id(older).is_ok());
+        assert!(
+            db.get_file_by_id(older).is_err(),
+            "just-phashed older provisional deleted"
+        );
+        assert!(
+            db.get_file_by_id(newer).is_ok(),
+            "matched existing row never auto-deleted"
+        );
 
         let older2 = db
             .insert_file("/tmp/order-older2.mp4", 3, None)
@@ -1274,18 +1322,22 @@ mod tests {
             test_near_phash_max_distance,
         )
         .expect("near older second");
+        // Just-phashed older2 flagged; existing newer2 never auto-flagged
         assert_eq!(
-            db.get_file_by_id(newer2).unwrap().status,
+            db.get_file_by_id(older2).unwrap().status,
             file_status::suspected_duplicate
         );
         assert_eq!(
-            db.get_pending_suspected_duplicate(newer2)
+            db.get_pending_suspected_duplicate(older2)
                 .unwrap()
                 .unwrap()
                 .keeper_id,
-            older2
+            newer2
         );
-        assert_eq!(db.get_file_by_id(older2).unwrap().status, file_status::ready);
+        assert_ne!(
+            db.get_file_by_id(newer2).unwrap().status,
+            file_status::suspected_duplicate
+        );
     }
 
     #[test]
@@ -1331,13 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn defensive_larger_id_is_always_victim() {
-        assert_eq!(Database::near_phash_victim_keeper(3, 7), (7, 3));
-        assert_eq!(Database::near_phash_victim_keeper(7, 3), (7, 3));
-    }
-
-    #[test]
-    fn exact_does_not_delete_organized_newer_when_older_phash_completes() {
+    fn exact_deletes_just_phashed_provisional_keeps_organized_other() {
         let db = open_memory_db();
         let older = db
             .insert_file("/tmp/org-older.mp4", 1, None)
@@ -1360,6 +1406,7 @@ mod tests {
             source_type: None,
         })
         .expect("meta");
+        db.mark_file_organized(newer).expect("organized_at");
         assert!(db.is_organized_file(newer).unwrap());
 
         let out = write_phashes(
@@ -1369,9 +1416,8 @@ mod tests {
             test_near_phash_max_distance,
         )
         .expect("write");
-        assert!(db.get_file_by_id(newer).is_ok(), "organized newer must survive");
-        // Older provisional deleted; outcome for older is SkippedDuplicate
-        assert!(db.get_file_by_id(older).is_err());
+        assert!(db.get_file_by_id(newer).is_ok(), "organized other must survive");
+        assert!(db.get_file_by_id(older).is_err(), "just-phashed provisional deleted");
         assert!(matches!(
             out[0].1,
             PhashApplyOutcome::SkippedDuplicate { .. }
@@ -1379,123 +1425,105 @@ mod tests {
     }
 
     #[test]
-    fn exact_deletes_provisional_smaller_when_larger_is_organized() {
+    fn exact_never_deletes_or_flags_matched_other_row() {
+        // Just-phashed is organized → no action; other (provisional) untouched.
         let db = open_memory_db();
-        // Same as above — documents rule (2) explicitly via choose helper
-        let smaller = db
-            .insert_file("/tmp/rule2-small.mp4", 1, None)
-            .expect("s");
-        let larger = db
-            .insert_file("/tmp/rule2-large.mp4", 2, Some("bbbbbbbbbbbbbbbb".into()))
-            .expect("l");
-        db.update_metadata(&crate::database::Metadata {
-            file_id: larger,
-            title: Some("kept".into()),
-            studio: None,
-            release_date: None,
-            summary: None,
-            cover_image: None,
-            sprite_sheet_path: None,
-            source_type: None,
-        })
-        .expect("meta");
-        let plan = db
-            .choose_exact_dedup_victim(smaller, larger)
-            .expect("choose");
-        assert_eq!(plan, Some((smaller, larger)));
+        let provisional = db
+            .insert_file("/tmp/other-prov.mp4", 1, Some("bbbbbbbbbbbbbbbb".into()))
+            .expect("prov");
+        let just = db
+            .insert_file("/tmp/just-org.mp4", 2, None)
+            .expect("just");
+        db.mark_file_organized(just).expect("org");
+        let out = write_phashes(
+            &db,
+            &[(just, Some("bbbbbbbbbbbbbbbb".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_file_by_id(provisional).is_ok());
+        assert!(db.get_file_by_id(just).is_ok());
+        assert!(db.get_pending_suspected_duplicate(provisional).unwrap().is_none());
+        assert!(db.get_pending_suspected_duplicate(just).unwrap().is_none());
+        assert_eq!(out[0].1, PhashApplyOutcome::Written);
     }
 
     #[test]
-    fn exact_downgrades_to_suspected_when_both_organized() {
+    fn exact_organized_just_phashed_takes_no_action() {
         let db = open_memory_db();
         let a = db
             .insert_file("/tmp/both-a.mp4", 1, Some("cccccccccccccccc".into()))
             .expect("a");
         let b = db
-            .insert_file("/tmp/both-b.mp4", 2, Some("cccccccccccccccc".into()))
+            .insert_file("/tmp/both-b.mp4", 2, None)
             .expect("b");
-        for id in [a, b] {
-            db.update_metadata(&crate::database::Metadata {
-                file_id: id,
-                title: Some(format!("t{id}")),
-                studio: None,
-                release_date: None,
-                summary: None,
-                cover_image: None,
-                sprite_sheet_path: None,
-                source_type: None,
-            })
-            .expect("meta");
-        }
-        assert!(db.choose_exact_dedup_victim(a, b).unwrap().is_none());
+        db.mark_file_organized(b).expect("org");
+        // b already hashed? No — first write. But organized → no delete/flag.
         let out = write_phashes(
             &db,
-            &[(a, Some("cccccccccccccccc".into()))],
+            &[(b, Some("cccccccccccccccc".into()))],
             None,
             test_near_phash_max_distance,
         )
         .expect("write");
         assert!(db.get_file_by_id(a).is_ok());
         assert!(db.get_file_by_id(b).is_ok());
-        let flagged = db
-            .get_pending_suspected_duplicate(b)
-            .unwrap()
-            .expect("b (larger) flagged");
-        assert_eq!(flagged.keeper_id, a);
-        assert_eq!(flagged.distance, 0);
+        assert!(db.get_pending_suspected_duplicate(a).unwrap().is_none());
+        assert!(db.get_pending_suspected_duplicate(b).unwrap().is_none());
         assert_eq!(out[0].1, PhashApplyOutcome::Written);
     }
 
     #[test]
-    fn exact_downgrades_when_other_has_active_pipeline_job() {
+    fn exact_deletes_self_even_when_other_pipeline_is_running() {
+        // Other running must not protect a provisional just-phashed self from delete,
+        // and must never make us flag/delete the other.
         let db = open_memory_db();
         let older = db
-            .insert_file("/tmp/busy-older.mp4", 1, None)
-            .expect("older");
-        let newer = db
             .insert_file(
-                "/tmp/busy-newer.mp4",
-                2,
+                "/tmp/busy-older.mp4",
+                1,
                 Some("dddddddddddddddd".into()),
             )
-            .expect("newer");
-        let newer_status_before = db.get_file_by_id(newer).unwrap().status;
+            .expect("older");
+        let older_status_before = db.get_file_by_id(older).unwrap().status;
         db.insert_job(&crate::database::NewJobRow {
             status: "running",
             job_type: "pipeline",
-            payload: &format!("{{\"file_id\":{newer}}}"),
+            payload: &format!("{{\"file_id\":{older}}}"),
             attempts: 0,
             max_attempts: 3,
             error: None,
             retryable: true,
         })
         .expect("job");
-        assert!(db.has_active_pipeline_job(newer).unwrap());
-        assert!(db.choose_exact_dedup_victim(older, newer).unwrap().is_none());
-        write_phashes(
+        let newer = db
+            .insert_file("/tmp/busy-newer.mp4", 2, None)
+            .expect("newer");
+        assert!(db.has_running_pipeline_job(older).unwrap());
+        assert!(db.may_auto_act_on_self(newer).unwrap());
+        let out = write_phashes(
             &db,
-            &[(older, Some("dddddddddddddddd".into()))],
+            &[(newer, Some("dddddddddddddddd".into()))],
             None,
             test_near_phash_max_distance,
         )
         .expect("write");
-        assert!(db.get_file_by_id(newer).is_ok());
+        assert!(db.get_file_by_id(newer).is_err());
         assert!(db.get_file_by_id(older).is_ok());
         assert_eq!(
             db.get_file_by_id(older).unwrap().status,
-            file_status::suspected_duplicate,
-            "non-busy row flagged"
+            older_status_before,
+            "matched other never auto-flagged"
         );
-        assert_eq!(
-            db.get_file_by_id(newer).unwrap().status,
-            newer_status_before,
-            "busy row status unchanged"
-        );
-        assert!(db.get_pending_suspected_duplicate(newer).unwrap().is_none());
+        assert!(matches!(
+            out[0].1,
+            PhashApplyOutcome::SkippedDuplicate { .. }
+        ));
     }
 
     #[test]
-    fn near_prefers_flagging_unorganized_row() {
+    fn near_flags_just_phashed_not_organized_other() {
         let db = open_memory_db();
         let older = db
             .insert_file("/tmp/near-org-older.mp4", 1, None)
@@ -1518,11 +1546,7 @@ mod tests {
             source_type: None,
         })
         .expect("meta");
-        let (victim, keeper) = db
-            .choose_near_suspect_victim(older, newer)
-            .unwrap()
-            .expect("choose");
-        assert_eq!((victim, keeper), (older, newer));
+        db.mark_file_organized(newer).expect("org");
         write_phashes(
             &db,
             &[(older, Some("000000000000000f".into()))],
@@ -1538,10 +1562,15 @@ mod tests {
             db.get_file_by_id(newer).unwrap().status,
             file_status::suspected_duplicate
         );
+        let sus = db
+            .get_pending_suspected_duplicate(older)
+            .unwrap()
+            .expect("pending");
+        assert_eq!(sus.keeper_id, newer);
     }
 
     #[test]
-    fn active_pipeline_job_matches_exact_file_id_not_prefix() {
+    fn running_pipeline_job_matches_exact_file_id_not_prefix() {
         let db = open_memory_db();
         let id1 = db.insert_file("/tmp/id1.mp4", 1, None).expect("1");
         assert_eq!(id1, 1);
@@ -1556,41 +1585,39 @@ mod tests {
         })
         .expect("job");
         assert!(
-            !db.has_active_pipeline_job(1).unwrap(),
+            !db.has_running_pipeline_job(1).unwrap(),
             "file_id 1 must not match payload file_id 12"
         );
-        assert!(db.has_active_pipeline_job(12).unwrap());
+        assert!(db.has_running_pipeline_job(12).unwrap());
     }
 
     #[test]
-    fn keeper_busy_still_deletes_provisional_newer_exact() {
+    fn queued_pipeline_does_not_block_auto_act_on_self() {
+        // B1: watcher enqueues pipeline before phash; queued must not count as busy.
         let db = open_memory_db();
-        let older = db
+        let keeper = db
             .insert_file(
-                "/tmp/keeper-busy.mp4",
+                "/tmp/keeper-q.mp4",
                 1,
                 Some("ffffffffffffffff".into()),
             )
-            .expect("older");
+            .expect("keeper");
+        db.mark_file_organized(keeper).expect("org");
+        let newer = db
+            .insert_file("/tmp/new-dup-q.mp4", 2, None)
+            .expect("newer");
         db.insert_job(&crate::database::NewJobRow {
-            status: "running",
+            status: "queued",
             job_type: "pipeline",
-            payload: &format!("{{\"file_id\":{older}}}"),
+            payload: &format!("{{\"file_id\":{newer}}}"),
             attempts: 0,
             max_attempts: 3,
             error: None,
             retryable: true,
         })
         .expect("job");
-        let newer = db
-            .insert_file("/tmp/new-dup.mp4", 2, None)
-            .expect("newer");
-        assert!(db.has_active_pipeline_job(older).unwrap());
-        let plan = db
-            .choose_exact_dedup_victim(newer, older)
-            .unwrap()
-            .expect("delete newer");
-        assert_eq!(plan, (newer, older));
+        assert!(!db.has_running_pipeline_job(newer).unwrap());
+        assert!(db.may_auto_act_on_self(newer).unwrap());
         let out = write_phashes(
             &db,
             &[(newer, Some("ffffffffffffffff".into()))],
@@ -1599,7 +1626,7 @@ mod tests {
         )
         .expect("write");
         assert!(db.get_file_by_id(newer).is_err());
-        assert!(db.get_file_by_id(older).is_ok());
+        assert!(db.get_file_by_id(keeper).is_ok());
         assert!(matches!(
             out[0].1,
             PhashApplyOutcome::SkippedDuplicate { .. }
@@ -1607,43 +1634,94 @@ mod tests {
     }
 
     #[test]
-    fn move_only_succeeded_pipeline_counts_as_organized() {
+    fn running_self_skips_auto_action() {
         let db = open_memory_db();
-        let older = db
-            .insert_file("/tmp/move-older.mp4", 1, None)
-            .expect("older");
-        let newer = db
+        let keeper = db
             .insert_file(
-                "/tmp/move-newer.mp4",
-                2,
+                "/tmp/run-keeper.mp4",
+                1,
                 Some("0123456789abcdef".into()),
             )
-            .expect("newer");
-        // Move-only: no Metadata, but succeeded pipeline job
+            .expect("k");
+        let self_id = db
+            .insert_file("/tmp/run-self.mp4", 2, None)
+            .expect("self");
+        db.insert_job(&crate::database::NewJobRow {
+            status: "running",
+            job_type: "pipeline",
+            payload: &format!("{{\"file_id\":{self_id}}}"),
+            attempts: 0,
+            max_attempts: 3,
+            error: None,
+            retryable: true,
+        })
+        .expect("job");
+        assert!(!db.may_auto_act_on_self(self_id).unwrap());
+        let out = write_phashes(
+            &db,
+            &[(self_id, Some("0123456789abcdef".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_file_by_id(self_id).is_ok());
+        assert!(db.get_file_by_id(keeper).is_ok());
+        assert!(db.get_pending_suspected_duplicate(self_id).unwrap().is_none());
+        assert_eq!(out[0].1, PhashApplyOutcome::Written);
+    }
+
+    #[test]
+    fn organized_at_survives_succeeded_job_prune() {
+        let db = open_memory_db();
+        let keeper = db
+            .insert_file(
+                "/tmp/prune-keeper.mp4",
+                1,
+                Some("fedcba9876543210".into()),
+            )
+            .expect("k");
+        db.mark_file_organized(keeper).expect("org");
         db.insert_job(&crate::database::NewJobRow {
             status: "succeeded",
             job_type: "pipeline",
-            payload: &format!("{{\"file_id\":{newer}}}"),
+            payload: &format!("{{\"file_id\":{keeper}}}"),
             attempts: 1,
             max_attempts: 3,
             error: None,
             retryable: true,
         })
         .expect("job");
-        assert!(db.is_organized_file(newer).unwrap());
-        assert!(!db.has_metadata_row(newer).unwrap());
+        // Flood terminal jobs then prune past the keeper's succeeded row
+        for i in 0..5 {
+            db.insert_job(&crate::database::NewJobRow {
+                status: "succeeded",
+                job_type: "pipeline",
+                payload: &format!("{{\"file_id\":999{i}}}"),
+                attempts: 1,
+                max_attempts: 3,
+                error: None,
+                retryable: true,
+            })
+            .expect("flood");
+        }
+        let removed = db.prune_terminal_jobs(2).expect("prune");
+        assert!(removed >= 1);
+        assert!(
+            db.is_organized_file(keeper).unwrap(),
+            "organized_at must survive Jobs prune"
+        );
+        let dup = db
+            .insert_file("/tmp/prune-dup.mp4", 2, None)
+            .expect("dup");
         let out = write_phashes(
             &db,
-            &[(older, Some("0123456789abcdef".into()))],
+            &[(dup, Some("fedcba9876543210".into()))],
             None,
             test_near_phash_max_distance,
         )
         .expect("write");
-        assert!(
-            db.get_file_by_id(newer).is_ok(),
-            "move-only organized newer must not be deleted"
-        );
-        assert!(db.get_file_by_id(older).is_err());
+        assert!(db.get_file_by_id(keeper).is_ok(), "organized keeper not auto-deleted");
+        assert!(db.get_file_by_id(dup).is_err());
         assert!(matches!(
             out[0].1,
             PhashApplyOutcome::SkippedDuplicate { .. }
@@ -1651,39 +1729,60 @@ mod tests {
     }
 
     #[test]
-    fn near_both_busy_defers_suspect_mark() {
+    fn rescan_existing_phash_does_not_auto_act() {
         let db = open_memory_db();
-        let a = db
-            .insert_file("/tmp/both-busy-a.mp4", 1, Some("0000000000000000".into()))
-            .expect("a");
-        let b = db
-            .insert_file("/tmp/both-busy-b.mp4", 2, Some("000000000000000f".into()))
-            .expect("b");
-        for id in [a, b] {
-            db.insert_job(&crate::database::NewJobRow {
-                status: "queued",
-                job_type: "pipeline",
-                payload: &format!("{{\"file_id\":{id}}}"),
-                attempts: 0,
-                max_attempts: 3,
-                error: None,
-                retryable: true,
-            })
-            .expect("job");
-        }
-        assert!(db
-            .choose_near_suspect_victim(a, b)
-            .unwrap()
-            .is_none());
-        write_phashes(
+        let keeper = db
+            .insert_file(
+                "/tmp/rescan-k.mp4",
+                1,
+                Some("0000000000000000".into()),
+            )
+            .expect("k");
+        db.mark_file_organized(keeper).expect("org");
+        let self_id = db
+            .insert_file(
+                "/tmp/rescan-self.mp4",
+                2,
+                Some("0000000000000000".into()),
+            )
+            .expect("self");
+        // Already hashed → rescan must not delete
+        let out = write_phashes(
             &db,
-            &[(a, Some("000000000000000f".into()))],
+            &[(self_id, Some("0000000000000000".into()))],
             None,
             test_near_phash_max_distance,
         )
         .expect("write");
-        assert!(db.get_pending_suspected_duplicate(a).unwrap().is_none());
-        assert!(db.get_pending_suspected_duplicate(b).unwrap().is_none());
+        assert!(db.get_file_by_id(self_id).is_ok());
+        assert_eq!(out[0].1, PhashApplyOutcome::Written);
+    }
+
+    #[test]
+    fn invalid_job_payload_does_not_break_running_lookup() {
+        let db = open_memory_db();
+        let id = db.insert_file("/tmp/bad-payload.mp4", 1, None).expect("f");
+        db.insert_job(&crate::database::NewJobRow {
+            status: "running",
+            job_type: "pipeline",
+            payload: "not-json{{{",
+            attempts: 0,
+            max_attempts: 3,
+            error: None,
+            retryable: true,
+        })
+        .expect("bad");
+        db.insert_job(&crate::database::NewJobRow {
+            status: "running",
+            job_type: "pipeline",
+            payload: &format!("{{\"file_id\":{id}}}"),
+            attempts: 0,
+            max_attempts: 3,
+            error: None,
+            retryable: true,
+        })
+        .expect("good");
+        assert!(db.has_running_pipeline_job(id).unwrap());
     }
 
     #[test]
@@ -1715,7 +1814,8 @@ mod tests {
     }
 
     #[test]
-    fn survivor_clears_processing_when_other_row_is_victim() {
+    fn just_phashed_provisional_deleted_matched_other_untouched() {
+        // THE RULE: act only on just-phashed self — even when self is older/smaller.
         let db = open_memory_db();
         let older = db
             .insert_file("/tmp/surv-older.mp4", 1, None)
@@ -1736,22 +1836,12 @@ mod tests {
             test_near_phash_max_distance,
         )
         .expect("write");
-        assert!(db.get_file_by_id(newer).is_err());
-        assert_eq!(db.get_file_by_id(older).unwrap().status, file_status::ready);
-        assert_eq!(out[0].1, PhashApplyOutcome::Written);
-        let (imported, _) = import_files_pending_phash(
-            &db,
-            &[ScannedFile {
-                path: PathBuf::from("/tmp/surv-older.mp4"),
-                size: 1,
-                phash: Some("eeeeeeeeeeeeeeee".into()),
-            }],
-            None,
-            test_near_phash_max_distance,
-        )
-        .expect("import");
-        assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].file_id, older);
+        assert!(db.get_file_by_id(older).is_err(), "just-phashed self deleted");
+        assert!(db.get_file_by_id(newer).is_ok(), "matched other never deleted");
+        assert!(matches!(
+            out[0].1,
+            PhashApplyOutcome::SkippedDuplicate { .. }
+        ));
     }
 
     #[test]
