@@ -3,6 +3,7 @@
 //! Lives under `tests/` so Windows harnesses pick up Common-Controls v6 via
 //! `cargo:rustc-link-arg-tests` (see build.rs). Requires `--features test-support`.
 
+use fs4::FileExt;
 use intelligent_dam_lib::test_support::{
     get_all_files, Database, TaskQueue, WatcherManager, WatcherOptions,
 };
@@ -113,6 +114,80 @@ fn write_chunked(path: &Path, chunks: usize, chunk_bytes: usize, pause: Duration
             thread::sleep(pause);
         }
     }
+}
+
+#[test]
+fn paused_then_resumed_write_ingests_only_after_completion() {
+    // Pause longer than for_watcher_e2e stability (~500ms) while holding the
+    // write handle (+ advisory lock). Size+mtime alone would look done; the
+    // lock / Windows exclusive-share probes must keep waiting until resume
+    // finishes and the handle is released.
+    let fx = Fixture::new("pause_resume");
+    let dest = fx.path("pause-resume.mp4");
+    let half = 512usize;
+    let total = half * 2;
+    let writer_done = Arc::new(Mutex::new(false));
+    let mid_pause = Arc::new(Mutex::new(false));
+    let done_flag = Arc::clone(&writer_done);
+    let mid_flag = Arc::clone(&mid_pause);
+    let dest_writer = dest.clone();
+
+    let writer = thread::spawn(move || {
+        let mut file = File::create(&dest_writer).expect("create");
+        file.write_all(&vec![0x11u8; half]).expect("first half");
+        file.flush().expect("flush half");
+        // Hold lock for the whole pause so Unix advisory probe stays Held;
+        // on Windows the open write handle alone fails share_mode(0).
+        FileExt::try_lock(&file).expect("hold exclusive during pause");
+        *mid_flag.lock().expect("mid") = true;
+
+        // Generous margin vs 100ms×5 (~500ms) stability window for CI skew
+        thread::sleep(Duration::from_millis(1800));
+
+        file.write_all(&vec![0x22u8; half]).expect("second half");
+        file.flush().expect("flush full");
+        let _ = FileExt::unlock(&file);
+        drop(file);
+        *done_flag.lock().expect("done") = true;
+    });
+
+    assert!(
+        wait_until(ingest_timeout, || *mid_pause.lock().expect("mid")),
+        "writer should reach mid-pause"
+    );
+
+    // Sample repeatedly through the long pause: must stay uningested
+    let pause_deadline = Instant::now() + Duration::from_millis(1400);
+    let mut samples = 0u32;
+    while Instant::now() < pause_deadline {
+        assert!(
+            !*writer_done.lock().expect("done"),
+            "writer finished earlier than expected"
+        );
+        assert_eq!(
+            fx.file_count(),
+            0,
+            "must not ingest during mid-write pause (sample {samples})"
+        );
+        samples += 1;
+        thread::sleep(poll_interval);
+    }
+    assert!(samples >= 10, "need enough pause samples, got {samples}");
+
+    writer.join().expect("writer");
+    assert!(*writer_done.lock().expect("done"));
+
+    assert!(
+        wait_until(ingest_timeout, || fx.has_file_named("pause-resume.mp4")),
+        "ingest only after true write completion"
+    );
+    let files = get_all_files(&fx.db).expect("list");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].file.size, total as u64);
+    assert!(
+        wait_until(ingest_timeout, || fx.queued_job_count() >= 1),
+        "phash job after final ingest"
+    );
 }
 
 #[test]
