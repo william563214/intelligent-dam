@@ -3,6 +3,7 @@
 //! Lives under `tests/` so Windows harnesses pick up Common-Controls v6 via
 //! `cargo:rustc-link-arg-tests` (see build.rs). Requires `--features test-support`.
 
+use fs4::FileExt;
 use intelligent_dam_lib::test_support::{
     get_all_files, Database, TaskQueue, WatcherManager, WatcherOptions,
 };
@@ -113,6 +114,149 @@ fn write_chunked(path: &Path, chunks: usize, chunk_bytes: usize, pause: Duration
             thread::sleep(pause);
         }
     }
+}
+
+#[test]
+fn paused_then_resumed_write_ingests_only_after_completion() {
+    // Pause longer than for_watcher_e2e stability (~500ms) while holding the
+    // write handle (+ advisory lock). Size+mtime alone would look done; the
+    // lock / Windows FILE_SHARE_READ probes must keep waiting until resume
+    // finishes and the handle is released.
+    let fx = Fixture::new("pause_resume");
+    let dest = fx.path("pause-resume.mp4");
+    let half = 512usize;
+    let total = half * 2;
+    let writer_done = Arc::new(Mutex::new(false));
+    let mid_at = Arc::new(Mutex::new(None::<Instant>));
+    let done_flag = Arc::clone(&writer_done);
+    let mid_flag = Arc::clone(&mid_at);
+    let dest_writer = dest.clone();
+
+    let writer = thread::spawn(move || {
+        let mut file = File::create(&dest_writer).expect("create");
+        file.write_all(&vec![0x11u8; half]).expect("first half");
+        file.flush().expect("flush half");
+        // Hold lock for the whole pause so Unix advisory probe stays Held;
+        // on Windows the open write handle alone fails FILE_SHARE_READ open.
+        FileExt::try_lock(&file).expect("hold exclusive during pause");
+        *mid_flag.lock().expect("mid") = Some(Instant::now());
+
+        // Generous margin vs 100ms×5 (~500ms) stability window for CI skew
+        thread::sleep(Duration::from_millis(1800));
+
+        file.write_all(&vec![0x22u8; half]).expect("second half");
+        file.flush().expect("flush full");
+        let _ = FileExt::unlock(&file);
+        drop(file);
+        *done_flag.lock().expect("done") = true;
+    });
+
+    assert!(
+        wait_until(ingest_timeout, || mid_at.lock().expect("mid").is_some()),
+        "writer should reach mid-pause"
+    );
+    let pause_started = mid_at.lock().expect("mid").expect("recorded by writer");
+    // Deadline anchored to writer clock (not when main noticed the flag)
+    let pause_deadline = pause_started + Duration::from_millis(1400);
+
+    let mut samples = 0u32;
+    while Instant::now() < pause_deadline {
+        assert!(
+            !*writer_done.lock().expect("done"),
+            "writer finished earlier than expected"
+        );
+        assert_eq!(
+            fx.file_count(),
+            0,
+            "must not ingest during mid-write pause (sample {samples})"
+        );
+        samples += 1;
+        thread::sleep(poll_interval);
+    }
+    assert!(samples >= 10, "need enough pause samples, got {samples}");
+
+    writer.join().expect("writer");
+    assert!(*writer_done.lock().expect("done"));
+
+    assert!(
+        wait_until(ingest_timeout, || fx.has_file_named("pause-resume.mp4")),
+        "ingest only after true write completion"
+    );
+    let files = get_all_files(&fx.db).expect("list");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].file.size, total as u64);
+    assert!(
+        wait_until(ingest_timeout, || fx.queued_job_count() >= 1),
+        "phash job after final ingest"
+    );
+}
+
+/// Windows: only an open write handle (no LockFileEx) must block mid-pause ingest.
+#[cfg(windows)]
+#[test]
+fn windows_paused_write_handle_only_blocks_until_complete() {
+    let fx = Fixture::new("win_write_only");
+    let dest = fx.path("win-write-only.mp4");
+    let half = 512usize;
+    let total = half * 2;
+    let writer_done = Arc::new(Mutex::new(false));
+    let mid_at = Arc::new(Mutex::new(None::<Instant>));
+    let done_flag = Arc::clone(&writer_done);
+    let mid_flag = Arc::clone(&mid_at);
+    let dest_writer = dest.clone();
+
+    let writer = thread::spawn(move || {
+        let mut file = File::create(&dest_writer).expect("create");
+        file.write_all(&vec![0x33u8; half]).expect("first half");
+        file.flush().expect("flush half");
+        // No try_lock — share probe alone must keep the gate waiting
+        *mid_flag.lock().expect("mid") = Some(Instant::now());
+        thread::sleep(Duration::from_millis(1800));
+        file.write_all(&vec![0x44u8; half]).expect("second half");
+        file.flush().expect("flush full");
+        drop(file);
+        *done_flag.lock().expect("done") = true;
+    });
+
+    assert!(
+        wait_until(ingest_timeout, || mid_at.lock().expect("mid").is_some()),
+        "writer mid-pause"
+    );
+    let pause_started = mid_at.lock().expect("mid").expect("writer mid_at");
+    let pause_deadline = pause_started + Duration::from_millis(1400);
+    while Instant::now() < pause_deadline {
+        assert_eq!(fx.file_count(), 0, "must not ingest with write handle open");
+        thread::sleep(poll_interval);
+    }
+
+    writer.join().expect("writer");
+    assert!(
+        wait_until(ingest_timeout, || fx.has_file_named("win-write-only.mp4")),
+        "ingest after write handle released"
+    );
+    let files = get_all_files(&fx.db).expect("list");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].file.size, total as u64);
+}
+
+/// Windows: a read-only holder (preview / seeder style) must not block ingest.
+#[cfg(windows)]
+#[test]
+fn windows_readonly_holder_still_ingests() {
+    let fx = Fixture::new("win_ro_ingest");
+    let dest = fx.path("win-ro.mp4");
+    fs::write(&dest, b"readonly-holder-e2e-payload-bytes").expect("write");
+    let reader = File::open(&dest).expect("read-only hold");
+
+    assert!(
+        wait_until(ingest_timeout, || fx.has_file_named("win-ro.mp4")),
+        "read-only holder must not block ingest"
+    );
+    drop(reader);
+    assert!(
+        wait_until(ingest_timeout, || fx.queued_job_count() >= 1),
+        "enqueue after readonly ingest"
+    );
 }
 
 #[test]

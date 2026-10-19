@@ -59,7 +59,8 @@ pub struct WatcherOptions {
 impl Default for WatcherOptions {
     fn default() -> Self {
         Self {
-            stability: StabilityOptions::default(),
+            // Env-overridable stability tunables (IDAM_STABILITY_*)
+            stability: StabilityOptions::from_env(),
             debounce_window: default_debounce_window,
             pipeline_override: None,
         }
