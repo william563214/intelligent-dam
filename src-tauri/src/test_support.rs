@@ -5,12 +5,24 @@
 pub use crate::commands::{
     add_file_tag, clear_error_logs, clear_file_tags, enqueue_pipeline_jobs, get_all_files,
     get_error_logs, get_file_tags, get_or_create_tag, get_settings, insert_error_log,
-    resolve_suspected_duplicate, save_settings, scan_directory, scan_multiple_directories,
-    EnqueueResult, PipelineOptionsInput, ResolveSuspectedOutcome, ScanResult,
+    list_duplicate_tombstones, remove_duplicate_tombstone,
+    resolve_suspected_duplicate_with_enqueue, save_settings, scan_directory,
+    scan_multiple_directories, EnqueueResult, PipelineOptionsInput, ResolveSuspectedOutcome,
+    ScanResult,
 };
+
+/// Convenience wrapper without pipeline enqueue (integration tests).
+pub fn resolve_suspected_duplicate(
+    db: &std::sync::Arc<std::sync::Mutex<Database>>,
+    queue: &std::sync::Arc<TaskQueue>,
+    file_id: i64,
+    action: &str,
+) -> Result<ResolveSuspectedOutcome, String> {
+    resolve_suspected_duplicate_with_enqueue(db, queue, file_id, action, None, None, None)
+}
 pub use crate::database::{
-    current_schema_user_version, Database, ErrorLogEntry, FileWithMetadata, JobRow, Metadata,
-    NewJobRow, Tag,
+    current_schema_user_version, Database, DuplicateTombstone, ErrorLogEntry, FileWithMetadata,
+    JobRow, Metadata, NewJobRow, PathTombstoneAction, Tag,
 };
 pub use crate::file_stability::StabilityOptions;
 pub use crate::pipeline::PipelineOptions;

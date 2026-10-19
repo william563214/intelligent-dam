@@ -62,6 +62,29 @@ pub struct SuspectedDuplicateRow {
     pub resolution: String,
 }
 
+/// Confirmed-duplicate tombstone (DuplicateTombstones table).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateTombstone {
+    pub id: i64,
+    pub path: String,
+    pub size: Option<i64>,
+    pub phash: Option<String>,
+    pub keeper_id: Option<i64>,
+    pub created_at: String,
+}
+
+/// Result of checking a path against DuplicateTombstones at import time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathTombstoneAction {
+    /// Same path + same size — skip re-ingest.
+    Block,
+    /// Same path but different size — tombstone removed; proceed as new file.
+    Cleared,
+    /// No tombstone for this path.
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorLogEntry {
@@ -113,7 +136,7 @@ pub struct Database {
 /// 2 = #45 NULL-category 唯一索引
 /// 3 = #34 Jobs 佇列持久化
 /// 4 = #38 SuspectedDuplicates（near-phash 疑似重複）
-const SCHEMA_USER_VERSION: i32 = 4;
+const SCHEMA_USER_VERSION: i32 = 5;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
 #[cfg(any(test, feature = "test-support"))]
@@ -296,6 +319,7 @@ impl Database {
             2 => self.migration_2_tags_nullsafe_unique(),
             3 => self.migration_3_jobs_table(),
             4 => self.migration_4_suspected_duplicates(),
+            5 => self.migration_5_duplicate_tombstones(),
             other => {
                 // 用 SqliteFailure 而非 InvalidParameterName
                 // 避免顯示 Invalid parameter name 前綴
@@ -310,7 +334,7 @@ impl Database {
         }
     }
 
-    /// #38 SuspectedDuplicates + DuplicateTombstones（near-phash 確認後永久墓碑）
+    /// #38 SuspectedDuplicates（near-phash 疑似重複確認）
     fn migration_4_suspected_duplicates(&self) -> SqliteResult<()> {
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
@@ -331,16 +355,6 @@ impl Database {
                     ON SuspectedDuplicates(keeper_id);
                 CREATE INDEX IF NOT EXISTS idx_suspected_duplicates_resolution
                     ON SuspectedDuplicates(resolution);
-                CREATE TABLE IF NOT EXISTS DuplicateTombstones (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    path TEXT NOT NULL UNIQUE,
-                    phash TEXT,
-                    keeper_id INTEGER,
-                    keeper_phash TEXT,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                );
-                CREATE INDEX IF NOT EXISTS idx_duplicate_tombstones_phash
-                    ON DuplicateTombstones(phash);
                 ",
             )?;
             self.set_user_version(4)?;
@@ -354,6 +368,79 @@ impl Database {
                 if let Err(rb) = self.conn.execute("ROLLBACK", []) {
                     eprintln!(
                         "warn: ROLLBACK failed after SuspectedDuplicates migration error: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// #38 DuplicateTombstones（確認重複後的 path/phash 墓碑；含 size 以免誤擋同路徑新檔）
+    fn migration_5_duplicate_tombstones(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS DuplicateTombstones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL UNIQUE,
+                    size INTEGER,
+                    phash TEXT,
+                    keeper_id INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_duplicate_tombstones_phash
+                    ON DuplicateTombstones(phash);
+                ",
+            )?;
+            // Dev DBs that already created DuplicateTombstones under a premature v4
+            // may lack `size` — add it if missing.
+            let has_size: bool = {
+                let mut stmt = self.conn.prepare("PRAGMA table_info(DuplicateTombstones)")?;
+                let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                let mut found = false;
+                for c in cols {
+                    if c? == "size" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_size {
+                self.conn
+                    .execute("ALTER TABLE DuplicateTombstones ADD COLUMN size INTEGER", [])?;
+            }
+            // Drop unused keeper_phash if a premature v4 schema introduced it
+            let has_keeper_phash: bool = {
+                let mut stmt = self.conn.prepare("PRAGMA table_info(DuplicateTombstones)")?;
+                let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                let mut found = false;
+                for c in cols {
+                    if c? == "keeper_phash" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if has_keeper_phash {
+                // SQLite < 3.35 cannot DROP COLUMN; leave column unused if present.
+                eprintln!(
+                    "warn: DuplicateTombstones.keeper_phash present (legacy); unused by app"
+                );
+            }
+            self.set_user_version(5)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after DuplicateTombstones migration error: {rb}"
                     );
                 }
                 Err(e)
@@ -1008,9 +1095,10 @@ impl Database {
             .query_row("SELECT COUNT(*) FROM Files", [], |row| row.get(0))
     }
 
-    /// Find an older Files row whose phash is within `max_distance` of `phash_hex`.
-    /// Only considers `id < exclude_file_id` (avoids reverse flagging on rescan).
-    /// Skips candidates that are already suspected-of this file.
+    /// Find another Files row whose phash is within `max_distance` of `phash_hex`.
+    /// Considers any `id != exclude_file_id` (order-independent with multi-worker phash).
+    /// Skips candidates already suspected-of this file (prevents reverse re-flag).
+    /// Caller must always act on the **larger** id (exact delete / near flag).
     pub fn find_near_phash_duplicate(
         &self,
         exclude_file_id: i64,
@@ -1024,7 +1112,7 @@ impl Database {
 
         let mut stmt = self.conn.prepare(
             "SELECT id, path, size, created_at, phash, status FROM Files
-             WHERE id < ?1 AND phash IS NOT NULL AND TRIM(phash) != ''
+             WHERE id != ?1 AND phash IS NOT NULL AND TRIM(phash) != ''
              ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(params![exclude_file_id], |row| {
@@ -1066,6 +1154,15 @@ impl Database {
             }
         }
         Ok(best)
+    }
+
+    /// Larger id is the provisional/victim; smaller id is the keeper.
+    pub fn near_phash_victim_keeper(self_id: i64, other_id: i64) -> (i64, i64) {
+        if other_id > self_id {
+            (other_id, self_id)
+        } else {
+            (self_id, other_id)
+        }
     }
 
     /// True when `file_id` has any SuspectedDuplicates row pointing at `keeper_id`.
@@ -1266,93 +1363,204 @@ impl Database {
     }
 
     /// Permanent tombstone so confirmed duplicates are not re-ingested after PathSuppress TTL.
+    /// Stores `size` so a later different file at the same path is not silently blocked.
     pub fn insert_duplicate_tombstone(
         &self,
         path: &str,
+        size: u64,
         phash: Option<&str>,
         keeper_id: Option<i64>,
-        keeper_phash: Option<&str>,
+    ) -> SqliteResult<()> {
+        self.insert_duplicate_tombstone_inner(path, size, phash, keeper_id)
+    }
+
+    fn insert_duplicate_tombstone_inner(
+        &self,
+        path: &str,
+        size: u64,
+        phash: Option<&str>,
+        keeper_id: Option<i64>,
     ) -> SqliteResult<()> {
         self.conn.execute(
-            "INSERT INTO DuplicateTombstones (path, phash, keeper_id, keeper_phash)
+            "INSERT INTO DuplicateTombstones (path, size, phash, keeper_id)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(path) DO UPDATE SET
+               size = excluded.size,
                phash = COALESCE(excluded.phash, DuplicateTombstones.phash),
-               keeper_id = COALESCE(excluded.keeper_id, DuplicateTombstones.keeper_id),
-               keeper_phash = COALESCE(excluded.keeper_phash, DuplicateTombstones.keeper_phash)",
-            params![path, phash, keeper_id, keeper_phash],
+               keeper_id = COALESCE(excluded.keeper_id, DuplicateTombstones.keeper_id)",
+            params![path, size as i64, phash, keeper_id],
         )?;
         Ok(())
     }
 
-    pub fn has_duplicate_tombstone_path(&self, path: &str) -> SqliteResult<bool> {
+    pub fn get_duplicate_tombstone_by_path(
+        &self,
+        path: &str,
+    ) -> SqliteResult<Option<DuplicateTombstone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, phash, keeper_id, created_at
+             FROM DuplicateTombstones WHERE path = ?1",
+        )?;
+        let mut rows = stmt.query(params![path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(DuplicateTombstone {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get(2)?,
+                phash: row.get(3)?,
+                keeper_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Path tombstone gate for import: same size → block; different size → clear tombstone.
+    pub fn check_path_tombstone(
+        &self,
+        path: &str,
+        size: u64,
+    ) -> SqliteResult<PathTombstoneAction> {
+        let Some(ts) = self.get_duplicate_tombstone_by_path(path)? else {
+            return Ok(PathTombstoneAction::None);
+        };
+        match ts.size {
+            Some(stored) if stored as u64 != size => {
+                self.remove_duplicate_tombstone(ts.id)?;
+                Ok(PathTombstoneAction::Cleared)
+            }
+            _ => Ok(PathTombstoneAction::Block),
+        }
+    }
+
+    pub fn get_duplicate_tombstone_by_phash(
+        &self,
+        phash_hex: &str,
+    ) -> SqliteResult<Option<DuplicateTombstone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, phash, keeper_id, created_at
+             FROM DuplicateTombstones
+             WHERE phash IS NOT NULL AND lower(phash) = lower(?1)
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![phash_hex])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(DuplicateTombstone {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get(2)?,
+                phash: row.get(3)?,
+                keeper_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_duplicate_tombstones(&self) -> SqliteResult<Vec<DuplicateTombstone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, phash, keeper_id, created_at
+             FROM DuplicateTombstones ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DuplicateTombstone {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get(2)?,
+                phash: row.get(3)?,
+                keeper_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn remove_duplicate_tombstone(&self, id: i64) -> SqliteResult<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM DuplicateTombstones WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn has_metadata_row(&self, file_id: i64) -> SqliteResult<bool> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM DuplicateTombstones WHERE path = ?1",
-            params![path],
+            "SELECT COUNT(*) FROM Metadata WHERE file_id = ?1",
+            params![file_id],
             |row| row.get(0),
         )?;
         Ok(n > 0)
     }
 
-    pub fn has_duplicate_tombstone_phash(&self, phash_hex: &str) -> SqliteResult<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM DuplicateTombstones
-             WHERE phash IS NOT NULL AND lower(phash) = lower(?1)",
-            params![phash_hex],
-            |row| row.get(0),
-        )?;
-        Ok(n > 0)
+    /// Confirm suspected duplicate atomically: tombstone + resolve + delete in one tx.
+    /// Returns orphan path for PathSuppress **after** COMMIT.
+    pub fn confirm_suspected_duplicate(&self, file_id: i64) -> SqliteResult<String> {
+        self.confirm_suspected_duplicate_impl(file_id, false)
+    }
+
+    /// Test hook: fail after resolve (before delete) to verify ROLLBACK recoverability.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn confirm_suspected_duplicate_fail_after_resolve(
+        &self,
+        file_id: i64,
+    ) -> SqliteResult<String> {
+        self.confirm_suspected_duplicate_impl(file_id, true)
+    }
+
+    fn confirm_suspected_duplicate_impl(
+        &self,
+        file_id: i64,
+        fail_after_resolve: bool,
+    ) -> SqliteResult<String> {
+        let file = self.get_file_by_id(file_id)?;
+        if file.status != file_status::suspected_duplicate {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "file {file_id} is not suspected_duplicate"
+            )));
+        }
+        let pending = self
+            .get_pending_suspected_duplicate(file_id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<String> {
+            self.insert_duplicate_tombstone(
+                &file.path,
+                file.size,
+                file.phash.as_deref(),
+                Some(pending.keeper_id),
+            )?;
+            self.conn.execute(
+                "UPDATE SuspectedDuplicates SET resolution = 'confirmed' WHERE file_id = ?1",
+                params![file_id],
+            )?;
+            if fail_after_resolve {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some("injected confirm failure after resolve".into()),
+                ));
+            }
+            self.delete_file_record_inner(file_id)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(file.path.clone())
+        })();
+
+        match tx_result {
+            Ok(path) => Ok(path),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after confirm_suspected: {rb}");
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Remove a Files row and children; restore pending orphans that pointed at it as keeper.
     pub fn delete_file_record(&self, file_id: i64) -> SqliteResult<()> {
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
-            let mut stmt = self.conn.prepare(
-                "SELECT file_id FROM SuspectedDuplicates
-                 WHERE keeper_id = ?1 AND resolution = 'pending'",
-            )?;
-            let orphan_ids: Vec<i64> = stmt
-                .query_map(params![file_id], |row| row.get(0))?
-                .collect::<SqliteResult<Vec<_>>>()?;
-            drop(stmt);
-
-            self.conn.execute(
-                "DELETE FROM SuspectedDuplicates WHERE file_id = ?1 OR keeper_id = ?1",
-                params![file_id],
-            )?;
-            self.conn.execute(
-                "DELETE FROM FileTags WHERE file_id = ?1",
-                params![file_id],
-            )?;
-            self.conn.execute(
-                "DELETE FROM Metadata WHERE file_id = ?1",
-                params![file_id],
-            )?;
-            self.conn
-                .execute("DELETE FROM Files WHERE id = ?1", params![file_id])?;
-
-            for orphan_id in orphan_ids {
-                let status: String = self.conn.query_row(
-                    "SELECT status FROM Files WHERE id = ?1",
-                    params![orphan_id],
-                    |row| row.get(0),
-                )?;
-                if status == file_status::suspected_duplicate {
-                    if !file_status::can_transition(
-                        file_status::suspected_duplicate,
-                        file_status::ready,
-                    ) {
-                        return Err(rusqlite::Error::InvalidParameterName(
-                            "illegal status transition restoring orphan".into(),
-                        ));
-                    }
-                    self.conn.execute(
-                        "UPDATE Files SET status = ?1 WHERE id = ?2",
-                        params![file_status::ready, orphan_id],
-                    )?;
-                }
-            }
+            self.delete_file_record_inner(file_id)?;
             self.conn.execute("COMMIT", [])?;
             Ok(())
         })();
@@ -1366,6 +1574,56 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    /// Delete file row + children. Caller must hold an open transaction when nesting.
+    fn delete_file_record_inner(&self, file_id: i64) -> SqliteResult<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id FROM SuspectedDuplicates
+             WHERE keeper_id = ?1 AND resolution = 'pending'",
+        )?;
+        let orphan_ids: Vec<i64> = stmt
+            .query_map(params![file_id], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        drop(stmt);
+
+        self.conn.execute(
+            "DELETE FROM SuspectedDuplicates WHERE file_id = ?1 OR keeper_id = ?1",
+            params![file_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM FileTags WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM Metadata WHERE file_id = ?1",
+            params![file_id],
+        )?;
+        self.conn
+            .execute("DELETE FROM Files WHERE id = ?1", params![file_id])?;
+
+        for orphan_id in orphan_ids {
+            let status: String = self.conn.query_row(
+                "SELECT status FROM Files WHERE id = ?1",
+                params![orphan_id],
+                |row| row.get(0),
+            )?;
+            if status == file_status::suspected_duplicate {
+                if !file_status::can_transition(
+                    file_status::suspected_duplicate,
+                    file_status::ready,
+                ) {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "illegal status transition restoring orphan".into(),
+                    ));
+                }
+                self.conn.execute(
+                    "UPDATE Files SET status = ?1 WHERE id = ?2",
+                    params![file_status::ready, orphan_id],
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub fn get_file_by_id(&self, id: i64) -> SqliteResult<FileRecord> {
@@ -4247,7 +4505,7 @@ mod tests {
     fn fresh_db_creates_jobs_and_suspected_tables_at_current_version() {
         let db = open_memory_db();
         assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
-        assert_eq!(SCHEMA_USER_VERSION, 4);
+        assert_eq!(SCHEMA_USER_VERSION, 5);
         assert!(db.jobs_table_exists().expect("Jobs exists"));
         assert!(db
             .suspected_duplicates_table_exists()
@@ -4334,8 +4592,8 @@ mod tests {
     }
 
     #[test]
-    fn v3_db_upgrades_to_v4_with_suspected_duplicates_table() {
-        let path = temp_db_path("v3-to-v4-suspected");
+    fn v3_db_upgrades_to_current_with_suspected_and_tombstones() {
+        let path = temp_db_path("v3-to-current-suspected");
         write_v3_shaped_file_db(&path);
         assert_eq!(raw_user_version(&path), 3);
         {
@@ -4352,7 +4610,7 @@ mod tests {
         }
 
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 4);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         assert!(db
             .suspected_duplicates_table_exists()
             .expect("SuspectedDuplicates"));
@@ -4417,49 +4675,99 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    fn write_v4_without_tombstones(path: &Path) {
+        write_v3_shaped_file_db(path);
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "
+            CREATE TABLE SuspectedDuplicates (
+                file_id INTEGER PRIMARY KEY,
+                keeper_id INTEGER NOT NULL,
+                distance INTEGER NOT NULL
+                    CHECK (distance BETWEEN 0 AND 64),
+                resolution TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (resolution IN ('pending', 'confirmed', 'ignored')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(keeper_id) REFERENCES Files(id)
+            );
+            PRAGMA user_version = 4;
+            ",
+        )
+        .expect("v4 without tombstones");
+    }
+
     #[test]
-    fn migration_4_failure_rolls_back_user_version() {
-        let path = temp_db_path("v3-mig4-rollback");
-        write_v3_shaped_file_db(&path);
-        // Break migration mid-flight by making SuspectedDuplicates create fail:
-        // pre-create a table with that name but wrong schema so CREATE IF NOT EXISTS
-        // succeeds without CHECK, then force failure via unknown follow-up — instead
-        // open DB and run migration_4 after dropping ability to set user_version.
-        // Simpler: call run_migration(4) twice after manually setting version to 3
-        // with SuspectedDuplicates already present is idempotent; inject failure by
-        // opening a connection that creates a view named DuplicateTombstones.
+    fn v4_db_without_tombstones_upgrades_to_v5() {
+        let path = temp_db_path("v4-to-v5-tombstones");
+        write_v4_without_tombstones(&path);
+        assert_eq!(raw_user_version(&path), 4);
         {
             let conn = Connection::open(&path).expect("raw");
-            conn.execute_batch(
-                "CREATE VIEW DuplicateTombstones AS SELECT 1 AS id;",
-            )
-            .expect("poison view");
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'DuplicateTombstones'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(n, 0, "v4 fixture must lack DuplicateTombstones");
+        }
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), 5);
+        assert!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'DuplicateTombstones'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("tombstones")
+                > 0
+        );
+        db.insert_duplicate_tombstone("/tmp/tomb.mp4", 42, Some("aabb"), Some(1))
+            .expect("insert tombstone");
+        let list = db.list_duplicate_tombstones().expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].size, Some(42));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_5_failure_rolls_back_user_version() {
+        // Real failure mode: CREATE VIEW DuplicateTombstones poisons the name so
+        // CREATE TABLE IF NOT EXISTS is a no-op, then CREATE INDEX fails with
+        // "views may not be indexed" / similar — assert message mentions index|view.
+        let path = temp_db_path("v4-mig5-rollback");
+        write_v4_without_tombstones(&path);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute_batch("CREATE VIEW DuplicateTombstones AS SELECT 1 AS id;")
+                .expect("poison view");
         }
         match Database::new(path.to_str().expect("utf8")) {
-            Ok(_) => panic!("mig should fail when DuplicateTombstones name is poisoned"),
+            Ok(_) => panic!("mig should fail when DuplicateTombstones name is a view"),
             Err(err) => {
                 let msg = err.to_string().to_lowercase();
                 assert!(
-                    msg.contains("view")
-                        || msg.contains("already exists")
-                        || msg.contains("duplicate")
-                        || msg.contains("index"),
-                    "err={msg}"
+                    msg.contains("index") || msg.contains("view"),
+                    "expected index/view error, got {msg}"
                 );
             }
         }
-        assert_eq!(raw_user_version(&path), 3, "failed mig must not bump version");
-        // SuspectedDuplicates must not remain after rollback
+        assert_eq!(raw_user_version(&path), 4, "failed mig must not bump version");
         let conn = Connection::open(&path).expect("reopen");
         let n: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'SuspectedDuplicates'",
+                 WHERE type = 'table' AND name = 'DuplicateTombstones'",
                 [],
                 |row| row.get(0),
             )
             .expect("count");
-        assert_eq!(n, 0, "failed mig must roll back SuspectedDuplicates table");
+        assert_eq!(n, 0, "failed mig must not leave DuplicateTombstones table");
         let _ = std::fs::remove_file(&path);
     }
 

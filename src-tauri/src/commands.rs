@@ -229,18 +229,24 @@ pub enum ResolveSuspectedOutcome {
     /// DB record removed; disk file left in place; permanent tombstone written.
     Confirmed { file_id: i64 },
     /// Suspicion cleared; file restored to ready (pipeline may be enqueued).
-    Ignored { file: Box<FileWithMetadata> },
+    Ignored {
+        file: Box<FileWithMetadata>,
+        pipeline_enqueued: bool,
+    },
 }
 
 /// Confirm or ignore a near-phash suspected duplicate.
 ///
-/// - `confirm`: write DuplicateTombstone, delete DB row (not disk) + PathSuppress
-/// - `ignore`: mark ignored, set ready; caller should enqueue pipeline
-pub fn resolve_suspected_duplicate(
+/// - `confirm`: atomic tombstone + resolve + delete; PathSuppress only after COMMIT
+/// - `ignore`: mark ignored, set ready; optionally enqueue pipeline when args provided
+pub fn resolve_suspected_duplicate_with_enqueue(
     db: &Arc<Mutex<Database>>,
-    queue: &TaskQueue,
+    queue: &Arc<TaskQueue>,
     file_id: i64,
     action: &str,
+    app: Option<&AppHandle>,
+    settings: Option<&AppSettings>,
+    pipeline: Option<PipelineOptions>,
 ) -> Result<ResolveSuspectedOutcome, String> {
     let action = action.trim().to_lowercase();
     if action != "confirm" && action != "ignore" {
@@ -256,41 +262,11 @@ pub fn resolve_suspected_duplicate(
             let guard = db
                 .lock()
                 .map_err(|e| format!("Database lock error: {}", e))?;
-            let file = guard
-                .get_file_by_id(file_id)
-                .map_err(|e| format!("File not found: {}", e))?;
-            if file.status != file_status::suspected_duplicate {
-                return Err(format!(
-                    "file {} is not suspected_duplicate (status={})",
-                    file_id, file.status
-                ));
-            }
-            let pending = guard
-                .get_pending_suspected_duplicate(file_id)
-                .map_err(|e| format!("Failed to read suspicion: {}", e))?
-                .ok_or_else(|| format!("no pending suspicion for file {file_id}"))?;
-            let keeper_phash = guard
-                .get_file_by_id(pending.keeper_id)
-                .ok()
-                .and_then(|k| k.phash);
             guard
-                .insert_duplicate_tombstone(
-                    &file.path,
-                    file.phash.as_deref(),
-                    Some(pending.keeper_id),
-                    keeper_phash.as_deref(),
-                )
-                .map_err(|e| format!("Failed to write duplicate tombstone: {}", e))?;
-            // Persist confirmed resolution while the Files row still exists
-            guard
-                .resolve_suspected_duplicate(file_id, "confirmed")
-                .map_err(|e| format!("Failed to mark confirmed: {}", e))?;
-            // delete_file_record removes SuspectedDuplicates; tombstone remains
-            guard
-                .delete_file_record(file_id)
-                .map_err(|e| format!("Failed to delete confirmed duplicate DB row: {}", e))?;
-            file.path.clone()
+                .confirm_suspected_duplicate(file_id)
+                .map_err(|e| format!("Failed to confirm duplicate: {}", e))?
         };
+        // PathSuppress only after COMMIT succeeded
         if let Some(supp) = suppressions {
             supp.suppress(std::path::Path::new(&orphan_path));
         }
@@ -323,6 +299,23 @@ pub fn resolve_suspected_duplicate(
             .map_err(|e| format!("Failed to resolve suspicion: {}", e))?;
     }
 
+    let mut pipeline_enqueued = false;
+    if let (Some(settings), Some(opts)) = (settings, pipeline) {
+        if !opts.is_noop() {
+            match enqueue_pipeline_jobs(app, db, queue, settings, vec![file_id], opts) {
+                Ok(result) => {
+                    pipeline_enqueued = result.enqueued > 0;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "resolve_suspected: ignore enqueue pipeline failed for {}: {}",
+                        file_id, e
+                    );
+                }
+            }
+        }
+    }
+
     let guard = db
         .lock()
         .map_err(|e| format!("Database lock error: {}", e))?;
@@ -335,7 +328,33 @@ pub fn resolve_suspected_duplicate(
         .ok_or_else(|| format!("file {} missing after ignore", file_id))?;
     Ok(ResolveSuspectedOutcome::Ignored {
         file: Box::new(file),
+        pipeline_enqueued,
     })
+}
+
+/// List confirmed-duplicate tombstones (Settings UI).
+pub fn list_duplicate_tombstones(
+    db: &Arc<Mutex<Database>>,
+) -> Result<Vec<crate::database::DuplicateTombstone>, String> {
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    guard
+        .list_duplicate_tombstones()
+        .map_err(|e| format!("Failed to list tombstones: {}", e))
+}
+
+/// Remove one tombstone by id (Settings UI).
+pub fn remove_duplicate_tombstone(
+    db: &Arc<Mutex<Database>>,
+    id: i64,
+) -> Result<bool, String> {
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    guard
+        .remove_duplicate_tombstone(id)
+        .map_err(|e| format!("Failed to remove tombstone: {}", e))
 }
 
 /// Load settings from the store (defaults when missing).
@@ -496,29 +515,32 @@ pub async fn resolve_suspected_duplicate_command(
     settings_store: State<'_, Mutex<SettingsStore>>,
     app: AppHandle,
 ) -> Result<ResolveSuspectedOutcome, String> {
-    let outcome = resolve_suspected_duplicate(&db, &queue, file_id, &action)?;
-    if matches!(outcome, ResolveSuspectedOutcome::Ignored { .. }) {
-        // After ignore, enqueue pipeline so the file does not stay unscanned
-        let settings = get_settings(&settings_store).unwrap_or_default();
-        let base = PipelineOptions::from_env();
-        if !base.is_noop() {
-            let enqueue = enqueue_pipeline_jobs(
-                Some(&app),
-                &db,
-                &queue,
-                &settings,
-                vec![file_id],
-                base,
-            );
-            if let Err(e) = enqueue {
-                eprintln!(
-                    "resolve_suspected: ignore enqueue pipeline failed for {}: {}",
-                    file_id, e
-                );
-            }
-        }
-    }
-    Ok(outcome)
+    let settings = get_settings(&settings_store).unwrap_or_default();
+    let base = PipelineOptions::from_env();
+    resolve_suspected_duplicate_with_enqueue(
+        &db,
+        &queue,
+        file_id,
+        &action,
+        Some(&app),
+        Some(&settings),
+        Some(base),
+    )
+}
+
+#[tauri::command]
+pub fn list_duplicate_tombstones_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Vec<crate::database::DuplicateTombstone>, String> {
+    list_duplicate_tombstones(&db)
+}
+
+#[tauri::command]
+pub fn remove_duplicate_tombstone_command(
+    id: i64,
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<bool, String> {
+    remove_duplicate_tombstone(&db, id)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

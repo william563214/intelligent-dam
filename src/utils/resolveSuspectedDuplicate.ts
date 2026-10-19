@@ -12,12 +12,16 @@ export function confirm_duplicate_message(): string {
 
 export function resolve_success_message(
   action: resolve_action,
-  fileId: number
+  fileId: number,
+  pipelineEnqueued?: boolean
 ): string {
   if (action === "confirm") {
     return `已確認重複：已移除資料庫紀錄 #${fileId}（磁碟檔案仍保留）`;
   }
-  return `已忽略疑似重複，檔案 #${fileId} 恢復就緒並排入流水線`;
+  if (pipelineEnqueued) {
+    return `已忽略疑似重複，檔案 #${fileId} 恢復就緒並已排入流水線`;
+  }
+  return `已忽略疑似重複，檔案 #${fileId} 恢復就緒`;
 }
 
 export async function handle_resolve_suspected(
@@ -31,7 +35,7 @@ export async function handle_resolve_suspected(
   }
   try {
     const outcome = await resolveSuspectedDuplicate(fileId, action);
-    return { ok: true, outcome };
+    return { ok: true as const, outcome };
   } catch (err) {
     return {
       ok: false,

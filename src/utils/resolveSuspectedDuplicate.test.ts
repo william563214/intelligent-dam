@@ -16,10 +16,13 @@ describe("resolveSuspectedDuplicate helpers", () => {
     vi.mocked(resolveSuspectedDuplicate).mockReset();
   });
 
-  it("resolve_success_message distinguishes confirm vs ignore", () => {
+  it("resolve_success_message distinguishes confirm vs ignore enqueue", () => {
     expect(resolve_success_message("confirm", 7)).toContain("資料庫紀錄 #7");
     expect(resolve_success_message("confirm", 7)).toContain("磁碟檔案仍保留");
-    expect(resolve_success_message("ignore", 9)).toContain("恢復就緒");
+    expect(resolve_success_message("ignore", 9, true)).toContain("已排入流水線");
+    expect(resolve_success_message("ignore", 9, false)).not.toContain(
+      "已排入流水線"
+    );
   });
 
   it("confirm_duplicate_message warns about DB not disk", () => {
@@ -43,6 +46,7 @@ describe("resolveSuspectedDuplicate helpers", () => {
         metadata: null,
         tags: [],
       },
+      pipelineEnqueued: true,
     } as never);
     const result = await handle_resolve_suspected(3, "ignore", () => true);
     expect(result.ok).toBe(true);

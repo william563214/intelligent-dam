@@ -13,10 +13,13 @@ import {
   retryTask,
   testConnectivity,
   canonicalizePath,
+  listDuplicateTombstones,
+  removeDuplicateTombstone,
 } from "../api";
 import type {
   AppSettings,
   ConnectivityReport,
+  DuplicateTombstone,
   PipelineProgressEvent,
   TaskQueueProgressEvent,
   TaskQueueStatus,
@@ -82,13 +85,39 @@ export default function Settings() {
     null
   );
   const [connectivityBusy, setConnectivityBusy] = useState(false);
+  const [tombstones, setTombstones] = useState<DuplicateTombstone[]>([]);
+  const [tombstoneBusyId, setTombstoneBusyId] = useState<number | null>(null);
 
   useEffect(() => {
     loadSettings();
     checkFFmpeg();
     refreshWatcherStatus();
     refreshQueueStatus();
+    void refreshTombstones();
   }, []);
+
+  const refreshTombstones = async () => {
+    try {
+      setTombstones(await listDuplicateTombstones());
+    } catch (e) {
+      console.error("Failed to list tombstones:", e);
+    }
+  };
+
+  const handleRemoveTombstone = async (id: number) => {
+    if (!confirm("移除此確認重複墓碑？之後同路徑／phash 可能再次被匯入。")) {
+      return;
+    }
+    try {
+      setTombstoneBusyId(id);
+      await removeDuplicateTombstone(id);
+      await refreshTombstones();
+    } catch (e) {
+      alert(`移除失敗: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setTombstoneBusyId(null);
+    }
+  };
 
   useEffect(() => {
     let unlistenFile: (() => void) | undefined;
@@ -802,6 +831,50 @@ export default function Settings() {
               {settings.nearPhashMaxDistance}）
             </p>
           )}
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            已確認重複墓碑（可移除）
+          </label>
+          <p className="mb-2 text-xs text-gray-500">
+            確認重複後會依路徑＋大小（與 phash）永久略過再匯入。同路徑但大小不同
+            會自動清除墓碑。可在此手動移除。
+          </p>
+          {tombstones.length === 0 ? (
+            <p className="text-sm text-gray-400">目前沒有墓碑</p>
+          ) : (
+            <ul className="space-y-2 max-h-48 overflow-y-auto border border-gray-200 rounded-md p-2">
+              {tombstones.map((t) => (
+                <li
+                  key={t.id}
+                  className="flex items-start justify-between gap-2 text-sm"
+                >
+                  <div className="min-w-0 break-all">
+                    <div className="font-mono text-xs">{t.path}</div>
+                    <div className="text-xs text-gray-500">
+                      size={t.size ?? "—"} · phash={t.phash ?? "—"}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handleRemoveTombstone(t.id)}
+                    disabled={tombstoneBusyId === t.id}
+                    className="shrink-0 px-2 py-1 text-xs text-red-700 border border-red-300 rounded hover:bg-red-50 disabled:opacity-50"
+                  >
+                    {tombstoneBusyId === t.id ? "…" : "移除"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <button
+            type="button"
+            onClick={() => void refreshTombstones()}
+            className="mt-2 text-xs text-teal-700 underline"
+          >
+            重新整理墓碑列表
+          </button>
         </div>
 
         <div>

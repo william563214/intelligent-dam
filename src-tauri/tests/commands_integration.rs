@@ -9,9 +9,10 @@
 use intelligent_dam_lib::test_support::{
     add_file_tag, clear_error_logs, clear_file_tags, current_schema_user_version,
     enqueue_pipeline_jobs, get_all_files, get_error_logs, get_file_tags, get_or_create_tag,
-    get_settings, insert_error_log, resolve_suspected_duplicate, save_settings, scan_directory,
-    scan_multiple_directories, AppSettings, Database, PipelineOptions, ResolveSuspectedOutcome,
-    SettingsStore, TaskQueue,
+    get_settings, insert_error_log, list_duplicate_tombstones, remove_duplicate_tombstone,
+    resolve_suspected_duplicate, resolve_suspected_duplicate_with_enqueue, save_settings,
+    scan_directory, scan_multiple_directories, AppSettings, Database, PipelineOptions,
+    ResolveSuspectedOutcome, SettingsStore, TaskQueue,
 };
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -315,8 +316,9 @@ fn resolve_suspected_confirm_ignore_and_errors() {
         let db = fx.db.lock().expect("lock");
         assert!(db.get_file_by_id(near).is_err());
         assert!(db
-            .has_duplicate_tombstone_path(&near_path_str)
-            .expect("tombstone"));
+            .get_duplicate_tombstone_by_path(&near_path_str)
+            .expect("tombstone")
+            .is_some());
     }
 
     // Fresh pair for ignore + no-pending
@@ -350,9 +352,13 @@ fn resolve_suspected_confirm_ignore_and_errors() {
     let ignored =
         resolve_suspected_duplicate(&fx.db, &fx.queue, near2, "ignore").expect("ignore");
     match ignored {
-        ResolveSuspectedOutcome::Ignored { file } => {
+        ResolveSuspectedOutcome::Ignored {
+            file,
+            pipeline_enqueued,
+        } => {
             assert_eq!(file.file.id, near2);
             assert_eq!(file.file.status, "ready");
+            assert!(!pipeline_enqueued);
         }
         other => panic!("expected Ignored, got {other:?}"),
     }
@@ -368,6 +374,132 @@ fn resolve_suspected_confirm_ignore_and_errors() {
         "expected no pending error"
     );
     let _ = keeper2;
+}
+
+#[test]
+#[test]
+fn confirm_failure_rolls_back_to_recoverable_state() {
+    let fx = Fixture::new();
+    let near_path = fx.temp().join("fail-near.mp4");
+    fs::write(&near_path, b"n").expect("write");
+    let keeper_path = fx.temp().join("fail-keeper.mp4");
+    fs::write(&keeper_path, b"k").expect("write");
+    let (keeper, near) = {
+        let db = fx.db.lock().expect("lock");
+        let (keeper, _) = db
+            .upsert_file(
+                keeper_path.to_str().unwrap(),
+                1,
+                Some("0000000000000000".into()),
+            )
+            .expect("k");
+        let (near, _) = db
+            .upsert_file(
+                near_path.to_str().unwrap(),
+                1,
+                Some("000000000000000f".into()),
+            )
+            .expect("n");
+        db.mark_suspected_duplicate_atomic(near, keeper, 4, None)
+            .expect("mark");
+        (keeper, near)
+    };
+    {
+        let db = fx.db.lock().expect("lock");
+        let err = db
+            .confirm_suspected_duplicate_fail_after_resolve(near)
+            .expect_err("injected fail");
+        assert!(err.to_string().contains("injected"));
+        assert!(db.get_file_by_id(near).is_ok(), "row must remain");
+        assert_eq!(
+            db.get_file_by_id(near).unwrap().status,
+            "suspected_duplicate"
+        );
+        assert!(db
+            .get_pending_suspected_duplicate(near)
+            .unwrap()
+            .is_some());
+        assert!(db
+            .get_duplicate_tombstone_by_path(near_path.to_str().unwrap())
+            .unwrap()
+            .is_none());
+        // Recoverable: confirm can succeed after rollback
+        db.confirm_suspected_duplicate(near).expect("retry confirm");
+        assert!(db.get_file_by_id(near).is_err());
+        assert!(db
+            .get_duplicate_tombstone_by_path(near_path.to_str().unwrap())
+            .unwrap()
+            .is_some());
+    }
+    let _ = keeper;
+}
+
+#[test]
+fn list_and_remove_duplicate_tombstones_commands() {
+    let fx = Fixture::new();
+    {
+        let db = fx.db.lock().expect("lock");
+        db.insert_duplicate_tombstone("/tmp/list-a.mp4", 10, Some("aa"), None)
+            .expect("a");
+        db.insert_duplicate_tombstone("/tmp/list-b.mp4", 20, None, None)
+            .expect("b");
+    }
+    let list = list_duplicate_tombstones(&fx.db).expect("list");
+    assert_eq!(list.len(), 2);
+    let id = list[0].id;
+    assert!(remove_duplicate_tombstone(&fx.db, id).expect("remove"));
+    assert_eq!(list_duplicate_tombstones(&fx.db).expect("list2").len(), 1);
+    assert!(!remove_duplicate_tombstone(&fx.db, id).expect("gone"));
+}
+
+#[test]
+fn ignore_enqueues_pipeline_when_options_enabled() {
+    let fx = Fixture::new();
+    let near_path = fx.temp().join("enq-near.mp4");
+    let keeper_path = fx.temp().join("enq-keeper.mp4");
+    fs::write(&near_path, b"n").expect("write");
+    fs::write(&keeper_path, b"k").expect("write");
+    let near = {
+        let db = fx.db.lock().expect("lock");
+        let (keeper, _) = db
+            .upsert_file(
+                keeper_path.to_str().unwrap(),
+                1,
+                Some("ffffffffffffffff".into()),
+            )
+            .expect("k");
+        let (near, _) = db
+            .upsert_file(
+                near_path.to_str().unwrap(),
+                1,
+                Some("fffffffffffffffc".into()),
+            )
+            .expect("n");
+        db.mark_suspected_duplicate_atomic(near, keeper, 2, None)
+            .expect("mark");
+        near
+    };
+    let settings = AppSettings::default();
+    let outcome = resolve_suspected_duplicate_with_enqueue(
+        &fx.db,
+        &fx.queue,
+        near,
+        "ignore",
+        None,
+        Some(&settings),
+        Some(PipelineOptions {
+            enable_scrape: false,
+            enable_move: false,
+            enable_preview: true,
+        }),
+    )
+    .expect("ignore+enqueue");
+    match outcome {
+        ResolveSuspectedOutcome::Ignored {
+            pipeline_enqueued, ..
+        } => assert!(pipeline_enqueued),
+        other => panic!("expected Ignored, got {other:?}"),
+    }
 }
 
 #[test]
