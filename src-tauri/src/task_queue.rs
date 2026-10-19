@@ -1440,11 +1440,15 @@ fn execute_job(
                 ) {
                     Ok(outcomes) => {
                         let skipped = outcomes.iter().any(|(_, o)| {
-                            matches!(o, scanner::PhashApplyOutcome::SkippedDuplicate { .. })
+                            matches!(
+                                o,
+                                scanner::PhashApplyOutcome::SkippedDuplicate { .. }
+                                    | scanner::PhashApplyOutcome::Tombstoned { .. }
+                            )
                         });
                         if skipped {
                             eprintln!(
-                                "task_queue: phash job for file {} skipped as exact-duplicate (path suppressed)",
+                                "task_queue: phash job for file {} skipped as exact-duplicate/tombstone (path suppressed)",
                                 file_id
                             );
                         }

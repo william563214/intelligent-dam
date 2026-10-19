@@ -67,7 +67,20 @@ export interface SettingsResponse extends AppSettings {
 
 export type ResolveSuspectedOutcome =
   | { kind: "confirmed"; fileId: number }
-  | { kind: "ignored"; file: FileWithMetadata };
+  | {
+      kind: "ignored";
+      file: FileWithMetadata;
+      pipelineEnqueued: boolean;
+    };
+
+export interface DuplicateTombstone {
+  id: number;
+  path: string;
+  size: number | null;
+  phash: string | null;
+  keeperId: number | null;
+  createdAt: string;
+}
 
 export interface WatcherStatus {
   running: boolean;

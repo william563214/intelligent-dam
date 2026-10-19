@@ -105,7 +105,11 @@ export default function FileBrowser() {
       return;
     }
     await loadFiles();
-    setBatchMessage(resolve_success_message(action, fileId));
+    const enqueued =
+      result.outcome.kind === "ignored"
+        ? result.outcome.pipelineEnqueued
+        : false;
+    setBatchMessage(resolve_success_message(action, fileId, enqueued));
     setResolveBusyId(null);
   };
 

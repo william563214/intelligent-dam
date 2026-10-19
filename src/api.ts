@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AppSettings,
   ConnectivityReport,
+  DuplicateTombstone,
   EnqueueResult,
   ErrorLogEntry,
   FileWithMetadata,
@@ -33,6 +34,14 @@ export async function resolveSuspectedDuplicate(
   action: "confirm" | "ignore"
 ): Promise<ResolveSuspectedOutcome> {
   return await invoke("resolve_suspected_duplicate_command", { fileId, action });
+}
+
+export async function listDuplicateTombstones(): Promise<DuplicateTombstone[]> {
+  return await invoke("list_duplicate_tombstones_command");
+}
+
+export async function removeDuplicateTombstone(id: number): Promise<boolean> {
+  return await invoke("remove_duplicate_tombstone_command", { id });
 }
 
 export async function scrapeFile(
