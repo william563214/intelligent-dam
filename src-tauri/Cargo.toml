@@ -47,6 +47,8 @@ rfd = { version = "~0.16.0", default-features = false }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# Same as lib dep so watcher_e2e can hold an exclusive lock during pause/resume
+fs4 = { version = "1.1", default-features = false, features = ["sync"] }
 
 # Integration tests import `test_support`; skip them unless the feature is on
 # so plain `cargo test` / release clippy do not fail to compile.
