@@ -13,8 +13,6 @@ import {
   retryTask,
   testConnectivity,
   canonicalizePath,
-  listDuplicateTombstones,
-  removeDuplicateTombstone,
 } from "../api";
 import type {
   AppSettings,
@@ -26,6 +24,10 @@ import type {
   WatcherFileEvent,
   WatcherStatus,
 } from "../types";
+import {
+  refresh_tombstone_list,
+  remove_tombstone_and_refresh,
+} from "../utils/tombstoneSettings";
 
 const default_settings: AppSettings = {
   scanDirectories: [],
@@ -87,6 +89,7 @@ export default function Settings() {
   const [connectivityBusy, setConnectivityBusy] = useState(false);
   const [tombstones, setTombstones] = useState<DuplicateTombstone[]>([]);
   const [tombstoneBusyId, setTombstoneBusyId] = useState<number | null>(null);
+  const [tombstoneMessage, setTombstoneMessage] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings();
@@ -98,22 +101,26 @@ export default function Settings() {
 
   const refreshTombstones = async () => {
     try {
-      setTombstones(await listDuplicateTombstones());
+      setTombstones(await refresh_tombstone_list());
     } catch (e) {
       console.error("Failed to list tombstones:", e);
     }
   };
 
   const handleRemoveTombstone = async (id: number) => {
-    if (!confirm("移除此確認重複墓碑？之後同路徑／phash 可能再次被匯入。")) {
-      return;
-    }
     try {
       setTombstoneBusyId(id);
-      await removeDuplicateTombstone(id);
-      await refreshTombstones();
-    } catch (e) {
-      alert(`移除失敗: ${e instanceof Error ? e.message : String(e)}`);
+      setTombstoneMessage(null);
+      const result = await remove_tombstone_and_refresh(id);
+      setTombstones(result.tombstones);
+      if (!result.ok) {
+        if (result.error !== "已取消") {
+          setTombstoneMessage(result.error);
+          alert(result.error);
+        }
+        return;
+      }
+      setTombstoneMessage(null);
     } finally {
       setTombstoneBusyId(null);
     }
@@ -841,6 +848,11 @@ export default function Settings() {
             確認重複後會依路徑＋大小（與 phash）永久略過再匯入。同路徑但大小不同
             會自動清除墓碑。可在此手動移除。
           </p>
+          {tombstoneMessage && (
+            <p className="mb-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+              {tombstoneMessage}
+            </p>
+          )}
           {tombstones.length === 0 ? (
             <p className="text-sm text-gray-400">目前沒有墓碑</p>
           ) : (

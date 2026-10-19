@@ -82,6 +82,12 @@ npm run dev
 npm run tauri dev
 ```
 
+### 開發者備註：SQLite schema / DuplicateTombstones
+
+- Schema 以 `PRAGMA user_version` 遷移：`v4` = `SuspectedDuplicates`，`v5` = `DuplicateTombstones`（含 `size`）。
+- 若本機 DB 來自中間 commit（例如曾把 tombstones 建在 v4），開檔時 v5 會 `ALTER TABLE … ADD COLUMN size`；舊列的 `size` 為 NULL。
+- 部分早期實驗 schema 可能仍有未使用的 `keeper_phash` 欄位；應用程式只讀寫 `path` / `size` / `phash` / `keeper_id`，不會再寫入 `keeper_phash`。若 schema 怪異，刪除本機 `intelligent_dam.db` 讓應用重建即可。
+
 ## 建置
 
 ```bash

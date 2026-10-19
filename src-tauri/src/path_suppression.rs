@@ -14,6 +14,8 @@ const default_ttl: Duration = Duration::from_secs(90);
 pub struct PathSuppression {
     inner: Mutex<HashMap<String, Instant>>,
     ttl: Duration,
+    /// Test/injected clock skew so expiry can be asserted without sleeping.
+    clock_skew: Mutex<Duration>,
 }
 
 impl Default for PathSuppression {
@@ -27,7 +29,25 @@ impl PathSuppression {
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl,
+            clock_skew: Mutex::new(Duration::ZERO),
         }
+    }
+
+    /// Advance the logical clock (tests / deterministic expiry).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn advance_clock(&self, by: Duration) {
+        if let Ok(mut skew) = self.clock_skew.lock() {
+            *skew = skew.saturating_add(by);
+        }
+    }
+
+    fn now(&self) -> Instant {
+        let skew = self
+            .clock_skew
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(Duration::ZERO);
+        Instant::now() + skew
     }
 
     /// Remember a destination so subsequent notify events are ignored
@@ -40,7 +60,7 @@ impl PathSuppression {
                 keys.push(c);
             }
         }
-        let now = Instant::now();
+        let now = self.now();
         if let Ok(mut guard) = self.inner.lock() {
             Self::purge_locked(&mut guard, self.ttl, now);
             for key in keys {
@@ -51,7 +71,7 @@ impl PathSuppression {
 
     /// True when `path` was recently suppressed
     pub fn is_suppressed(&self, path: &Path) -> bool {
-        let now = Instant::now();
+        let now = self.now();
         let candidates = [
             normalize_key(path),
             path.canonicalize()
@@ -62,7 +82,9 @@ impl PathSuppression {
             return false;
         };
         Self::purge_locked(&mut guard, self.ttl, now);
-        candidates.iter().any(|k| !k.is_empty() && guard.contains_key(k))
+        candidates
+            .iter()
+            .any(|k| !k.is_empty() && guard.contains_key(k))
     }
 
     fn purge_locked(map: &mut HashMap<String, Instant>, ttl: Duration, now: Instant) {
@@ -109,14 +131,14 @@ mod tests {
     }
 
     #[test]
-    fn suppress_expires_after_ttl() {
+    fn suppress_expires_after_ttl_via_clock_advance() {
         let dir = unique_temp_dir("ttl");
         let file = dir.join("clip.mp4");
         fs::write(&file, b"x").unwrap();
         let supp = PathSuppression::new(Duration::from_millis(30));
         supp.suppress(&file);
         assert!(supp.is_suppressed(&file));
-        std::thread::sleep(Duration::from_millis(60));
+        supp.advance_clock(Duration::from_millis(60));
         assert!(!supp.is_suppressed(&file));
         let _ = fs::remove_dir_all(&dir);
     }

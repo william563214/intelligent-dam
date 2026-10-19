@@ -377,7 +377,6 @@ fn resolve_suspected_confirm_ignore_and_errors() {
 }
 
 #[test]
-#[test]
 fn confirm_failure_rolls_back_to_recoverable_state() {
     let fx = Fixture::new();
     let near_path = fx.temp().join("fail-near.mp4");
