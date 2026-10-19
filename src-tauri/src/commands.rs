@@ -260,11 +260,13 @@ pub fn resolve_suspected_duplicate(
                 file_id, file.status
             ));
         }
-        let pending = guard
+        if guard
             .get_pending_suspected_duplicate(file_id)
             .map_err(|e| format!("Failed to read suspicion: {}", e))?
-            .ok_or_else(|| format!("no pending suspicion for file {}", file_id))?;
-        let _ = pending;
+            .is_none()
+        {
+            return Err(format!("no pending suspicion for file {file_id}"));
+        }
         let path = file.path.clone();
         guard
             .resolve_suspected_duplicate(file_id, resolution)
