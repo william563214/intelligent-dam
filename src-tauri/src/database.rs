@@ -175,6 +175,59 @@ impl Database {
         }
 
         self.apply_pending_migrations(version)?;
+        // Dev DBs that reached user_version=5 before organized_at landed still need repair.
+        let version_after = self.get_user_version()?;
+        if version_after >= 5 {
+            self.ensure_v5_columns()?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent v5 column repair: `Files.organized_at` (+ backfill).
+    ///
+    /// Mid-flight PR commits stamped `user_version=5` without this column; opening those
+    /// DBs must ALTER+backfill or scrape/move/dedup break. Shared by migration_5 and
+    /// post-migration init so there is one code path.
+    fn ensure_v5_columns(&self) -> SqliteResult<()> {
+        let has_organized_at: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(Files)")?;
+            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for c in cols {
+                if c? == "organized_at" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_organized_at {
+            self.conn.execute(
+                "ALTER TABLE Files ADD COLUMN organized_at DATETIME",
+                [],
+            )?;
+        }
+        // Backfill semantics unchanged (#54 tracks rule changes separately).
+        self.conn.execute_batch(
+            "
+            UPDATE Files SET organized_at = CURRENT_TIMESTAMP
+            WHERE organized_at IS NULL
+              AND (
+                id IN (SELECT file_id FROM Metadata)
+                OR id IN (SELECT file_id FROM FileTags)
+                OR id IN (
+                    SELECT CAST(
+                        CASE WHEN json_valid(payload)
+                             THEN json_extract(payload, '$.file_id')
+                             ELSE NULL END
+                        AS INTEGER
+                    )
+                    FROM Jobs
+                    WHERE type = 'pipeline' AND status = 'succeeded'
+                )
+              );
+            ",
+        )?;
         Ok(())
     }
 
@@ -432,45 +485,7 @@ impl Database {
                 );
             }
             // Durable organized marker — survives Jobs terminal prune (max 200).
-            let has_organized_at: bool = {
-                let mut stmt = self.conn.prepare("PRAGMA table_info(Files)")?;
-                let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
-                let mut found = false;
-                for c in cols {
-                    if c? == "organized_at" {
-                        found = true;
-                        break;
-                    }
-                }
-                found
-            };
-            if !has_organized_at {
-                self.conn.execute(
-                    "ALTER TABLE Files ADD COLUMN organized_at DATETIME",
-                    [],
-                )?;
-            }
-            // Backfill from existing Metadata / FileTags / succeeded pipeline jobs
-            self.conn.execute_batch(
-                "
-                UPDATE Files SET organized_at = CURRENT_TIMESTAMP
-                WHERE organized_at IS NULL
-                  AND (
-                    id IN (SELECT file_id FROM Metadata)
-                    OR id IN (SELECT file_id FROM FileTags)
-                    OR id IN (
-                        SELECT CAST(
-                            CASE WHEN json_valid(payload)
-                                 THEN json_extract(payload, '$.file_id')
-                                 ELSE NULL END
-                            AS INTEGER
-                        )
-                        FROM Jobs
-                        WHERE type = 'pipeline' AND status = 'succeeded'
-                    )
-                  );
-                ",
-            )?;
+            self.ensure_v5_columns()?;
             self.set_user_version(5)?;
             self.conn.execute("COMMIT", [])?;
             Ok(())
@@ -4333,6 +4348,162 @@ mod tests {
             "fresh db should have nullsafe unique index"
         );
         assert_eq!(foreign_keys_enabled(&db), 1);
+    }
+
+    /// Mid-PR v5 DBs (364c6cb / 22dd37f / 01eb0f8) stamped user_version=5 without
+    /// Files.organized_at — opening through Database::new must repair.
+    fn write_v5_without_organized_at(path: &Path) {
+        let conn = Connection::open(path).expect("open raw db");
+        conn.execute_batch(
+            "
+            CREATE TABLE Files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phash TEXT,
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE Metadata (
+                file_id INTEGER PRIMARY KEY,
+                title TEXT,
+                studio TEXT,
+                release_date TEXT,
+                summary TEXT,
+                cover_image TEXT,
+                sprite_sheet_path TEXT,
+                source_type TEXT,
+                FOREIGN KEY(file_id) REFERENCES Files(id)
+            );
+            CREATE TABLE Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
+            );
+            CREATE UNIQUE INDEX idx_tags_name_ifnull_category
+                ON Tags (name, IFNULL(category, ''));
+            CREATE TABLE FileTags (
+                file_id INTEGER,
+                tag_id INTEGER,
+                confidence FLOAT DEFAULT 1.0,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            );
+            CREATE TABLE ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
+            );
+            CREATE TABLE Jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL CHECK (
+                    status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+                ),
+                type TEXT NOT NULL CHECK (type IN ('pipeline', 'phash')),
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                error TEXT,
+                retryable INTEGER NOT NULL DEFAULT 1 CHECK (retryable IN (0, 1)),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE SuspectedDuplicates (
+                file_id INTEGER PRIMARY KEY,
+                keeper_id INTEGER NOT NULL,
+                distance INTEGER NOT NULL CHECK (distance BETWEEN 0 AND 64),
+                resolution TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (resolution IN ('pending', 'confirmed', 'ignored')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(keeper_id) REFERENCES Files(id)
+            );
+            CREATE TABLE DuplicateTombstones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                phash TEXT,
+                keeper_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO Files (id, path, size) VALUES (1, '/tmp/v5-no-org.mp4', 10);
+            PRAGMA user_version = 5;
+            ",
+        )
+        .expect("seed v5 without organized_at");
+    }
+
+    fn files_has_column(db: &Database, name: &str) -> bool {
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA table_info(Files)")
+            .expect("table_info");
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("cols");
+        for c in cols {
+            if c.expect("col") == name {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn v5_without_organized_at_is_repaired_on_open() {
+        let path = temp_db_path("v5-no-organized-at");
+        write_v5_without_organized_at(&path);
+        assert_eq!(raw_user_version(&path), 5);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let mut stmt = conn.prepare("PRAGMA table_info(Files)").expect("info");
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get(1))
+                .expect("map")
+                .map(|r| r.expect("row"))
+                .collect();
+            assert!(
+                !cols.iter().any(|c| c == "organized_at"),
+                "precondition: column must be absent"
+            );
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("open repair");
+        assert_eq!(db.get_user_version().expect("uv"), 5);
+        assert!(
+            files_has_column(&db, "organized_at"),
+            "ensure_v5_columns must ADD organized_at on already-v5 DBs"
+        );
+
+        let tags = db
+            .persist_scrape_success(
+                &Metadata {
+                    file_id: 1,
+                    title: Some("repaired".into()),
+                    studio: None,
+                    release_date: None,
+                    summary: None,
+                    cover_image: None,
+                    sprite_sheet_path: None,
+                    source_type: Some("test".into()),
+                },
+                &["TagA".to_string()],
+                &[],
+                file_status::ready,
+            )
+            .expect("persist_scrape_success must succeed after repair");
+        assert_eq!(tags.len(), 1);
+        assert!(
+            db.is_organized_file(1).expect("organized"),
+            "scrape success marks organized_at"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -139,6 +139,8 @@ pub fn calculate_phash(file_path: &Path) -> Result<String> {
 /// just imported/phashed this pass), and only when it is not organized and does not
 /// have a running pipeline job. The matched older/existing row is never deleted or
 /// flagged automatically. If `file_id` is organized or running → no automatic action.
+/// The row that is kept is the one whose phash finished first, not necessarily the
+/// lower id.
 /// Phash tombstone: only provisional rows without Metadata (still only `file_id`).
 /// Already-ignored (victim, keeper) pairs are treated as Distinct.
 fn apply_near_phash_policy(
