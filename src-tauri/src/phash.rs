@@ -43,6 +43,10 @@ const hash_size: usize = 8;
 #[allow(non_upper_case_globals)]
 pub const default_near_phash_max_distance: u32 = 4;
 
+/// Inclusive upper bound for near-phash threshold (settings / env).
+#[allow(non_upper_case_globals)]
+pub const max_near_phash_max_distance: u32 = 32;
+
 #[allow(non_upper_case_globals)]
 pub const env_near_phash_max_distance: &str = "IDAM_NEAR_PHASH_MAX_DISTANCE";
 
@@ -55,6 +59,38 @@ pub enum PhashMatchKind {
     Suspected,
     /// Beyond threshold — distinct clips.
     Distinct,
+}
+
+/// Clamp threshold into `0..=max_near_phash_max_distance`.
+pub fn clamp_near_phash_max_distance(value: u32) -> u32 {
+    value.min(max_near_phash_max_distance)
+}
+
+/// Parse env override; invalid values warn and are ignored.
+pub fn parse_env_near_phash_max_distance() -> Option<u32> {
+    parse_near_phash_env_value(read_env_near_phash_max_distance().as_deref())
+}
+
+/// Pure env parse for tests (no process env). Warns via eprintln on invalid.
+pub fn parse_near_phash_env_value(env_value: Option<&str>) -> Option<u32> {
+    let raw = env_value.map(str::trim).filter(|s| !s.is_empty())?;
+    match raw.parse::<u32>() {
+        Ok(v) => {
+            let clamped = clamp_near_phash_max_distance(v);
+            if clamped != v {
+                eprintln!(
+                    "warn: {env_near_phash_max_distance}={v} exceeds max {max_near_phash_max_distance}; using {clamped}"
+                );
+            }
+            Some(clamped)
+        }
+        Err(_) => {
+            eprintln!(
+                "warn: invalid {env_near_phash_max_distance}={raw:?}; ignoring env override"
+            );
+            None
+        }
+    }
 }
 
 /// Resolve effective threshold: env override → settings → default 4.
@@ -70,9 +106,8 @@ pub fn resolve_near_phash_max_distance_from(
     settings_value: Option<u32>,
     env_value: Option<&str>,
 ) -> u32 {
-    env_value
-        .and_then(|s| s.trim().parse::<u32>().ok())
-        .or(settings_value)
+    parse_near_phash_env_value(env_value)
+        .or_else(|| settings_value.map(clamp_near_phash_max_distance))
         .unwrap_or(default_near_phash_max_distance)
 }
 
@@ -461,6 +496,10 @@ mod tests {
         assert_eq!(
             resolve_near_phash_max_distance_from(None, Some("3")),
             3
+        );
+        assert_eq!(
+            resolve_near_phash_max_distance_from(None, Some("99")),
+            max_near_phash_max_distance
         );
     }
 

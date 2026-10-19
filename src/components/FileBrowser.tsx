@@ -3,9 +3,12 @@ import {
   enqueuePipelineJobs,
   getAllFiles,
   organizeEligibleFiles,
-  resolveSuspectedDuplicate,
 } from "../api";
 import type { FileWithMetadata } from "../types";
+import {
+  handle_resolve_suspected,
+  resolve_success_message,
+} from "../utils/resolveSuspectedDuplicate";
 import VideoCard from "./VideoCard";
 
 export default function FileBrowser() {
@@ -91,23 +94,19 @@ export default function FileBrowser() {
     fileId: number,
     action: "confirm" | "ignore"
   ) => {
-    try {
-      setResolveBusyId(fileId);
-      setBatchMessage(null);
-      await resolveSuspectedDuplicate(fileId, action);
-      await loadFiles();
-      setBatchMessage(
-        action === "confirm"
-          ? `已確認重複並移除檔案 #${fileId}`
-          : `已忽略疑似重複，檔案 #${fileId} 恢復就緒`
-      );
-    } catch (err) {
-      setBatchMessage(
-        `疑似重複處理失敗: ${err instanceof Error ? err.message : String(err)}`
-      );
-    } finally {
+    setResolveBusyId(fileId);
+    setBatchMessage(null);
+    const result = await handle_resolve_suspected(fileId, action);
+    if (!result.ok) {
+      if (result.error !== "已取消確認") {
+        setBatchMessage(`疑似重複處理失敗: ${result.error}`);
+      }
       setResolveBusyId(null);
+      return;
     }
+    await loadFiles();
+    setBatchMessage(resolve_success_message(action, fileId));
+    setResolveBusyId(null);
   };
 
   const handleOneClickOrganize = async () => {

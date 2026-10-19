@@ -34,8 +34,35 @@ const default_settings: AppSettings = {
 
 const legacy_settings_key = "intelligent_dam_settings";
 
+function settings_from_response(loaded: {
+  scanDirectories: string[];
+  avdcPath: string;
+  stashdbUrl: string;
+  outputTemplate: string;
+  nearPhashMaxDistance: number;
+  nearPhashEnvOverride?: number | null;
+  effectiveNearPhashMaxDistance?: number;
+}): AppSettings {
+  return {
+    scanDirectories: loaded.scanDirectories,
+    avdcPath: loaded.avdcPath,
+    stashdbUrl: loaded.stashdbUrl,
+    outputTemplate: loaded.outputTemplate,
+    nearPhashMaxDistance: loaded.nearPhashMaxDistance,
+  };
+}
+
 export default function Settings() {
   const [settings, setSettings] = useState<AppSettings>(default_settings);
+  const [nearPhashDraft, setNearPhashDraft] = useState(
+    String(default_settings.nearPhashMaxDistance)
+  );
+  const [nearPhashEnvOverride, setNearPhashEnvOverride] = useState<
+    number | null
+  >(null);
+  const [effectiveNearPhash, setEffectiveNearPhash] = useState(
+    default_settings.nearPhashMaxDistance
+  );
   const [newDirectory, setNewDirectory] = useState("");
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<string | null>(null);
@@ -182,8 +209,19 @@ export default function Settings() {
       setLoading(true);
       setLoadError(null);
       const loaded = await getSettings();
-      const resolved = await migrateLegacySettings(loaded);
-      setSettings({ ...default_settings, ...resolved });
+      setNearPhashEnvOverride(
+        loaded.nearPhashEnvOverride === undefined
+          ? null
+          : loaded.nearPhashEnvOverride
+      );
+      setEffectiveNearPhash(
+        loaded.effectiveNearPhashMaxDistance ?? loaded.nearPhashMaxDistance
+      );
+      const base = settings_from_response(loaded);
+      const resolved = await migrateLegacySettings(base);
+      const next = { ...default_settings, ...resolved };
+      setSettings(next);
+      setNearPhashDraft(String(next.nearPhashMaxDistance));
     } catch (e) {
       console.error("Failed to load settings:", e);
       const message =
@@ -722,23 +760,48 @@ export default function Settings() {
             type="number"
             min={0}
             max={32}
-            value={settings.nearPhashMaxDistance}
-            onChange={(e) =>
-              setSettings({
-                ...settings,
-                nearPhashMaxDistance: Math.min(
-                  32,
-                  Math.max(0, Number(e.target.value) || 0)
-                ),
-              })
-            }
+            value={nearPhashDraft}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setNearPhashDraft(raw);
+              if (raw.trim() === "") {
+                return;
+              }
+              const n = Number(raw);
+              if (!Number.isFinite(n)) {
+                return;
+              }
+              const clamped = Math.min(32, Math.max(0, Math.trunc(n)));
+              setSettings({ ...settings, nearPhashMaxDistance: clamped });
+            }}
+            onBlur={() => {
+              if (nearPhashDraft.trim() === "") {
+                setNearPhashDraft(String(settings.nearPhashMaxDistance));
+                return;
+              }
+              const n = Number(nearPhashDraft);
+              if (!Number.isFinite(n)) {
+                setNearPhashDraft(String(settings.nearPhashMaxDistance));
+                return;
+              }
+              const clamped = Math.min(32, Math.max(0, Math.trunc(n)));
+              setNearPhashDraft(String(clamped));
+              setSettings({ ...settings, nearPhashMaxDistance: clamped });
+            }}
             className="w-32 px-3 py-2 border border-gray-300 rounded-md"
           />
           <p className="mt-1 text-xs text-gray-500">
             預設 4。距離 0（完全相同 phash）仍自動略過；1～閾值標為「疑似重複」
-            不自動處理，需在瀏覽器確認或忽略。可用環境變數
-            IDAM_NEAR_PHASH_MAX_DISTANCE 覆寫。
+            不自動處理，需在瀏覽器確認或忽略。清空輸入不會變成 0，失焦後還原。
+            環境變數 IDAM_NEAR_PHASH_MAX_DISTANCE 可覆寫（上限 32）。
           </p>
+          {nearPhashEnvOverride !== null && (
+            <p className="mt-1 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+              目前由環境變數覆寫：有效閾值 = {effectiveNearPhash}
+              （env={nearPhashEnvOverride}；Settings 儲存值仍為{" "}
+              {settings.nearPhashMaxDistance}）
+            </p>
+          )}
         </div>
 
         <div>

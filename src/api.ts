@@ -6,8 +6,10 @@ import type {
   ErrorLogEntry,
   FileWithMetadata,
   PipelineOptionsInput,
+  ResolveSuspectedOutcome,
   ScanResult,
   ScrapeResult,
+  SettingsResponse,
   Metadata,
   WatcherStatus,
   TaskQueueStatus,
@@ -25,11 +27,11 @@ export async function getAllFiles(): Promise<FileWithMetadata[]> {
   return await invoke("get_all_files_command");
 }
 
-/** Confirm or ignore a near-phash suspected duplicate. Returns null when confirmed (row removed). */
+/** Confirm or ignore a near-phash suspected duplicate. */
 export async function resolveSuspectedDuplicate(
   fileId: number,
   action: "confirm" | "ignore"
-): Promise<FileWithMetadata | null> {
+): Promise<ResolveSuspectedOutcome> {
   return await invoke("resolve_suspected_duplicate_command", { fileId, action });
 }
 
@@ -67,7 +69,7 @@ export async function checkFFmpegAvailable(): Promise<boolean> {
   return await invoke("check_ffmpeg_available_command");
 }
 
-export async function getSettings(): Promise<AppSettings> {
+export async function getSettings(): Promise<SettingsResponse> {
   return await invoke("get_settings_command");
 }
 

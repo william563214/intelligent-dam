@@ -29,7 +29,7 @@ fn default_near_phash_max_distance_setting() -> u32 {
 
 /// Clamp persisted near-phash threshold to a sane Hamming range.
 pub fn clamp_near_phash_max_distance(value: u32) -> u32 {
-    value.min(32)
+    crate::phash::clamp_near_phash_max_distance(value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
