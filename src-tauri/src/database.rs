@@ -1166,12 +1166,19 @@ impl Database {
         }
     }
 
-    /// Organized = has Metadata or FileTags (must not be auto-deleted as exact dup).
+    /// Organized = Metadata / FileTags / succeeded pipeline job.
+    ///
+    /// Limitation (N3): scrape/move done *outside* the durable Jobs queue does not
+    /// write a Jobs row, so those rows only count as organized once Metadata/FileTags
+    /// exist (or once a succeeded pipeline job is registered).
     pub fn is_organized_file(&self, file_id: i64) -> SqliteResult<bool> {
         if self.has_metadata_row(file_id)? {
             return Ok(true);
         }
-        self.has_file_tags(file_id)
+        if self.has_file_tags(file_id)? {
+            return Ok(true);
+        }
+        self.has_succeeded_pipeline_job(file_id)
     }
 
     pub fn has_file_tags(&self, file_id: i64) -> SqliteResult<bool> {
@@ -1183,22 +1190,35 @@ impl Database {
         Ok(n > 0)
     }
 
+    fn count_pipeline_jobs_with_file_id(
+        &self,
+        file_id: i64,
+        statuses: &str,
+    ) -> SqliteResult<i64> {
+        if !self.table_exists("Jobs")? {
+            return Ok(0);
+        }
+        // Exact match via json_extract — do not use instr('"file_id":1') (matches 12, 123…).
+        self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM Jobs
+                 WHERE type = 'pipeline'
+                   AND status IN ({statuses})
+                   AND CAST(json_extract(payload, '$.file_id') AS INTEGER) = ?1"
+            ),
+            params![file_id],
+            |row| row.get(0),
+        )
+    }
+
     /// Active durable pipeline job (queued/running) for this file_id.
     pub fn has_active_pipeline_job(&self, file_id: i64) -> SqliteResult<bool> {
-        if !self.table_exists("Jobs")? {
-            return Ok(false);
-        }
-        let needle = format!("\"file_id\":{file_id}");
-        let needle_spaced = format!("\"file_id\": {file_id}");
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM Jobs
-             WHERE type = 'pipeline'
-               AND status IN ('queued', 'running')
-               AND (instr(payload, ?1) > 0 OR instr(payload, ?2) > 0)",
-            params![needle, needle_spaced],
-            |row| row.get(0),
-        )?;
-        Ok(n > 0)
+        Ok(self.count_pipeline_jobs_with_file_id(file_id, "'queued', 'running'")? > 0)
+    }
+
+    /// Succeeded pipeline job — counts as organized (e.g. move-only, no scrape Metadata).
+    pub fn has_succeeded_pipeline_job(&self, file_id: i64) -> SqliteResult<bool> {
+        Ok(self.count_pipeline_jobs_with_file_id(file_id, "'succeeded'")? > 0)
     }
 
     /// True when the row is safe to auto-delete as an exact duplicate.
@@ -1214,9 +1234,11 @@ impl Database {
 
     /// Choose exact-dup victim/keeper. `None` → do not auto-delete (downgrade to Suspected).
     ///
-    /// Rules: never delete organized or in-progress pipeline rows; if larger is
-    /// organized and smaller is provisional, delete smaller; if both provisional,
-    /// delete larger.
+    /// - Prefer deleting larger when provisional (`!organized && !busy`).
+    /// - If larger is organized and smaller is provisional, delete smaller.
+    /// - Keeper being busy does **not** block deleting a provisional victim.
+    /// - If the only provisional row's counterpart is busy (not organized), abort
+    ///   (re-judge via Suspected / rescan) rather than deleting the free row.
     pub fn choose_exact_dedup_victim(
         &self,
         self_id: i64,
@@ -1227,48 +1249,55 @@ impl Database {
         } else {
             (self_id, other_id)
         };
-        let larger_prov = self.is_provisional_for_dedup(larger)?;
-        let smaller_prov = self.is_provisional_for_dedup(smaller)?;
         let larger_org = self.is_organized_file(larger)?;
         let smaller_org = self.is_organized_file(smaller)?;
-        let larger_busy = self.has_active_pipeline_job(larger)?;
-        let smaller_busy = self.has_active_pipeline_job(smaller)?;
+        let larger_prov = self.is_provisional_for_dedup(larger)?;
+        let smaller_prov = self.is_provisional_for_dedup(smaller)?;
 
-        if larger_busy || smaller_busy || (larger_org && smaller_org) {
+        if larger_org && smaller_org {
             return Ok(None);
         }
+        // Prefer larger provisional (keeper may be busy — still OK)
+        if larger_prov {
+            return Ok(Some((larger, smaller)));
+        }
+        // Organized larger → delete provisional smaller
         if larger_org && smaller_prov {
-            // (2) organized larger → delete provisional smaller
             return Ok(Some((smaller, larger)));
         }
-        if smaller_org && larger_prov {
-            return Ok(Some((larger, smaller)));
-        }
-        if larger_prov && smaller_prov {
-            // both provisional → delete larger
-            return Ok(Some((larger, smaller)));
-        }
+        // Larger busy (not organized) + smaller provisional → do not delete smaller
         Ok(None)
     }
 
-    /// Near match: prefer flagging the un-organized row as victim.
+    /// Near / exact-downgrade: prefer flagging the non-busy side; both busy → None.
+    /// Among non-busy, prefer the un-organized row.
     pub fn choose_near_suspect_victim(
         &self,
         self_id: i64,
         other_id: i64,
-    ) -> SqliteResult<(i64, i64)> {
+    ) -> SqliteResult<Option<(i64, i64)>> {
         let (larger, smaller) = if other_id > self_id {
             (other_id, self_id)
         } else {
             (self_id, other_id)
         };
+        let larger_busy = self.has_active_pipeline_job(larger)?;
+        let smaller_busy = self.has_active_pipeline_job(smaller)?;
+        if larger_busy && smaller_busy {
+            return Ok(None);
+        }
+        if larger_busy && !smaller_busy {
+            return Ok(Some((smaller, larger)));
+        }
+        if smaller_busy && !larger_busy {
+            return Ok(Some((larger, smaller)));
+        }
         let larger_org = self.is_organized_file(larger)?;
         let smaller_org = self.is_organized_file(smaller)?;
         if larger_org && !smaller_org {
-            Ok((smaller, larger))
+            Ok(Some((smaller, larger)))
         } else {
-            // unorganized larger (or both same organized-ness) → flag larger
-            Ok((larger, smaller))
+            Ok(Some((larger, smaller)))
         }
     }
 

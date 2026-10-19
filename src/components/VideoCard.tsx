@@ -225,7 +225,10 @@ export default function VideoCard({
         {file.status === "suspected_duplicate" && suspectedDuplicate && (
           <div className="mt-3 pt-3 border-t border-orange-100">
             <p className="text-xs text-orange-900 mb-2">
-              疑似重複（Hamming {suspectedDuplicate.distance}）相對：
+              {suspectedDuplicate.distance === 0
+                ? `與 #${suspectedDuplicate.keeperId} 完全相同（exact 降級為疑似）`
+                : `疑似重複（Hamming ${suspectedDuplicate.distance}）`}
+              {" "}相對：
               <span className="block truncate" title={suspectedDuplicate.keeperPath}>
                 {suspectedDuplicate.keeperPath.split(/[/\\]/).pop()}
               </span>
