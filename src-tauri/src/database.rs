@@ -1156,12 +1156,119 @@ impl Database {
         Ok(best)
     }
 
-    /// Larger id is the provisional/victim; smaller id is the keeper.
+    /// Larger id / smaller id pair (legacy helper for tests).
+    #[cfg(any(test, feature = "test-support"))]
     pub fn near_phash_victim_keeper(self_id: i64, other_id: i64) -> (i64, i64) {
         if other_id > self_id {
             (other_id, self_id)
         } else {
             (self_id, other_id)
+        }
+    }
+
+    /// Organized = has Metadata or FileTags (must not be auto-deleted as exact dup).
+    pub fn is_organized_file(&self, file_id: i64) -> SqliteResult<bool> {
+        if self.has_metadata_row(file_id)? {
+            return Ok(true);
+        }
+        self.has_file_tags(file_id)
+    }
+
+    pub fn has_file_tags(&self, file_id: i64) -> SqliteResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM FileTags WHERE file_id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Active durable pipeline job (queued/running) for this file_id.
+    pub fn has_active_pipeline_job(&self, file_id: i64) -> SqliteResult<bool> {
+        if !self.table_exists("Jobs")? {
+            return Ok(false);
+        }
+        let needle = format!("\"file_id\":{file_id}");
+        let needle_spaced = format!("\"file_id\": {file_id}");
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM Jobs
+             WHERE type = 'pipeline'
+               AND status IN ('queued', 'running')
+               AND (instr(payload, ?1) > 0 OR instr(payload, ?2) > 0)",
+            params![needle, needle_spaced],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// True when the row is safe to auto-delete as an exact duplicate.
+    pub fn is_provisional_for_dedup(&self, file_id: i64) -> SqliteResult<bool> {
+        if self.is_organized_file(file_id)? {
+            return Ok(false);
+        }
+        if self.has_active_pipeline_job(file_id)? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Choose exact-dup victim/keeper. `None` → do not auto-delete (downgrade to Suspected).
+    ///
+    /// Rules: never delete organized or in-progress pipeline rows; if larger is
+    /// organized and smaller is provisional, delete smaller; if both provisional,
+    /// delete larger.
+    pub fn choose_exact_dedup_victim(
+        &self,
+        self_id: i64,
+        other_id: i64,
+    ) -> SqliteResult<Option<(i64, i64)>> {
+        let (larger, smaller) = if other_id > self_id {
+            (other_id, self_id)
+        } else {
+            (self_id, other_id)
+        };
+        let larger_prov = self.is_provisional_for_dedup(larger)?;
+        let smaller_prov = self.is_provisional_for_dedup(smaller)?;
+        let larger_org = self.is_organized_file(larger)?;
+        let smaller_org = self.is_organized_file(smaller)?;
+        let larger_busy = self.has_active_pipeline_job(larger)?;
+        let smaller_busy = self.has_active_pipeline_job(smaller)?;
+
+        if larger_busy || smaller_busy || (larger_org && smaller_org) {
+            return Ok(None);
+        }
+        if larger_org && smaller_prov {
+            // (2) organized larger → delete provisional smaller
+            return Ok(Some((smaller, larger)));
+        }
+        if smaller_org && larger_prov {
+            return Ok(Some((larger, smaller)));
+        }
+        if larger_prov && smaller_prov {
+            // both provisional → delete larger
+            return Ok(Some((larger, smaller)));
+        }
+        Ok(None)
+    }
+
+    /// Near match: prefer flagging the un-organized row as victim.
+    pub fn choose_near_suspect_victim(
+        &self,
+        self_id: i64,
+        other_id: i64,
+    ) -> SqliteResult<(i64, i64)> {
+        let (larger, smaller) = if other_id > self_id {
+            (other_id, self_id)
+        } else {
+            (self_id, other_id)
+        };
+        let larger_org = self.is_organized_file(larger)?;
+        let smaller_org = self.is_organized_file(smaller)?;
+        if larger_org && !smaller_org {
+            Ok((smaller, larger))
+        } else {
+            // unorganized larger (or both same organized-ness) → flag larger
+            Ok((larger, smaller))
         }
     }
 
@@ -4695,6 +4802,67 @@ mod tests {
             ",
         )
         .expect("v4 without tombstones");
+    }
+
+    fn write_v4_tombstones_without_size(path: &Path) {
+        // Schema as on 7e72e54: DuplicateTombstones inside v4, no `size` column
+        // (and with legacy keeper_phash).
+        write_v4_without_tombstones(path);
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "
+            CREATE TABLE DuplicateTombstones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                phash TEXT,
+                keeper_id INTEGER,
+                keeper_phash TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX idx_duplicate_tombstones_phash ON DuplicateTombstones(phash);
+            INSERT INTO DuplicateTombstones (path, phash, keeper_id, keeper_phash)
+            VALUES ('/tmp/legacy-tomb.mp4', 'abcd', 1, 'keeperhash');
+            PRAGMA user_version = 4;
+            ",
+        )
+        .expect("v4 premature tombstones");
+    }
+
+    #[test]
+    fn v4_premature_tombstones_without_size_alters_on_v5() {
+        let path = temp_db_path("v4-tomb-no-size-to-v5");
+        write_v4_tombstones_without_size(&path);
+        assert_eq!(raw_user_version(&path), 4);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(DuplicateTombstones)")
+                .expect("info");
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get(1))
+                .expect("rows")
+                .collect::<Result<_, _>>()
+                .expect("cols");
+            assert!(!cols.iter().any(|c| c == "size"), "fixture must lack size");
+            assert!(cols.iter().any(|c| c == "keeper_phash"));
+        }
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), 5);
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA table_info(DuplicateTombstones)")
+            .expect("info");
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("cols");
+        assert!(cols.iter().any(|c| c == "size"), "v5 must ADD COLUMN size");
+        let list = db.list_duplicate_tombstones().expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].path, "/tmp/legacy-tomb.mp4");
+        assert_eq!(list[0].size, None);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

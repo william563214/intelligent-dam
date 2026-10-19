@@ -56,15 +56,19 @@ pub enum PhashApplyOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NearPhashDecision {
     Exact {
+        /// Row that was deleted (may differ from the file currently being hashed).
+        victim_id: i64,
         keeper_id: i64,
         distance: u32,
         path: PathBuf,
     },
     Suspected {
+        victim_id: i64,
         keeper_id: i64,
         distance: u32,
     },
     Tombstoned {
+        victim_id: i64,
         keeper_id: Option<i64>,
         path: PathBuf,
     },
@@ -130,9 +134,10 @@ pub fn calculate_phash(file_path: &Path) -> Result<String> {
 }
 
 /// Evaluate phash against existing rows.
-/// Exact (distance 0): delete the **newer** (larger id) row + PathSuppress.
-/// Suspected (1..=max_distance): flag the newer row; keeper = older id.
-/// Phash tombstone: only for provisional rows with no Metadata (not organized files).
+/// Exact: auto-delete only a provisional row (no Metadata/FileTags/active pipeline);
+/// never delete organized rows; if unsafe → Suspected.
+/// Near: prefer flagging the un-organized row.
+/// Phash tombstone: only provisional rows without Metadata.
 /// Already-ignored (victim, keeper) pairs are treated as Distinct.
 fn apply_near_phash_policy(
     db: &Database,
@@ -160,6 +165,7 @@ fn apply_near_phash_policy(
                     supp.suppress(&path_buf);
                 }
                 return Ok(Some(NearPhashDecision::Tombstoned {
+                    victim_id: file_id,
                     keeper_id: ts.keeper_id,
                     path: path_buf,
                 }));
@@ -169,13 +175,64 @@ fn apply_near_phash_policy(
 
     match db.find_near_phash_duplicate(file_id, phash_hex, max_distance)? {
         Some((other, distance)) => {
-            let (victim_id, keeper_id) =
-                Database::near_phash_victim_keeper(file_id, other.id);
+            match phash::classify_phash_distance(distance, max_distance) {
+                phash::PhashMatchKind::Exact => {
+                    apply_exact_dedup(
+                        db,
+                        file_id,
+                        other.id,
+                        distance,
+                        phash_hex,
+                        suppressions,
+                        write_phash_on_suspected,
+                    )
+                }
+                phash::PhashMatchKind::Suspected => {
+                    apply_near_suspect(
+                        db,
+                        file_id,
+                        other.id,
+                        distance,
+                        phash_hex,
+                        write_phash_on_suspected,
+                    )
+                }
+                phash::PhashMatchKind::Distinct => Ok(None),
+            }
+        }
+        None => Ok(None),
+    }
+}
 
-            // Ignored pair must not re-flag (always keyed as victim→keeper)
+fn apply_exact_dedup(
+    db: &Database,
+    file_id: i64,
+    other_id: i64,
+    distance: u32,
+    phash_hex: &str,
+    suppressions: Option<&PathSuppression>,
+    write_phash_on_suspected: bool,
+) -> Result<Option<NearPhashDecision>> {
+    match db.choose_exact_dedup_victim(file_id, other_id)? {
+        None => {
+            eprintln!(
+                "phash dedup: exact match file_id {} other {} but neither safe to auto-delete \
+                 (organized/in-progress) — downgrading to suspected",
+                file_id, other_id
+            );
+            apply_near_suspect(
+                db,
+                file_id,
+                other_id,
+                distance.max(1),
+                phash_hex,
+                write_phash_on_suspected,
+            )
+        }
+        Some((victim_id, keeper_id)) => {
             if db.is_ignored_suspected_pair(victim_id, keeper_id)? {
                 eprintln!(
-                    "phash dedup: skip re-flag victim {} keeper {} (already ignored)",
+                    "phash dedup: skip exact delete victim {} keeper {} (already ignored)",
                     victim_id, keeper_id
                 );
                 if write_phash_on_suspected {
@@ -183,90 +240,89 @@ fn apply_near_phash_policy(
                 }
                 return Ok(None);
             }
-
-            match phash::classify_phash_distance(distance, max_distance) {
-                phash::PhashMatchKind::Exact => {
-                    if write_phash_on_suspected && victim_id != file_id {
-                        // Persist phash on the surviving (older) row first
-                        let _ = db.update_file_phash(file_id, phash_hex);
-                    }
-                    let orphan_path = db.get_file_by_id(victim_id)?.path;
-                    eprintln!(
-                        "phash dedup: exact match victim {} path {} (keeper {} distance 0); \
-                         removing provisional row; PathSuppress orphan",
-                        victim_id, orphan_path, keeper_id
-                    );
-                    db.delete_file_record(victim_id)?;
-                    let path_buf = PathBuf::from(&orphan_path);
-                    if let Some(supp) = suppressions {
-                        supp.suppress(&path_buf);
-                    } else {
-                        eprintln!(
-                            "phash dedup: warning - no PathSuppression bound; orphan {} may re-ingest",
-                            orphan_path
-                        );
-                    }
-                    Ok(Some(NearPhashDecision::Exact {
-                        keeper_id,
-                        distance,
-                        path: path_buf,
-                    }))
-                }
-                phash::PhashMatchKind::Suspected => {
-                    let victim_status = db.get_file_by_id(victim_id)?.status;
-                    // scrape_failed / missing stay as-is (no suspected mark)
-                    if victim_status == file_status::scrape_failed
-                        || victim_status == file_status::missing
-                    {
-                        eprintln!(
-                            "phash dedup: skip suspected mark for victim {} status={}",
-                            victim_id, victim_status
-                        );
-                        if write_phash_on_suspected {
-                            let _ = db.update_file_phash(file_id, phash_hex);
-                        }
-                        return Ok(None);
-                    }
-                    eprintln!(
-                        "phash dedup: suspected duplicate victim {} (keeper {} distance {} \
-                         <= {}); keeping row as suspected_duplicate — no auto-handle",
-                        victim_id, keeper_id, distance, max_distance
-                    );
-                    if write_phash_on_suspected {
-                        if victim_id == file_id {
-                            db.mark_suspected_duplicate_atomic(
-                                victim_id,
-                                keeper_id,
-                                distance,
-                                Some(phash_hex),
-                            )?;
-                        } else {
-                            let _ = db.update_file_phash(file_id, phash_hex);
-                            db.mark_suspected_duplicate_atomic(
-                                victim_id,
-                                keeper_id,
-                                distance,
-                                None,
-                            )?;
-                        }
-                    } else {
-                        db.mark_suspected_duplicate_atomic(
-                            victim_id,
-                            keeper_id,
-                            distance,
-                            None,
-                        )?;
-                    }
-                    Ok(Some(NearPhashDecision::Suspected {
-                        keeper_id,
-                        distance,
-                    }))
-                }
-                phash::PhashMatchKind::Distinct => Ok(None),
+            if write_phash_on_suspected {
+                let _ = db.update_file_phash(file_id, phash_hex);
             }
+            let orphan_path = db.get_file_by_id(victim_id)?.path;
+            eprintln!(
+                "phash dedup: exact match victim {} path {} (keeper {} distance 0); \
+                 removing provisional row; PathSuppress orphan",
+                victim_id, orphan_path, keeper_id
+            );
+            db.delete_file_record(victim_id)?;
+            let path_buf = PathBuf::from(&orphan_path);
+            if let Some(supp) = suppressions {
+                supp.suppress(&path_buf);
+            } else {
+                eprintln!(
+                    "phash dedup: warning - no PathSuppression bound; orphan {} may re-ingest",
+                    orphan_path
+                );
+            }
+            Ok(Some(NearPhashDecision::Exact {
+                victim_id,
+                keeper_id,
+                distance,
+                path: path_buf,
+            }))
         }
-        None => Ok(None),
     }
+}
+
+fn apply_near_suspect(
+    db: &Database,
+    file_id: i64,
+    other_id: i64,
+    distance: u32,
+    phash_hex: &str,
+    write_phash_on_suspected: bool,
+) -> Result<Option<NearPhashDecision>> {
+    let (victim_id, keeper_id) = db.choose_near_suspect_victim(file_id, other_id)?;
+
+    if db.is_ignored_suspected_pair(victim_id, keeper_id)? {
+        eprintln!(
+            "phash dedup: skip re-flag victim {} keeper {} (already ignored)",
+            victim_id, keeper_id
+        );
+        if write_phash_on_suspected {
+            let _ = db.update_file_phash(file_id, phash_hex);
+        }
+        return Ok(None);
+    }
+
+    let victim_status = db.get_file_by_id(victim_id)?.status;
+    if victim_status == file_status::scrape_failed || victim_status == file_status::missing {
+        eprintln!(
+            "phash dedup: skip suspected mark for victim {} status={}",
+            victim_id, victim_status
+        );
+        if write_phash_on_suspected {
+            let _ = db.update_file_phash(file_id, phash_hex);
+        }
+        return Ok(None);
+    }
+
+    eprintln!(
+        "phash dedup: suspected duplicate victim {} (keeper {} distance {}); \
+         keeping row as suspected_duplicate — no auto-handle",
+        victim_id, keeper_id, distance
+    );
+    if write_phash_on_suspected {
+        let _ = db.update_file_phash(file_id, phash_hex);
+        let phash_arg = if victim_id == file_id {
+            Some(phash_hex)
+        } else {
+            None
+        };
+        db.mark_suspected_duplicate_atomic(victim_id, keeper_id, distance, phash_arg)?;
+    } else {
+        db.mark_suspected_duplicate_atomic(victim_id, keeper_id, distance, None)?;
+    }
+    Ok(Some(NearPhashDecision::Suspected {
+        victim_id,
+        keeper_id,
+        distance,
+    }))
 }
 
 /// Short-lock friendly insert: write rows without waiting on ffmpeg.
@@ -363,16 +419,28 @@ pub fn import_files_pending_phash(
                     false,
                     allow_tombstone,
                 ) {
-                    Ok(Some(NearPhashDecision::Exact { .. }))
-                    | Ok(Some(NearPhashDecision::Tombstoned { .. })) => continue,
-                    Ok(Some(NearPhashDecision::Suspected { .. })) => {
+                    // Self deleted → skip import entry
+                    Ok(Some(NearPhashDecision::Exact { victim_id, .. }))
+                    | Ok(Some(NearPhashDecision::Tombstoned { victim_id, .. }))
+                        if victim_id == record.id =>
+                    {
+                        continue;
+                    }
+                    // Self flagged as suspected → keep in imported, no pipeline yet
+                    Ok(Some(NearPhashDecision::Suspected { victim_id, .. }))
+                        if victim_id == record.id =>
+                    {
                         imported.push(ImportedFile {
                             file_id: record.id,
                             is_new,
                         });
                         continue;
                     }
-                    Ok(None) => {}
+                    // Victim was the other row (or no decision): survivor continues normally
+                    Ok(Some(NearPhashDecision::Exact { .. }))
+                    | Ok(Some(NearPhashDecision::Suspected { .. }))
+                    | Ok(Some(NearPhashDecision::Tombstoned { .. }))
+                    | Ok(None) => {}
                     Err(e) => {
                         eprintln!(
                             "phash dedup check failed for {}: {:#}",
@@ -460,10 +528,11 @@ pub fn write_phashes(
                 allow_tombstone,
             ) {
                 Ok(Some(NearPhashDecision::Exact {
+                    victim_id,
                     keeper_id,
                     distance,
                     path,
-                })) => {
+                })) if victim_id == *file_id => {
                     outcomes.push((
                         *file_id,
                         PhashApplyOutcome::SkippedDuplicate {
@@ -475,9 +544,10 @@ pub fn write_phashes(
                     continue;
                 }
                 Ok(Some(NearPhashDecision::Suspected {
+                    victim_id,
                     keeper_id,
                     distance,
-                })) => {
+                })) if victim_id == *file_id => {
                     outcomes.push((
                         *file_id,
                         PhashApplyOutcome::SuspectedDuplicate {
@@ -487,21 +557,28 @@ pub fn write_phashes(
                     ));
                     continue;
                 }
-                Ok(Some(NearPhashDecision::Tombstoned { keeper_id, path })) => {
+                Ok(Some(NearPhashDecision::Tombstoned {
+                    victim_id,
+                    keeper_id,
+                    path,
+                })) if victim_id == *file_id => {
                     outcomes.push((
                         *file_id,
                         PhashApplyOutcome::Tombstoned { keeper_id, path },
                     ));
                     continue;
                 }
-                Ok(None) => {
+                // Survivor (victim was the other row) or Distinct: write phash + clear processing
+                Ok(Some(NearPhashDecision::Exact { .. }))
+                | Ok(Some(NearPhashDecision::Suspected { .. }))
+                | Ok(Some(NearPhashDecision::Tombstoned { .. }))
+                | Ok(None) => {
                     if let Err(e) = db.update_file_phash(*file_id, hash) {
                         eprintln!("Failed to write phash for file_id {}: {}", file_id, e);
                     }
                     outcomes.push((*file_id, PhashApplyOutcome::Written));
                 }
                 Err(e) => {
-                    // S1: per-file error — log and continue the batch
                     eprintln!(
                         "phash dedup failed for file_id {}: {:#} (batch continues)",
                         file_id, e
@@ -1245,6 +1322,240 @@ mod tests {
     }
 
     #[test]
+    fn exact_does_not_delete_organized_newer_when_older_phash_completes() {
+        let db = open_memory_db();
+        let older = db
+            .insert_file("/tmp/org-older.mp4", 1, None)
+            .expect("older");
+        let newer = db
+            .insert_file(
+                "/tmp/org-newer.mp4",
+                2,
+                Some("aaaaaaaaaaaaaaaa".into()),
+            )
+            .expect("newer");
+        db.update_metadata(&crate::database::Metadata {
+            file_id: newer,
+            title: Some("library".into()),
+            studio: None,
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: None,
+        })
+        .expect("meta");
+        assert!(db.is_organized_file(newer).unwrap());
+
+        let out = write_phashes(
+            &db,
+            &[(older, Some("aaaaaaaaaaaaaaaa".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_file_by_id(newer).is_ok(), "organized newer must survive");
+        // Older provisional deleted; outcome for older is SkippedDuplicate
+        assert!(db.get_file_by_id(older).is_err());
+        assert!(matches!(
+            out[0].1,
+            PhashApplyOutcome::SkippedDuplicate { .. }
+        ));
+    }
+
+    #[test]
+    fn exact_deletes_provisional_smaller_when_larger_is_organized() {
+        let db = open_memory_db();
+        // Same as above — documents rule (2) explicitly via choose helper
+        let smaller = db
+            .insert_file("/tmp/rule2-small.mp4", 1, None)
+            .expect("s");
+        let larger = db
+            .insert_file("/tmp/rule2-large.mp4", 2, Some("bbbbbbbbbbbbbbbb".into()))
+            .expect("l");
+        db.update_metadata(&crate::database::Metadata {
+            file_id: larger,
+            title: Some("kept".into()),
+            studio: None,
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: None,
+        })
+        .expect("meta");
+        let plan = db
+            .choose_exact_dedup_victim(smaller, larger)
+            .expect("choose");
+        assert_eq!(plan, Some((smaller, larger)));
+    }
+
+    #[test]
+    fn exact_downgrades_to_suspected_when_both_organized() {
+        let db = open_memory_db();
+        let a = db
+            .insert_file("/tmp/both-a.mp4", 1, Some("cccccccccccccccc".into()))
+            .expect("a");
+        let b = db
+            .insert_file("/tmp/both-b.mp4", 2, Some("cccccccccccccccc".into()))
+            .expect("b");
+        for id in [a, b] {
+            db.update_metadata(&crate::database::Metadata {
+                file_id: id,
+                title: Some(format!("t{id}")),
+                studio: None,
+                release_date: None,
+                summary: None,
+                cover_image: None,
+                sprite_sheet_path: None,
+                source_type: None,
+            })
+            .expect("meta");
+        }
+        assert!(db.choose_exact_dedup_victim(a, b).unwrap().is_none());
+        let out = write_phashes(
+            &db,
+            &[(a, Some("cccccccccccccccc".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_file_by_id(a).is_ok());
+        assert!(db.get_file_by_id(b).is_ok());
+        // Prefer flagging un-organized — both organized → still flags larger as suspected
+        let flagged = db
+            .get_pending_suspected_duplicate(b)
+            .unwrap()
+            .or_else(|| db.get_pending_suspected_duplicate(a).unwrap());
+        assert!(flagged.is_some(), "both organized exact → suspected");
+        assert!(matches!(
+            out[0].1,
+            PhashApplyOutcome::SuspectedDuplicate { .. } | PhashApplyOutcome::Written
+        ));
+    }
+
+    #[test]
+    fn exact_downgrades_when_other_has_active_pipeline_job() {
+        let db = open_memory_db();
+        let older = db
+            .insert_file("/tmp/busy-older.mp4", 1, None)
+            .expect("older");
+        let newer = db
+            .insert_file(
+                "/tmp/busy-newer.mp4",
+                2,
+                Some("dddddddddddddddd".into()),
+            )
+            .expect("newer");
+        db.insert_job(&crate::database::NewJobRow {
+            status: "running",
+            job_type: "pipeline",
+            payload: &format!("{{\"file_id\":{newer}}}"),
+            attempts: 0,
+            max_attempts: 3,
+            error: None,
+            retryable: true,
+        })
+        .expect("job");
+        assert!(db.has_active_pipeline_job(newer).unwrap());
+        assert!(db.choose_exact_dedup_victim(older, newer).unwrap().is_none());
+        write_phashes(
+            &db,
+            &[(older, Some("dddddddddddddddd".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_file_by_id(newer).is_ok());
+        assert!(db.get_file_by_id(older).is_ok());
+    }
+
+    #[test]
+    fn near_prefers_flagging_unorganized_row() {
+        let db = open_memory_db();
+        let older = db
+            .insert_file("/tmp/near-org-older.mp4", 1, None)
+            .expect("older");
+        let newer = db
+            .insert_file(
+                "/tmp/near-org-newer.mp4",
+                2,
+                Some("0000000000000000".into()),
+            )
+            .expect("newer");
+        db.update_metadata(&crate::database::Metadata {
+            file_id: newer,
+            title: Some("lib".into()),
+            studio: None,
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: None,
+        })
+        .expect("meta");
+        let (victim, keeper) = db
+            .choose_near_suspect_victim(older, newer)
+            .expect("choose");
+        assert_eq!((victim, keeper), (older, newer));
+        write_phashes(
+            &db,
+            &[(older, Some("000000000000000f".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert_eq!(
+            db.get_file_by_id(older).unwrap().status,
+            file_status::suspected_duplicate
+        );
+        assert_ne!(
+            db.get_file_by_id(newer).unwrap().status,
+            file_status::suspected_duplicate
+        );
+    }
+
+    #[test]
+    fn survivor_clears_processing_when_other_row_is_victim() {
+        let db = open_memory_db();
+        let older = db
+            .insert_file("/tmp/surv-older.mp4", 1, None)
+            .expect("older");
+        db.update_file_status(older, file_status::processing)
+            .expect("processing");
+        let newer = db
+            .insert_file(
+                "/tmp/surv-newer.mp4",
+                2,
+                Some("eeeeeeeeeeeeeeee".into()),
+            )
+            .expect("newer");
+        let out = write_phashes(
+            &db,
+            &[(older, Some("eeeeeeeeeeeeeeee".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_file_by_id(newer).is_err());
+        assert_eq!(db.get_file_by_id(older).unwrap().status, file_status::ready);
+        assert_eq!(out[0].1, PhashApplyOutcome::Written);
+        let (imported, _) = import_files_pending_phash(
+            &db,
+            &[ScannedFile {
+                path: PathBuf::from("/tmp/surv-older.mp4"),
+                size: 1,
+                phash: Some("eeeeeeeeeeeeeeee".into()),
+            }],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("import");
+        assert_eq!(imported.len(), 1);
+        assert_eq!(imported[0].file_id, older);
+    }
+
+    #[test]
     fn path_tombstone_blocks_same_size_clears_different_size() {
         let db = open_memory_db();
         db.insert_duplicate_tombstone("/tmp/ts.mp4", 100, Some("deadbeefdeadbeef"), None)
@@ -1340,9 +1651,9 @@ mod tests {
             .expect("mark");
         db.confirm_suspected_duplicate(near).expect("confirm");
         assert!(db.get_file_by_id(near).is_err());
-        let supp = PathSuppression::new(std::time::Duration::from_millis(1));
+        let supp = PathSuppression::new(std::time::Duration::from_millis(30));
         supp.suppress(std::path::Path::new(path));
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        supp.advance_clock(std::time::Duration::from_millis(60));
         assert!(!supp.is_suppressed(std::path::Path::new(path)));
         let scanned = vec![ScannedFile {
             path: PathBuf::from(path),
