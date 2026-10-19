@@ -222,16 +222,26 @@ pub fn get_all_files(db: &Arc<Mutex<Database>>) -> Result<Vec<FileWithMetadata>,
         .map_err(|e| format!("Failed to get files: {}", e))
 }
 
+/// Outcome of confirming or ignoring a near-phash suspicion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResolveSuspectedOutcome {
+    /// DB record removed; disk file left in place; permanent tombstone written.
+    Confirmed { file_id: i64 },
+    /// Suspicion cleared; file restored to ready (pipeline may be enqueued).
+    Ignored { file: Box<FileWithMetadata> },
+}
+
 /// Confirm or ignore a near-phash suspected duplicate.
 ///
-/// - `confirm`: treat as duplicate — delete provisional row + PathSuppress (exact-dup path)
-/// - `ignore`: clear suspicion, set status ready (caller may enqueue pipeline)
+/// - `confirm`: write DuplicateTombstone, delete DB row (not disk) + PathSuppress
+/// - `ignore`: mark ignored, set ready; caller should enqueue pipeline
 pub fn resolve_suspected_duplicate(
     db: &Arc<Mutex<Database>>,
     queue: &TaskQueue,
     file_id: i64,
     action: &str,
-) -> Result<FileWithMetadata, String> {
+) -> Result<ResolveSuspectedOutcome, String> {
     let action = action.trim().to_lowercase();
     if action != "confirm" && action != "ignore" {
         return Err(format!(
@@ -241,13 +251,54 @@ pub fn resolve_suspected_duplicate(
 
     let suppressions = queue.path_suppressions().ok();
 
-    let resolution = if action == "confirm" {
-        "confirmed"
-    } else {
-        "ignored"
-    };
+    if action == "confirm" {
+        let orphan_path = {
+            let guard = db
+                .lock()
+                .map_err(|e| format!("Database lock error: {}", e))?;
+            let file = guard
+                .get_file_by_id(file_id)
+                .map_err(|e| format!("File not found: {}", e))?;
+            if file.status != file_status::suspected_duplicate {
+                return Err(format!(
+                    "file {} is not suspected_duplicate (status={})",
+                    file_id, file.status
+                ));
+            }
+            let pending = guard
+                .get_pending_suspected_duplicate(file_id)
+                .map_err(|e| format!("Failed to read suspicion: {}", e))?
+                .ok_or_else(|| format!("no pending suspicion for file {file_id}"))?;
+            let keeper_phash = guard
+                .get_file_by_id(pending.keeper_id)
+                .ok()
+                .and_then(|k| k.phash);
+            guard
+                .insert_duplicate_tombstone(
+                    &file.path,
+                    file.phash.as_deref(),
+                    Some(pending.keeper_id),
+                    keeper_phash.as_deref(),
+                )
+                .map_err(|e| format!("Failed to write duplicate tombstone: {}", e))?;
+            // Persist confirmed resolution while the Files row still exists
+            guard
+                .resolve_suspected_duplicate(file_id, "confirmed")
+                .map_err(|e| format!("Failed to mark confirmed: {}", e))?;
+            // delete_file_record removes SuspectedDuplicates; tombstone remains
+            guard
+                .delete_file_record(file_id)
+                .map_err(|e| format!("Failed to delete confirmed duplicate DB row: {}", e))?;
+            file.path.clone()
+        };
+        if let Some(supp) = suppressions {
+            supp.suppress(std::path::Path::new(&orphan_path));
+        }
+        return Ok(ResolveSuspectedOutcome::Confirmed { file_id });
+    }
 
-    let orphan_path = {
+    // ignore
+    {
         let guard = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
@@ -267,28 +318,9 @@ pub fn resolve_suspected_duplicate(
         {
             return Err(format!("no pending suspicion for file {file_id}"));
         }
-        let path = file.path.clone();
         guard
-            .resolve_suspected_duplicate(file_id, resolution)
+            .resolve_suspected_duplicate(file_id, "ignored")
             .map_err(|e| format!("Failed to resolve suspicion: {}", e))?;
-
-        if action == "confirm" {
-            guard
-                .delete_file_record(file_id)
-                .map_err(|e| format!("Failed to delete confirmed duplicate: {}", e))?;
-            Some(path)
-        } else {
-            None
-        }
-    };
-
-    if let (Some(path), Some(supp)) = (orphan_path, suppressions) {
-        supp.suppress(std::path::Path::new(&path));
-    }
-
-    if action == "confirm" {
-        // Row gone — return a minimal tombstone-style error for the UI to refresh
-        return Err("confirmed: duplicate removed".to_string());
     }
 
     let guard = db
@@ -297,10 +329,13 @@ pub fn resolve_suspected_duplicate(
     let files = guard
         .get_files_with_metadata()
         .map_err(|e| format!("Failed to reload files: {}", e))?;
-    files
+    let file = files
         .into_iter()
         .find(|f| f.file.id == file_id)
-        .ok_or_else(|| format!("file {} missing after ignore", file_id))
+        .ok_or_else(|| format!("file {} missing after ignore", file_id))?;
+    Ok(ResolveSuspectedOutcome::Ignored {
+        file: Box::new(file),
+    })
 }
 
 /// Load settings from the store (defaults when missing).
@@ -458,19 +493,56 @@ pub async fn resolve_suspected_duplicate_command(
     action: String,
     db: State<'_, Arc<Mutex<Database>>>,
     queue: State<'_, Arc<TaskQueue>>,
-) -> Result<Option<FileWithMetadata>, String> {
-    match resolve_suspected_duplicate(&db, &queue, file_id, &action) {
-        Ok(file) => Ok(Some(file)),
-        Err(msg) if msg.starts_with("confirmed:") => Ok(None),
-        Err(e) => Err(e),
+    settings_store: State<'_, Mutex<SettingsStore>>,
+    app: AppHandle,
+) -> Result<ResolveSuspectedOutcome, String> {
+    let outcome = resolve_suspected_duplicate(&db, &queue, file_id, &action)?;
+    if matches!(outcome, ResolveSuspectedOutcome::Ignored { .. }) {
+        // After ignore, enqueue pipeline so the file does not stay unscanned
+        let settings = get_settings(&settings_store).unwrap_or_default();
+        let base = PipelineOptions::from_env();
+        if !base.is_noop() {
+            let enqueue = enqueue_pipeline_jobs(
+                Some(&app),
+                &db,
+                &queue,
+                &settings,
+                vec![file_id],
+                base,
+            );
+            if let Err(e) = enqueue {
+                eprintln!(
+                    "resolve_suspected: ignore enqueue pipeline failed for {}: {}",
+                    file_id, e
+                );
+            }
+        }
     }
+    Ok(outcome)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsResponse {
+    #[serde(flatten)]
+    pub settings: AppSettings,
+    /// Present when `IDAM_NEAR_PHASH_MAX_DISTANCE` is set and valid.
+    pub near_phash_env_override: Option<u32>,
+    pub effective_near_phash_max_distance: u32,
 }
 
 #[tauri::command]
 pub fn get_settings_command(
     settings_store: State<'_, Mutex<SettingsStore>>,
-) -> Result<AppSettings, String> {
-    get_settings(&settings_store)
+) -> Result<SettingsResponse, String> {
+    let settings = get_settings(&settings_store)?;
+    let env_override = crate::phash::parse_env_near_phash_max_distance();
+    let effective = settings.effective_near_phash_max_distance();
+    Ok(SettingsResponse {
+        settings,
+        near_phash_env_override: env_override,
+        effective_near_phash_max_distance: effective,
+    })
 }
 
 #[tauri::command]

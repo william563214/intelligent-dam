@@ -59,6 +59,16 @@ export interface AppSettings {
   nearPhashMaxDistance: number;
 }
 
+/** get_settings_command response (flatten AppSettings + env override metadata) */
+export interface SettingsResponse extends AppSettings {
+  nearPhashEnvOverride: number | null;
+  effectiveNearPhashMaxDistance: number;
+}
+
+export type ResolveSuspectedOutcome =
+  | { kind: "confirmed"; fileId: number }
+  | { kind: "ignored"; file: FileWithMetadata };
+
 export interface WatcherStatus {
   running: boolean;
   watchedPaths: string[];
