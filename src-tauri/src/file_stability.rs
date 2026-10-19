@@ -302,6 +302,7 @@ fn try_windows_exclusive_share(path: &Path) -> LockProbe {
     use std::os::windows::fs::OpenOptionsExt;
 
     // ERROR_SHARING_VIOLATION
+    #[allow(non_upper_case_globals)]
     const sharing_violation: i32 = 32;
 
     match OpenOptions::new().read(true).share_mode(0).open(path) {
