@@ -42,10 +42,45 @@ use tauri::{AppHandle, Emitter};
 const watcher_event_name: &str = "watcher-file-detected";
 
 #[allow(non_upper_case_globals)]
-const debounce_window: Duration = Duration::from_millis(750);
+const default_debounce_window: Duration = Duration::from_millis(750);
 
 #[allow(non_upper_case_globals)]
 const debounce_capacity: usize = 256;
+
+/// Tunables for ingest (stability gate + path debounce). Production uses [`Default`].
+#[derive(Debug, Clone)]
+pub struct WatcherOptions {
+    pub stability: StabilityOptions,
+    pub debounce_window: Duration,
+    /// When set skips `PipelineOptions::from_env` and AppHandle settings load
+    pub pipeline_override: Option<PipelineOptions>,
+}
+
+impl Default for WatcherOptions {
+    fn default() -> Self {
+        Self {
+            stability: StabilityOptions::default(),
+            debounce_window: default_debounce_window,
+            pipeline_override: None,
+        }
+    }
+}
+
+impl WatcherOptions {
+    /// Fast debounce + short stability for notify e2e tests
+    #[cfg(feature = "test-support")]
+    pub fn for_tests() -> Self {
+        Self {
+            stability: StabilityOptions::for_watcher_e2e(),
+            debounce_window: Duration::from_millis(80),
+            pipeline_override: Some(PipelineOptions {
+                enable_scrape: false,
+                enable_move: false,
+                enable_preview: false,
+            }),
+        }
+    }
+}
 
 /// Payload emitted to the frontend when a new video is detected and registered.
 #[derive(Debug, Clone, Serialize)]
@@ -161,6 +196,12 @@ pub struct WatcherManager {
     inner: Mutex<Option<ActiveWatch>>,
 }
 
+impl Default for WatcherManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WatcherManager {
     pub fn new() -> Self {
         Self {
@@ -231,7 +272,7 @@ impl WatcherManager {
     }
 
     /// Stop monitoring if active. Idempotent. Uses [`worker_join_timeout`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn stop(&self) -> Result<()> {
         self.stop_with_timeout(worker_join_timeout)
     }
@@ -245,6 +286,49 @@ impl WatcherManager {
         app: AppHandle,
         db: Arc<Mutex<Database>>,
         queue: Arc<TaskQueue>,
+    ) -> Result<WatcherStatus> {
+        self.start_with_options(paths, app, db, queue, WatcherOptions::default())
+    }
+
+    /// Like [`start`] with injectable stability / debounce (tests keep production defaults via [`Default`]).
+    pub fn start_with_options(
+        &self,
+        paths: Vec<PathBuf>,
+        app: AppHandle,
+        db: Arc<Mutex<Database>>,
+        queue: Arc<TaskQueue>,
+        options: WatcherOptions,
+    ) -> Result<WatcherStatus> {
+        self.spawn_watch(
+            paths,
+            Some(app),
+            db,
+            queue,
+            options,
+            true,
+        )
+    }
+
+    /// Headless notify→ingest→enqueue for integration tests (no AppHandle / workers).
+    #[cfg(feature = "test-support")]
+    pub fn start_for_test(
+        &self,
+        paths: Vec<PathBuf>,
+        db: Arc<Mutex<Database>>,
+        queue: Arc<TaskQueue>,
+        options: WatcherOptions,
+    ) -> Result<WatcherStatus> {
+        self.spawn_watch(paths, None, db, queue, options, false)
+    }
+
+    fn spawn_watch(
+        &self,
+        paths: Vec<PathBuf>,
+        app: Option<AppHandle>,
+        db: Arc<Mutex<Database>>,
+        queue: Arc<TaskQueue>,
+        options: WatcherOptions,
+        start_workers: bool,
     ) -> Result<WatcherStatus> {
         if paths.is_empty() {
             anyhow::bail!("No valid watch directories (configure scan directories in settings)");
@@ -280,16 +364,33 @@ impl WatcherManager {
 
         let worker_stop = Arc::clone(&stop_flag);
         let suppressions = Arc::new(PathSuppression::default());
-        queue
-            .bind_and_start(app.clone(), Arc::clone(&db), Arc::clone(&suppressions))
-            .map_err(|e| anyhow::anyhow!("Failed to bind task queue: {}", e))?;
+        if start_workers {
+            let app_handle = app
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("AppHandle required when starting queue workers"))?;
+            queue
+                .bind_and_start(app_handle, Arc::clone(&db), Arc::clone(&suppressions))
+                .map_err(|e| anyhow::anyhow!("Failed to bind task queue: {}", e))?;
+        } else {
+            queue
+                .bind_database(Arc::clone(&db))
+                .map_err(|e| anyhow::anyhow!("Failed to bind task queue: {}", e))?;
+        }
 
         let worker_suppressions = Arc::clone(&suppressions);
         let worker_queue = Arc::clone(&queue);
         let worker = thread::Builder::new()
             .name("dam-watcher-ingest".into())
             .spawn(move || {
-                ingest_worker(rx, worker_stop, app, db, worker_suppressions, worker_queue)
+                ingest_worker(
+                    rx,
+                    worker_stop,
+                    app,
+                    db,
+                    worker_suppressions,
+                    worker_queue,
+                    options,
+                )
             })
             .context("Failed to spawn watcher ingest worker")?;
 
@@ -322,10 +423,11 @@ impl Drop for WatcherManager {
 fn ingest_worker(
     rx: Receiver<DetectedPath>,
     stop_flag: Arc<AtomicBool>,
-    app: AppHandle,
+    app: Option<AppHandle>,
     db: Arc<Mutex<Database>>,
     suppressions: Arc<PathSuppression>,
     queue: Arc<TaskQueue>,
+    options: WatcherOptions,
 ) {
     let mut recent: VecDeque<(String, Instant)> = VecDeque::new();
 
@@ -341,7 +443,7 @@ fn ingest_worker(
         }
 
         let path_key = detected.path.to_string_lossy().to_string();
-        if is_duplicate(&mut recent, &path_key) {
+        if is_duplicate(&mut recent, &path_key, options.debounce_window) {
             continue;
         }
 
@@ -356,7 +458,8 @@ fn ingest_worker(
 
         // I/O outside DB lock: wait for write stability then confirm size
         let stop_for_wait = Arc::clone(&stop_flag);
-        let scanned = match prepare_scanned_file(&detected.path, move || {
+        let stability = options.stability.clone();
+        let scanned = match prepare_scanned_file(&detected.path, &stability, move || {
             stop_for_wait.load(Ordering::SeqCst)
         }) {
             Ok(Some(s)) => s,
@@ -368,7 +471,7 @@ fn ingest_worker(
                     e
                 );
                 let _ = emit_event(
-                    &app,
+                    app.as_ref(),
                     WatcherFileEvent {
                         path: path_key,
                         kind: detected.kind.to_string(),
@@ -408,7 +511,7 @@ fn ingest_worker(
                 Err(e) => {
                     eprintln!("watcher: import failed for {}: {:#}", path_str, e);
                     let _ = emit_event(
-                        &app,
+                        app.as_ref(),
                         WatcherFileEvent {
                             path: path_str.clone(),
                             kind: detected.kind.to_string(),
@@ -428,7 +531,7 @@ fn ingest_worker(
                 path_str
             );
             let _ = emit_event(
-                &app,
+                app.as_ref(),
                 WatcherFileEvent {
                     path: path_str,
                     kind: detected.kind.to_string(),
@@ -443,7 +546,7 @@ fn ingest_worker(
         let is_new = entry.is_new;
 
         let _ = emit_event(
-            &app,
+            app.as_ref(),
             WatcherFileEvent {
                 path: path_str,
                 kind: detected.kind.to_string(),
@@ -478,15 +581,36 @@ fn ingest_worker(
             }
         }
 
-        let base_options = PipelineOptions::from_env();
+        let base_options = options
+            .pipeline_override
+            .clone()
+            .unwrap_or_else(PipelineOptions::from_env);
         if base_options.is_noop() {
             continue;
         }
 
         // Soften options when this path is an already-organized library row
         // (e.g. move landed under watch and suppress window missed)
-        let settings = pipeline::load_settings(&app);
-        let options = {
+        let Some(app_handle) = app.as_ref() else {
+            // Headless tests: enqueue pipeline with override as-is (no settings soften)
+            match queue.enqueue_pipeline(file_id, base_options, Some(Arc::clone(&stop_flag))) {
+                Ok(job_id) => {
+                    eprintln!(
+                        "watcher: enqueued pipeline job {} for file {} (headless)",
+                        job_id, file_id
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "watcher: failed to enqueue pipeline for file {}: {}",
+                        file_id, e
+                    );
+                }
+            }
+            continue;
+        };
+        let settings = pipeline::load_settings(app_handle);
+        let pipeline_opts = {
             let db_guard = match db.lock() {
                 Ok(g) => g,
                 Err(e) => {
@@ -511,7 +635,7 @@ fn ingest_worker(
             }
         };
 
-        if options.is_noop() {
+        if pipeline_opts.is_noop() {
             eprintln!(
                 "watcher: skip pipeline enqueue for already-organized file {}",
                 file_id
@@ -533,7 +657,7 @@ fn ingest_worker(
             }
         }
 
-        match queue.enqueue_pipeline(file_id, options, Some(Arc::clone(&stop_flag))) {
+        match queue.enqueue_pipeline(file_id, pipeline_opts, Some(Arc::clone(&stop_flag))) {
             Ok(job_id) => {
                 eprintln!(
                     "watcher: enqueued pipeline job {} for file {}",
@@ -550,7 +674,11 @@ fn ingest_worker(
     }
 }
 
-fn prepare_scanned_file<F>(path: &Path, should_abort: F) -> Result<Option<ScannedFile>>
+fn prepare_scanned_file<F>(
+    path: &Path,
+    stability: &StabilityOptions,
+    should_abort: F,
+) -> Result<Option<ScannedFile>>
 where
     F: FnMut() -> bool,
 {
@@ -558,11 +686,7 @@ where
         return Ok(None);
     }
 
-    let size = match file_stability::wait_until_stable(
-        path,
-        &StabilityOptions::default(),
-        should_abort,
-    ) {
+    let size = match file_stability::wait_until_stable(path, stability, should_abort) {
         Ok(size) => size,
         Err(StabilityError::Aborted { .. }) => return Ok(None),
         Err(StabilityError::Missing { .. }) => return Ok(None),
@@ -583,7 +707,11 @@ where
     }))
 }
 
-fn is_duplicate(recent: &mut VecDeque<(String, Instant)>, path_key: &str) -> bool {
+fn is_duplicate(
+    recent: &mut VecDeque<(String, Instant)>,
+    path_key: &str,
+    debounce_window: Duration,
+) -> bool {
     let now = Instant::now();
     while let Some((_, at)) = recent.front() {
         if now.duration_since(*at) > debounce_window {
@@ -602,7 +730,10 @@ fn is_duplicate(recent: &mut VecDeque<(String, Instant)>, path_key: &str) -> boo
     false
 }
 
-fn emit_event(app: &AppHandle, payload: WatcherFileEvent) -> Result<()> {
+fn emit_event(app: Option<&AppHandle>, payload: WatcherFileEvent) -> Result<()> {
+    let Some(app) = app else {
+        return Ok(());
+    };
     app.emit(watcher_event_name, payload)
         .context("Failed to emit watcher-file-detected")?;
     Ok(())
@@ -745,8 +876,9 @@ mod tests {
     #[test]
     fn is_duplicate_debounces_same_path() {
         let mut recent = VecDeque::new();
-        assert!(!is_duplicate(&mut recent, "/a/b.mp4"));
-        assert!(is_duplicate(&mut recent, "/a/b.mp4"));
-        assert!(!is_duplicate(&mut recent, "/a/c.mp4"));
+        let window = default_debounce_window;
+        assert!(!is_duplicate(&mut recent, "/a/b.mp4", window));
+        assert!(is_duplicate(&mut recent, "/a/b.mp4", window));
+        assert!(!is_duplicate(&mut recent, "/a/c.mp4", window));
     }
 }
