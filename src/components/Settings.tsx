@@ -29,6 +29,7 @@ const default_settings: AppSettings = {
   avdcPath: "",
   stashdbUrl: "https://stashdb.org",
   outputTemplate: "{{studio}}/{{date}}_{{title}}.{{ext}}",
+  nearPhashMaxDistance: 4,
 };
 
 const legacy_settings_key = "intelligent_dam_settings";
@@ -710,6 +711,33 @@ export default function Settings() {
             Handlebars 變數: studio date title number filename ext actor。
             相對路徑以來源檔所在目錄為基準；搬回監控樹內時會抑制 notify
             重入並略過已刮削檔。建議設定絕對圖書館根目錄以免與下載目錄重疊。
+          </p>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            Near-phash 疑似重複閾值（Hamming）
+          </label>
+          <input
+            type="number"
+            min={0}
+            max={32}
+            value={settings.nearPhashMaxDistance}
+            onChange={(e) =>
+              setSettings({
+                ...settings,
+                nearPhashMaxDistance: Math.min(
+                  32,
+                  Math.max(0, Number(e.target.value) || 0)
+                ),
+              })
+            }
+            className="w-32 px-3 py-2 border border-gray-300 rounded-md"
+          />
+          <p className="mt-1 text-xs text-gray-500">
+            預設 4。距離 0（完全相同 phash）仍自動略過；1～閾值標為「疑似重複」
+            不自動處理，需在瀏覽器確認或忽略。可用環境變數
+            IDAM_NEAR_PHASH_MAX_DISTANCE 覆寫。
           </p>
         </div>
 

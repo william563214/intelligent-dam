@@ -35,12 +35,31 @@ pub struct Tag {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuspectedDuplicateInfo {
+    pub keeper_id: i64,
+    pub keeper_path: String,
+    pub distance: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWithMetadata {
     // 保持巢狀 shape 與前端 FileWithMetadata.file / metadata / tags 對齊
     // 勿使用 flatten 否則 invoke JSON 會少掉 file 物件
     pub file: FileRecord,
     pub metadata: Option<Metadata>,
     pub tags: Vec<Tag>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "suspectedDuplicate")]
+    pub suspected_duplicate: Option<SuspectedDuplicateInfo>,
+}
+
+/// Pending near-phash suspicion row (SuspectedDuplicates table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspectedDuplicateRow {
+    pub file_id: i64,
+    pub keeper_id: i64,
+    pub distance: u32,
+    pub resolution: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +112,8 @@ pub struct Database {
 /// 1 = v0.1.0 baseline（含 #20 Tags / #28 FK 硬化）
 /// 2 = #45 NULL-category 唯一索引
 /// 3 = #34 Jobs 佇列持久化
-const SCHEMA_USER_VERSION: i32 = 3;
+/// 4 = #38 SuspectedDuplicates（near-phash 疑似重複）
+const SCHEMA_USER_VERSION: i32 = 4;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
 #[cfg(any(test, feature = "test-support"))]
@@ -275,6 +295,7 @@ impl Database {
         match target {
             2 => self.migration_2_tags_nullsafe_unique(),
             3 => self.migration_3_jobs_table(),
+            4 => self.migration_4_suspected_duplicates(),
             other => {
                 // 用 SqliteFailure 而非 InvalidParameterName
                 // 避免顯示 Invalid parameter name 前綴
@@ -285,6 +306,46 @@ impl Database {
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
                     Some(msg),
                 ))
+            }
+        }
+    }
+
+    /// #38 建立 SuspectedDuplicates 表（near-phash 疑似重複確認）
+    fn migration_4_suspected_duplicates(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS SuspectedDuplicates (
+                    file_id INTEGER PRIMARY KEY,
+                    keeper_id INTEGER NOT NULL,
+                    distance INTEGER NOT NULL,
+                    resolution TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (resolution IN ('pending', 'confirmed', 'ignored')),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(file_id) REFERENCES Files(id),
+                    FOREIGN KEY(keeper_id) REFERENCES Files(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_suspected_duplicates_keeper
+                    ON SuspectedDuplicates(keeper_id);
+                CREATE INDEX IF NOT EXISTS idx_suspected_duplicates_resolution
+                    ON SuspectedDuplicates(resolution);
+                ",
+            )?;
+            self.set_user_version(4)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after SuspectedDuplicates migration error: {rb}"
+                    );
+                }
+                Err(e)
             }
         }
     }
@@ -991,8 +1052,112 @@ impl Database {
         Ok(best)
     }
 
-    /// Remove a provisional Files row and its Metadata / FileTags (phash skip).
+    /// Upsert a pending near-phash suspicion (file_id is the newer / provisional row).
+    pub fn upsert_suspected_duplicate(
+        &self,
+        file_id: i64,
+        keeper_id: i64,
+        distance: u32,
+    ) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT INTO SuspectedDuplicates (file_id, keeper_id, distance, resolution)
+             VALUES (?1, ?2, ?3, 'pending')
+             ON CONFLICT(file_id) DO UPDATE SET
+               keeper_id = excluded.keeper_id,
+               distance = excluded.distance,
+               resolution = 'pending'",
+            params![file_id, keeper_id, distance as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Pending suspicion for a file, if any.
+    pub fn get_pending_suspected_duplicate(
+        &self,
+        file_id: i64,
+    ) -> SqliteResult<Option<SuspectedDuplicateRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, keeper_id, distance, resolution FROM SuspectedDuplicates
+             WHERE file_id = ?1 AND resolution = 'pending'",
+        )?;
+        let mut rows = stmt.query(params![file_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(SuspectedDuplicateRow {
+                file_id: row.get(0)?,
+                keeper_id: row.get(1)?,
+                distance: row.get::<_, i64>(2)? as u32,
+                resolution: row.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Mark suspicion resolved and clear Files.status when ignoring.
+    pub fn resolve_suspected_duplicate(
+        &self,
+        file_id: i64,
+        resolution: &str,
+    ) -> SqliteResult<SuspectedDuplicateRow> {
+        if resolution != "confirmed" && resolution != "ignored" {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid suspected-duplicate resolution: {resolution}"
+            )));
+        }
+        let pending = self
+            .get_pending_suspected_duplicate(file_id)?
+            .ok_or_else(|| {
+                rusqlite::Error::QueryReturnedNoRows
+            })?;
+
+        self.conn.execute(
+            "UPDATE SuspectedDuplicates SET resolution = ?1 WHERE file_id = ?2",
+            params![resolution, file_id],
+        )?;
+
+        if resolution == "ignored" {
+            let status = self.get_file_by_id(file_id)?.status;
+            if status == file_status::suspected_duplicate {
+                self.update_file_status(file_id, file_status::ready)?;
+            }
+        }
+
+        Ok(SuspectedDuplicateRow {
+            resolution: resolution.to_string(),
+            ..pending
+        })
+    }
+
+    fn suspected_duplicate_info_for(
+        &self,
+        file_id: i64,
+    ) -> SqliteResult<Option<SuspectedDuplicateInfo>> {
+        let Some(row) = self.get_pending_suspected_duplicate(file_id)? else {
+            return Ok(None);
+        };
+        let keeper = self.get_file_by_id(row.keeper_id)?;
+        Ok(Some(SuspectedDuplicateInfo {
+            keeper_id: row.keeper_id,
+            keeper_path: keeper.path,
+            distance: row.distance,
+        }))
+    }
+
+    /// Remove a provisional Files row and its Metadata / FileTags / suspicions.
     pub fn delete_file_record(&self, file_id: i64) -> SqliteResult<()> {
+        // Clear suspicions that point at this file as keeper; restore those rows to ready
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id FROM SuspectedDuplicates
+             WHERE keeper_id = ?1 AND resolution = 'pending'",
+        )?;
+        let orphan_ids: Vec<i64> = stmt
+            .query_map(params![file_id], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        drop(stmt);
+
+        self.conn.execute(
+            "DELETE FROM SuspectedDuplicates WHERE file_id = ?1 OR keeper_id = ?1",
+            params![file_id],
+        )?;
         self.conn.execute(
             "DELETE FROM FileTags WHERE file_id = ?1",
             params![file_id],
@@ -1003,6 +1168,14 @@ impl Database {
         )?;
         self.conn
             .execute("DELETE FROM Files WHERE id = ?1", params![file_id])?;
+
+        for orphan_id in orphan_ids {
+            if let Ok(file) = self.get_file_by_id(orphan_id) {
+                if file.status == file_status::suspected_duplicate {
+                    let _ = self.update_file_status(orphan_id, file_status::ready);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1232,10 +1405,12 @@ impl Database {
             let metadata = self.get_metadata(file.id)?;
             let tags = self.get_file_tags(file.id)?;
 
+            let suspected_duplicate = self.suspected_duplicate_info_for(file.id)?;
             result.push(FileWithMetadata {
                 file,
                 metadata,
                 tags,
+                suspected_duplicate,
             });
         }
         Ok(result)
@@ -1406,6 +1581,11 @@ impl Database {
         self.table_exists("Jobs")
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn suspected_duplicates_table_exists(&self) -> SqliteResult<bool> {
+        self.table_exists("SuspectedDuplicates")
+    }
+
     fn map_job_row(row: &rusqlite::Row<'_>) -> SqliteResult<JobRow> {
         let retryable_i: i64 = row.get(7)?;
         Ok(JobRow {
@@ -1453,12 +1633,15 @@ impl Database {
         Ok(n)
     }
 
-    /// File ids eligible for one-click / batch organize (not missing)
+    /// File ids eligible for one-click / batch organize (not missing / suspected)
     pub fn list_organizable_file_ids(&self) -> SqliteResult<Vec<i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM Files WHERE status != ?1 ORDER BY id ASC",
+            "SELECT id FROM Files WHERE status != ?1 AND status != ?2 ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map(params![file_status::missing], |row| row.get(0))?;
+        let rows = stmt.query_map(
+            params![file_status::missing, file_status::suspected_duplicate],
+            |row| row.get(0),
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1746,6 +1929,76 @@ mod tests {
             params![tag_id],
         )
         .expect("insert filetag");
+    }
+
+    /// Schema v3 形狀 DB（有 Jobs 無 SuspectedDuplicates）
+    fn write_v3_shaped_file_db(path: &Path) {
+        let conn = Connection::open(path).expect("open raw db");
+        conn.execute_batch(
+            "
+            CREATE TABLE Files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phash TEXT,
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE Metadata (
+                file_id INTEGER PRIMARY KEY,
+                title TEXT,
+                studio TEXT,
+                release_date TEXT,
+                summary TEXT,
+                cover_image TEXT,
+                sprite_sheet_path TEXT,
+                source_type TEXT,
+                FOREIGN KEY(file_id) REFERENCES Files(id)
+            );
+            CREATE TABLE Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
+            );
+            CREATE UNIQUE INDEX idx_tags_name_ifnull_category
+                ON Tags (name, IFNULL(category, ''));
+            CREATE TABLE FileTags (
+                file_id INTEGER,
+                tag_id INTEGER,
+                confidence FLOAT DEFAULT 1.0,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            );
+            CREATE TABLE ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
+            );
+            CREATE TABLE Jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL CHECK (
+                    status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+                ),
+                type TEXT NOT NULL CHECK (type IN ('pipeline', 'phash')),
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                error TEXT,
+                retryable INTEGER NOT NULL DEFAULT 1 CHECK (retryable IN (0, 1)),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO Files (id, path, size) VALUES (1, '/tmp/v3-upgrade.mp4', 10);
+            PRAGMA user_version = 3;
+            ",
+        )
+        .expect("seed v3 shaped db");
     }
 
     /// Schema v2 形狀 DB（有 nullsafe Tags 索引 無 Jobs 表）
@@ -3257,6 +3510,7 @@ mod tests {
             },
             metadata: None,
             tags: Vec::new(),
+            suspected_duplicate: None,
         };
         let value = serde_json::to_value(&payload).expect("serialize");
         assert!(value.get("file").is_some(), "expected nested file object");
@@ -3772,11 +4026,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_creates_jobs_table_at_v3() {
+    fn fresh_db_creates_jobs_and_suspected_tables_at_current_version() {
         let db = open_memory_db();
         assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
-        assert_eq!(SCHEMA_USER_VERSION, 3);
+        assert_eq!(SCHEMA_USER_VERSION, 4);
         assert!(db.jobs_table_exists().expect("Jobs exists"));
+        assert!(db
+            .suspected_duplicates_table_exists()
+            .expect("SuspectedDuplicates exists"));
         let sql: String = db
             .conn
             .query_row(
@@ -3791,8 +4048,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_db_upgrades_to_v3_with_jobs_table() {
-        let path = temp_db_path("v2-to-v3-jobs");
+    fn v2_db_upgrades_to_current_with_jobs_and_suspected_tables() {
+        let path = temp_db_path("v2-to-v4-jobs");
         write_v2_shaped_file_db(&path);
         assert_eq!(raw_user_version(&path), 2);
         {
@@ -3808,8 +4065,14 @@ mod tests {
         }
 
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 3);
+        assert_eq!(
+            db.get_user_version().expect("uv"),
+            SCHEMA_USER_VERSION
+        );
         assert!(db.jobs_table_exists().expect("Jobs"));
+        assert!(db
+            .suspected_duplicates_table_exists()
+            .expect("SuspectedDuplicates"));
         let file = db.get_file_by_id(1).expect("preserve file");
         assert_eq!(file.path, "/tmp/v2-upgrade.mp4");
 
@@ -3831,15 +4094,67 @@ mod tests {
     }
 
     #[test]
-    fn jobs_migration_is_idempotent_on_reopen() {
-        let path = temp_db_path("jobs-idempotent");
+    fn jobs_and_suspected_migration_is_idempotent_on_reopen() {
+        let path = temp_db_path("jobs-suspected-idempotent");
         write_v2_shaped_file_db(&path);
         let first = Database::new(path.to_str().expect("utf8")).expect("first");
-        assert_eq!(first.get_user_version().expect("v"), 3);
+        assert_eq!(
+            first.get_user_version().expect("v"),
+            SCHEMA_USER_VERSION
+        );
         drop(first);
         let second = Database::new(path.to_str().expect("utf8")).expect("second");
-        assert_eq!(second.get_user_version().expect("v"), 3);
+        assert_eq!(
+            second.get_user_version().expect("v"),
+            SCHEMA_USER_VERSION
+        );
         assert!(second.jobs_table_exists().expect("Jobs"));
+        assert!(second
+            .suspected_duplicates_table_exists()
+            .expect("SuspectedDuplicates"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v3_db_upgrades_to_v4_with_suspected_duplicates_table() {
+        let path = temp_db_path("v3-to-v4-suspected");
+        write_v3_shaped_file_db(&path);
+        assert_eq!(raw_user_version(&path), 3);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'SuspectedDuplicates'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(n, 0, "v3 fixture must not have SuspectedDuplicates");
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), 4);
+        assert!(db
+            .suspected_duplicates_table_exists()
+            .expect("SuspectedDuplicates"));
+        let file = db.get_file_by_id(1).expect("preserve file");
+        assert_eq!(file.path, "/tmp/v3-upgrade.mp4");
+
+        let keeper = db
+            .insert_file("/tmp/v3-keeper.mp4", 2, Some("0000000000000000".into()))
+            .expect("keeper");
+        let candidate = db
+            .insert_file("/tmp/v3-candidate.mp4", 3, Some("0000000000000003".into()))
+            .expect("candidate");
+        db.upsert_suspected_duplicate(candidate, keeper, 2)
+            .expect("upsert suspicion");
+        let row = db
+            .get_pending_suspected_duplicate(candidate)
+            .expect("get")
+            .expect("pending");
+        assert_eq!(row.keeper_id, keeper);
+        assert_eq!(row.distance, 2);
         let _ = std::fs::remove_file(&path);
     }
 

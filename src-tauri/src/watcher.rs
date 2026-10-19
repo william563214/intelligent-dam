@@ -507,7 +507,16 @@ fn ingest_worker(
                     continue;
                 }
             };
-            match scanner::import_files_pending_phash(&db_guard, &[scanned], Some(&suppressions)) {
+            let max_distance = match app.as_ref() {
+                Some(handle) => pipeline::load_settings(handle).effective_near_phash_max_distance(),
+                None => crate::phash::resolve_near_phash_max_distance(None),
+            };
+            match scanner::import_files_pending_phash(
+                &db_guard,
+                &[scanned],
+                Some(&suppressions),
+                max_distance,
+            ) {
                 Ok((entries, jobs)) => (entries.into_iter().next(), jobs),
                 Err(e) => {
                     eprintln!("watcher: import failed for {}: {:#}", path_str, e);
@@ -525,10 +534,10 @@ fn ingest_worker(
             }
         };
 
-        // Phash near-dedup may have removed the provisional row during import
+        // Exact phash dedup may have removed the provisional row during import
         let Some(entry) = imported else {
             eprintln!(
-                "watcher: skip ingest for {} (phash near-duplicate of existing row)",
+                "watcher: skip ingest for {} (exact phash duplicate of existing row)",
                 path_str
             );
             let _ = emit_event(
@@ -537,10 +546,21 @@ fn ingest_worker(
                     path: path_str,
                     kind: detected.kind.to_string(),
                     file_id: None,
-                    error: Some("skipped: phash near-duplicate".to_string()),
+                    error: Some("skipped: exact phash duplicate".to_string()),
                 },
             );
             continue;
+        };
+
+        // Suspected near-phash: keep row but do not auto-enqueue pipeline
+        let is_suspected = {
+            match db.lock() {
+                Ok(g) => g
+                    .get_file_by_id(entry.file_id)
+                    .map(|f| f.status == crate::file_status::suspected_duplicate)
+                    .unwrap_or(false),
+                Err(_) => false,
+            }
         };
 
         let file_id = entry.file_id;
@@ -580,6 +600,14 @@ fn ingest_worker(
                     eprintln!("watcher: failed to enqueue phash for file {}: {}", file_id, e);
                 }
             }
+        }
+
+        if is_suspected {
+            eprintln!(
+                "watcher: skip pipeline enqueue for suspected_duplicate file_id {}",
+                file_id
+            );
+            continue;
         }
 
         let base_options = options

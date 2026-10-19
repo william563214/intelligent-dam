@@ -8,16 +8,18 @@
 //! Stored as lowercase hex (`{:016x}`) for StashDB `?phash=` lookups.
 //! Frame extraction failure must not abort import callers should treat Err as skip.
 //!
-//! # Near-duplicate policy (MVP / issue #11)
+//! # Near-duplicate policy (issue #38)
 //!
-//! Hamming distance on the 64-bit value. Two hashes are near-identical when
-//! `hamming_distance <= near_phash_max_distance()` (default **8**, Stash-style;
-//! override with env `IDAM_NEAR_PHASH_MAX_DISTANCE`). Visually similar but
-//! distinct clips can false-positive at ≤8 — logged on every skip.
-//! Ingest strategy: **skip with log + keep the existing Files row** (delete the
-//! provisional newer row) then **PathSuppress (TTL)** that on-disk path so
-//! Watcher/scan do not re-ingest the orphan until TTL expires (or the operator
-//! clears suppressions). No duplicate-link UX in Phase 1.
+//! Hamming distance on the 64-bit value:
+//! - **distance == 0** (exact phash): auto-skip provisional row + PathSuppress (unchanged)
+//! - **1..=threshold**: mark **suspected duplicate** (疑似重複); keep both rows; no
+//!   auto-skip / move / delete — frontend confirms or ignores
+//! - **> threshold**: treat as distinct
+//!
+//! Default threshold is **4** (was 8 / Stash-style). The 25-frame sprite already
+//! aggregates multi-frame signal; false positives at ≤8 were mostly threshold
+//! looseness rather than single-frame weakness. Override via Settings
+//! (`nearPhashMaxDistance`) or env `IDAM_NEAR_PHASH_MAX_DISTANCE` (env wins).
 
 use anyhow::{bail, Context, Result};
 use image::{imageops, DynamicImage, GenericImageView, GrayImage, ImageBuffer, Luma, Rgba};
@@ -37,19 +39,56 @@ const dct_size: usize = 64;
 #[allow(non_upper_case_globals)]
 const hash_size: usize = 8;
 
-/// Default max Hamming distance treated as the same / near-identical video (MVP).
+/// Default max Hamming distance for near / suspected matches (issue #38).
 #[allow(non_upper_case_globals)]
-pub const default_near_phash_max_distance: u32 = 8;
+pub const default_near_phash_max_distance: u32 = 4;
 
 #[allow(non_upper_case_globals)]
-const env_near_phash_max_distance: &str = "IDAM_NEAR_PHASH_MAX_DISTANCE";
+pub const env_near_phash_max_distance: &str = "IDAM_NEAR_PHASH_MAX_DISTANCE";
 
-/// Effective near-dup threshold (`IDAM_NEAR_PHASH_MAX_DISTANCE` or default 8).
-pub fn near_phash_max_distance() -> u32 {
-    std::env::var(env_near_phash_max_distance)
-        .ok()
+/// Classification of a Hamming distance against the configured threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PhashMatchKind {
+    /// Identical 64-bit phash — auto-handled as duplicate.
+    Exact,
+    /// Within threshold but not identical — suspected only.
+    Suspected,
+    /// Beyond threshold — distinct clips.
+    Distinct,
+}
+
+/// Resolve effective threshold: env override → settings → default 4.
+pub fn resolve_near_phash_max_distance(settings_value: Option<u32>) -> u32 {
+    resolve_near_phash_max_distance_from(
+        settings_value,
+        read_env_near_phash_max_distance().as_deref(),
+    )
+}
+
+/// Pure resolver for tests (inject env string; no process env mutation).
+pub fn resolve_near_phash_max_distance_from(
+    settings_value: Option<u32>,
+    env_value: Option<&str>,
+) -> u32 {
+    env_value
         .and_then(|s| s.trim().parse::<u32>().ok())
+        .or(settings_value)
         .unwrap_or(default_near_phash_max_distance)
+}
+
+fn read_env_near_phash_max_distance() -> Option<String> {
+    std::env::var(env_near_phash_max_distance).ok()
+}
+
+/// Classify distance relative to `max_distance`.
+pub fn classify_phash_distance(distance: u32, max_distance: u32) -> PhashMatchKind {
+    if distance == 0 {
+        PhashMatchKind::Exact
+    } else if distance <= max_distance {
+        PhashMatchKind::Suspected
+    } else {
+        PhashMatchKind::Distinct
+    }
 }
 
 /// Parse a 16-char hex phash into a u64. Accepts optional `0x` prefix.
@@ -73,15 +112,15 @@ pub fn hamming_distance(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
 
-/// True when distance is within the MVP near-duplicate threshold.
+/// True when distance is within the near / suspected threshold (includes exact).
 #[cfg(test)]
-pub fn is_near_duplicate(a: u64, b: u64) -> bool {
-    hamming_distance(a, b) <= near_phash_max_distance()
+fn is_near_duplicate_with(a: u64, b: u64, max_distance: u32) -> bool {
+    hamming_distance(a, b) <= max_distance
 }
 
 /// Compare two hex phash strings. Returns None if either fails to parse.
 #[cfg(test)]
-pub fn hex_hamming_distance(a: &str, b: &str) -> Option<u32> {
+fn hex_hamming_distance(a: &str, b: &str) -> Option<u32> {
     let left = parse_phash_hex(a)?;
     let right = parse_phash_hex(b)?;
     Some(hamming_distance(left, right))
@@ -276,7 +315,6 @@ mod tests {
     fn perception_hash_differs_for_unlike_images() {
         let dark = perception_hash(&solid_image([10, 10, 10], 200, 200));
         let bright = perception_hash(&solid_image([240, 240, 240], 200, 200));
-        // Gradient vs flat can collide on uniform colors; use patterned images
         let mut left = RgbImage::new(128, 128);
         let mut right = RgbImage::new(128, 128);
         for y in 0..128 {
@@ -288,7 +326,6 @@ mod tests {
         let h1 = perception_hash(&DynamicImage::ImageRgb8(left));
         let h2 = perception_hash(&DynamicImage::ImageRgb8(right));
         assert_ne!(h1, h2);
-        // solid dark/bright may share structure; ensure patterned differ
         let _ = (dark, bright);
     }
 
@@ -372,35 +409,77 @@ mod tests {
     }
 
     #[test]
-    fn near_duplicate_threshold_defaults_to_eight() {
-        // Avoid depending on ambient env in CI; function falls back to default
-        let _guard = env_lock();
-        std::env::remove_var(env_near_phash_max_distance);
-        assert_eq!(near_phash_max_distance(), default_near_phash_max_distance);
-        assert_eq!(default_near_phash_max_distance, 8);
+    fn near_duplicate_threshold_defaults_to_four() {
+        assert_eq!(default_near_phash_max_distance, 4);
+        assert_eq!(
+            resolve_near_phash_max_distance_from(None, None),
+            default_near_phash_max_distance
+        );
         let base = 0u64;
-        // Flip 8 bits → still near under default
-        let near = 0b1111_1111u64;
-        assert!(is_near_duplicate(base, near));
-        // Flip 9 bits → not near under default
-        let far = 0b1_1111_1111u64;
-        assert!(!is_near_duplicate(base, far));
-        assert_eq!(hex_hamming_distance("0000000000000000", "00000000000000ff"), Some(8));
-        assert_eq!(hex_hamming_distance("0000000000000000", "00000000000001ff"), Some(9));
+        // Flip 4 bits → still near under default
+        let near = 0b1111u64;
+        assert!(is_near_duplicate_with(base, near, 4));
+        assert_eq!(
+            classify_phash_distance(4, 4),
+            PhashMatchKind::Suspected
+        );
+        // Flip 5 bits → not near under default
+        let far = 0b1_1111u64;
+        assert!(!is_near_duplicate_with(base, far, 4));
+        assert_eq!(
+            classify_phash_distance(5, 4),
+            PhashMatchKind::Distinct
+        );
+        assert_eq!(
+            classify_phash_distance(0, 4),
+            PhashMatchKind::Exact
+        );
+        assert_eq!(
+            hex_hamming_distance("0000000000000000", "000000000000000f"),
+            Some(4)
+        );
+        assert_eq!(
+            hex_hamming_distance("0000000000000000", "000000000000001f"),
+            Some(5)
+        );
     }
 
     #[test]
-    fn near_phash_max_distance_reads_env_override() {
-        let _guard = env_lock();
-        std::env::set_var(env_near_phash_max_distance, "2");
-        assert_eq!(near_phash_max_distance(), 2);
-        std::env::remove_var(env_near_phash_max_distance);
+    fn resolve_prefers_env_over_settings_without_process_env() {
+        assert_eq!(
+            resolve_near_phash_max_distance_from(Some(8), Some("2")),
+            2
+        );
+        assert_eq!(
+            resolve_near_phash_max_distance_from(Some(8), None),
+            8
+        );
+        assert_eq!(
+            resolve_near_phash_max_distance_from(Some(8), Some("not-a-number")),
+            8
+        );
+        assert_eq!(
+            resolve_near_phash_max_distance_from(None, Some("3")),
+            3
+        );
     }
 
-    /// Serialize env mutations across tests in this module
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        #[allow(non_upper_case_globals)]
-        static env_mutex: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        env_mutex.lock().unwrap_or_else(|e| e.into_inner())
+    #[test]
+    fn identical_reencoded_different_clip_synthetic_hashes() {
+        // identical
+        assert_eq!(
+            classify_phash_distance(0, default_near_phash_max_distance),
+            PhashMatchKind::Exact
+        );
+        // re-encoded style: small hamming (2)
+        assert_eq!(
+            classify_phash_distance(2, default_near_phash_max_distance),
+            PhashMatchKind::Suspected
+        );
+        // different clip: high hamming
+        assert_eq!(
+            classify_phash_distance(12, default_near_phash_max_distance),
+            PhashMatchKind::Distinct
+        );
     }
 }

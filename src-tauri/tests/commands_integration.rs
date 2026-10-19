@@ -84,14 +84,20 @@ async fn scan_ingest_lists_files_and_rejects_empty_multi_scan() {
     let ignored = media.join("notes.txt");
     fs::write(&ignored, b"skip me").expect("write txt");
 
-    let err = scan_multiple_directories(Vec::new(), &fx.db, &fx.queue)
+    let settings = AppSettings::default();
+    let err = scan_multiple_directories(Vec::new(), &fx.db, &fx.queue, &settings)
         .await
         .expect_err("empty paths");
     assert!(err.contains("No directories provided"), "{err}");
 
-    let result = scan_directory(media.to_string_lossy().to_string(), &fx.db, &fx.queue)
-        .await
-        .expect("scan");
+    let result = scan_directory(
+        media.to_string_lossy().to_string(),
+        &fx.db,
+        &fx.queue,
+        &settings,
+    )
+    .await
+    .expect("scan");
     assert_eq!(result.imported_count, 1);
     assert_eq!(result.file_ids.len(), 1);
 
