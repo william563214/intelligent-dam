@@ -152,7 +152,13 @@ fn apply_near_phash_policy(
 ) -> Result<Option<NearPhashDecision>> {
     if allow_phash_tombstone {
         if let Some(ts) = db.get_duplicate_tombstone_by_phash(phash_hex)? {
-            if !db.has_metadata_row(file_id)? {
+            // Never tombstone-delete the keeper row itself
+            if ts.keeper_id == Some(file_id) {
+                eprintln!(
+                    "phash dedup: skip phash tombstone for keeper file_id {} (tombstone id={})",
+                    file_id, ts.id
+                );
+            } else if !db.has_metadata_row(file_id)? {
                 let orphan_path = db.get_file_by_id(file_id)?.path;
                 eprintln!(
                     "phash dedup: tombstone hit for provisional file_id {} path {} phash {}; \
@@ -224,7 +230,7 @@ fn apply_exact_dedup(
                 db,
                 file_id,
                 other_id,
-                distance.max(1),
+                distance,
                 phash_hex,
                 write_phash_on_suspected,
             )
@@ -277,7 +283,16 @@ fn apply_near_suspect(
     phash_hex: &str,
     write_phash_on_suspected: bool,
 ) -> Result<Option<NearPhashDecision>> {
-    let (victim_id, keeper_id) = db.choose_near_suspect_victim(file_id, other_id)?;
+    let Some((victim_id, keeper_id)) = db.choose_near_suspect_victim(file_id, other_id)? else {
+        eprintln!(
+            "phash dedup: both sides busy for file_id {} other {} — defer suspect mark",
+            file_id, other_id
+        );
+        if write_phash_on_suspected {
+            let _ = db.update_file_phash(file_id, phash_hex);
+        }
+        return Ok(None);
+    };
 
     if db.is_ignored_suspected_pair(victim_id, keeper_id)? {
         eprintln!(
@@ -1422,16 +1437,13 @@ mod tests {
         .expect("write");
         assert!(db.get_file_by_id(a).is_ok());
         assert!(db.get_file_by_id(b).is_ok());
-        // Prefer flagging un-organized — both organized → still flags larger as suspected
         let flagged = db
             .get_pending_suspected_duplicate(b)
             .unwrap()
-            .or_else(|| db.get_pending_suspected_duplicate(a).unwrap());
-        assert!(flagged.is_some(), "both organized exact → suspected");
-        assert!(matches!(
-            out[0].1,
-            PhashApplyOutcome::SuspectedDuplicate { .. } | PhashApplyOutcome::Written
-        ));
+            .expect("b (larger) flagged");
+        assert_eq!(flagged.keeper_id, a);
+        assert_eq!(flagged.distance, 0);
+        assert_eq!(out[0].1, PhashApplyOutcome::Written);
     }
 
     #[test]
@@ -1447,6 +1459,7 @@ mod tests {
                 Some("dddddddddddddddd".into()),
             )
             .expect("newer");
+        let newer_status_before = db.get_file_by_id(newer).unwrap().status;
         db.insert_job(&crate::database::NewJobRow {
             status: "running",
             job_type: "pipeline",
@@ -1468,6 +1481,17 @@ mod tests {
         .expect("write");
         assert!(db.get_file_by_id(newer).is_ok());
         assert!(db.get_file_by_id(older).is_ok());
+        assert_eq!(
+            db.get_file_by_id(older).unwrap().status,
+            file_status::suspected_duplicate,
+            "non-busy row flagged"
+        );
+        assert_eq!(
+            db.get_file_by_id(newer).unwrap().status,
+            newer_status_before,
+            "busy row status unchanged"
+        );
+        assert!(db.get_pending_suspected_duplicate(newer).unwrap().is_none());
     }
 
     #[test]
@@ -1496,6 +1520,7 @@ mod tests {
         .expect("meta");
         let (victim, keeper) = db
             .choose_near_suspect_victim(older, newer)
+            .unwrap()
             .expect("choose");
         assert_eq!((victim, keeper), (older, newer));
         write_phashes(
@@ -1513,6 +1538,180 @@ mod tests {
             db.get_file_by_id(newer).unwrap().status,
             file_status::suspected_duplicate
         );
+    }
+
+    #[test]
+    fn active_pipeline_job_matches_exact_file_id_not_prefix() {
+        let db = open_memory_db();
+        let id1 = db.insert_file("/tmp/id1.mp4", 1, None).expect("1");
+        assert_eq!(id1, 1);
+        db.insert_job(&crate::database::NewJobRow {
+            status: "running",
+            job_type: "pipeline",
+            payload: "{\"file_id\":12}",
+            attempts: 0,
+            max_attempts: 3,
+            error: None,
+            retryable: true,
+        })
+        .expect("job");
+        assert!(
+            !db.has_active_pipeline_job(1).unwrap(),
+            "file_id 1 must not match payload file_id 12"
+        );
+        assert!(db.has_active_pipeline_job(12).unwrap());
+    }
+
+    #[test]
+    fn keeper_busy_still_deletes_provisional_newer_exact() {
+        let db = open_memory_db();
+        let older = db
+            .insert_file(
+                "/tmp/keeper-busy.mp4",
+                1,
+                Some("ffffffffffffffff".into()),
+            )
+            .expect("older");
+        db.insert_job(&crate::database::NewJobRow {
+            status: "running",
+            job_type: "pipeline",
+            payload: &format!("{{\"file_id\":{older}}}"),
+            attempts: 0,
+            max_attempts: 3,
+            error: None,
+            retryable: true,
+        })
+        .expect("job");
+        let newer = db
+            .insert_file("/tmp/new-dup.mp4", 2, None)
+            .expect("newer");
+        assert!(db.has_active_pipeline_job(older).unwrap());
+        let plan = db
+            .choose_exact_dedup_victim(newer, older)
+            .unwrap()
+            .expect("delete newer");
+        assert_eq!(plan, (newer, older));
+        let out = write_phashes(
+            &db,
+            &[(newer, Some("ffffffffffffffff".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_file_by_id(newer).is_err());
+        assert!(db.get_file_by_id(older).is_ok());
+        assert!(matches!(
+            out[0].1,
+            PhashApplyOutcome::SkippedDuplicate { .. }
+        ));
+    }
+
+    #[test]
+    fn move_only_succeeded_pipeline_counts_as_organized() {
+        let db = open_memory_db();
+        let older = db
+            .insert_file("/tmp/move-older.mp4", 1, None)
+            .expect("older");
+        let newer = db
+            .insert_file(
+                "/tmp/move-newer.mp4",
+                2,
+                Some("0123456789abcdef".into()),
+            )
+            .expect("newer");
+        // Move-only: no Metadata, but succeeded pipeline job
+        db.insert_job(&crate::database::NewJobRow {
+            status: "succeeded",
+            job_type: "pipeline",
+            payload: &format!("{{\"file_id\":{newer}}}"),
+            attempts: 1,
+            max_attempts: 3,
+            error: None,
+            retryable: true,
+        })
+        .expect("job");
+        assert!(db.is_organized_file(newer).unwrap());
+        assert!(!db.has_metadata_row(newer).unwrap());
+        let out = write_phashes(
+            &db,
+            &[(older, Some("0123456789abcdef".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(
+            db.get_file_by_id(newer).is_ok(),
+            "move-only organized newer must not be deleted"
+        );
+        assert!(db.get_file_by_id(older).is_err());
+        assert!(matches!(
+            out[0].1,
+            PhashApplyOutcome::SkippedDuplicate { .. }
+        ));
+    }
+
+    #[test]
+    fn near_both_busy_defers_suspect_mark() {
+        let db = open_memory_db();
+        let a = db
+            .insert_file("/tmp/both-busy-a.mp4", 1, Some("0000000000000000".into()))
+            .expect("a");
+        let b = db
+            .insert_file("/tmp/both-busy-b.mp4", 2, Some("000000000000000f".into()))
+            .expect("b");
+        for id in [a, b] {
+            db.insert_job(&crate::database::NewJobRow {
+                status: "queued",
+                job_type: "pipeline",
+                payload: &format!("{{\"file_id\":{id}}}"),
+                attempts: 0,
+                max_attempts: 3,
+                error: None,
+                retryable: true,
+            })
+            .expect("job");
+        }
+        assert!(db
+            .choose_near_suspect_victim(a, b)
+            .unwrap()
+            .is_none());
+        write_phashes(
+            &db,
+            &[(a, Some("000000000000000f".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_pending_suspected_duplicate(a).unwrap().is_none());
+        assert!(db.get_pending_suspected_duplicate(b).unwrap().is_none());
+    }
+
+    #[test]
+    fn phash_tombstone_skips_keeper_id() {
+        let db = open_memory_db();
+        let keeper = db
+            .insert_file(
+                "/tmp/ts-keeper.mp4",
+                1,
+                Some("9999999999999999".into()),
+            )
+            .expect("k");
+        db.insert_duplicate_tombstone(
+            "/tmp/ts-path.mp4",
+            1,
+            Some("9999999999999999"),
+            Some(keeper),
+        )
+        .expect("ts");
+        let out = write_phashes(
+            &db,
+            &[(keeper, Some("9999999999999999".into()))],
+            None,
+            test_near_phash_max_distance,
+        )
+        .expect("write");
+        assert!(db.get_file_by_id(keeper).is_ok());
+        assert_eq!(out[0].1, PhashApplyOutcome::Written);
     }
 
     #[test]
@@ -1611,7 +1810,7 @@ mod tests {
     #[test]
     fn phash_tombstone_removes_provisional_without_metadata() {
         let db = open_memory_db();
-        db.insert_duplicate_tombstone("/tmp/old2.mp4", 1, Some("2222222222222222"), Some(1))
+        db.insert_duplicate_tombstone("/tmp/old2.mp4", 1, Some("2222222222222222"), Some(99))
             .expect("ts");
         let provisional = db
             .insert_file(
@@ -1620,6 +1819,7 @@ mod tests {
                 None,
             )
             .expect("file");
+        assert_ne!(provisional, 99);
         let out = write_phashes(
             &db,
             &[(provisional, Some("2222222222222222".into()))],
@@ -1630,7 +1830,7 @@ mod tests {
         assert!(matches!(
             out[0].1,
             PhashApplyOutcome::Tombstoned {
-                keeper_id: Some(1),
+                keeper_id: Some(99),
                 ..
             }
         ));
