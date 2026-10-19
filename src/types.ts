@@ -25,10 +25,17 @@ export interface Tag {
   category: string | null;
 }
 
+export interface SuspectedDuplicateInfo {
+  keeperId: number;
+  keeperPath: string;
+  distance: number;
+}
+
 export interface FileWithMetadata {
   file: FileRecord;
   metadata: Metadata | null;
   tags: Tag[];
+  suspectedDuplicate?: SuspectedDuplicateInfo | null;
 }
 
 export interface ScanResult {
@@ -48,6 +55,8 @@ export interface AppSettings {
   avdcPath: string;
   stashdbUrl: string;
   outputTemplate: string;
+  /** Max Hamming distance for near-phash suspected matches (default 4) */
+  nearPhashMaxDistance: number;
 }
 
 export interface WatcherStatus {

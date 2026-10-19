@@ -132,6 +132,7 @@ pub async fn scan_directory(
     path: String,
     db: &Arc<Mutex<Database>>,
     queue: &TaskQueue,
+    settings: &AppSettings,
 ) -> Result<ScanResult, String> {
     // Directory walk off the async runtime; no DB lock held.
     let scanned = tokio::task::spawn_blocking(move || scanner::scan_directory(path))
@@ -139,7 +140,7 @@ pub async fn scan_directory(
         .map_err(|e| format!("Scan task join failed: {}", e))?
         .map_err(|e| format!("Scan failed: {}", e))?;
 
-    finish_scan_import(db, queue, scanned).await
+    finish_scan_import(db, queue, scanned, settings).await
 }
 
 /// Scan multiple directories and ingest. Empty `paths` is an error.
@@ -147,6 +148,7 @@ pub async fn scan_multiple_directories(
     paths: Vec<String>,
     db: &Arc<Mutex<Database>>,
     queue: &TaskQueue,
+    settings: &AppSettings,
 ) -> Result<ScanResult, String> {
     if paths.is_empty() {
         return Err("No directories provided".to_string());
@@ -156,23 +158,26 @@ pub async fn scan_multiple_directories(
         .await
         .map_err(|e| format!("Scan task join failed: {}", e))?;
 
-    finish_scan_import(db, queue, scanned).await
+    finish_scan_import(db, queue, scanned, settings).await
 }
 
 async fn finish_scan_import(
     db: &Arc<Mutex<Database>>,
     queue: &TaskQueue,
     scanned: Vec<scanner::ScannedFile>,
+    settings: &AppSettings,
 ) -> Result<ScanResult, String> {
     let suppressions = queue.path_suppressions().ok();
     let supp_ref = suppressions.as_deref();
+
+    let max_distance = settings.effective_near_phash_max_distance();
 
     // Short lock: insert rows (null phash ok; COALESCE keeps existing).
     let (imported, jobs) = {
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::import_files_pending_phash(&db, &scanned, supp_ref)
+        scanner::import_files_pending_phash(&db, &scanned, supp_ref, max_distance)
             .map_err(|e| format!("Import failed: {}", e))?
     };
 
@@ -185,7 +190,7 @@ async fn finish_scan_import(
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::write_phashes(&db, &results, supp_ref)
+        scanner::write_phashes(&db, &results, supp_ref, max_distance)
             .map_err(|e| format!("Failed to write phash: {}", e))?;
     }
 
@@ -217,6 +222,85 @@ pub fn get_all_files(db: &Arc<Mutex<Database>>) -> Result<Vec<FileWithMetadata>,
         .map_err(|e| format!("Failed to get files: {}", e))
 }
 
+/// Confirm or ignore a near-phash suspected duplicate.
+///
+/// - `confirm`: treat as duplicate — delete provisional row + PathSuppress (exact-dup path)
+/// - `ignore`: clear suspicion, set status ready (caller may enqueue pipeline)
+pub fn resolve_suspected_duplicate(
+    db: &Arc<Mutex<Database>>,
+    queue: &TaskQueue,
+    file_id: i64,
+    action: &str,
+) -> Result<FileWithMetadata, String> {
+    let action = action.trim().to_lowercase();
+    if action != "confirm" && action != "ignore" {
+        return Err(format!(
+            "invalid action '{action}' (expected confirm or ignore)"
+        ));
+    }
+
+    let suppressions = queue.path_suppressions().ok();
+
+    let resolution = if action == "confirm" {
+        "confirmed"
+    } else {
+        "ignored"
+    };
+
+    let orphan_path = {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let file = guard
+            .get_file_by_id(file_id)
+            .map_err(|e| format!("File not found: {}", e))?;
+        if file.status != file_status::suspected_duplicate {
+            return Err(format!(
+                "file {} is not suspected_duplicate (status={})",
+                file_id, file.status
+            ));
+        }
+        let pending = guard
+            .get_pending_suspected_duplicate(file_id)
+            .map_err(|e| format!("Failed to read suspicion: {}", e))?
+            .ok_or_else(|| format!("no pending suspicion for file {}", file_id))?;
+        let _ = pending;
+        let path = file.path.clone();
+        guard
+            .resolve_suspected_duplicate(file_id, resolution)
+            .map_err(|e| format!("Failed to resolve suspicion: {}", e))?;
+
+        if action == "confirm" {
+            guard
+                .delete_file_record(file_id)
+                .map_err(|e| format!("Failed to delete confirmed duplicate: {}", e))?;
+            Some(path)
+        } else {
+            None
+        }
+    };
+
+    if let (Some(path), Some(supp)) = (orphan_path, suppressions) {
+        supp.suppress(std::path::Path::new(&path));
+    }
+
+    if action == "confirm" {
+        // Row gone — return a minimal tombstone-style error for the UI to refresh
+        return Err("confirmed: duplicate removed".to_string());
+    }
+
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    let files = guard
+        .get_files_with_metadata()
+        .map_err(|e| format!("Failed to reload files: {}", e))?;
+    files
+        .into_iter()
+        .find(|f| f.file.id == file_id)
+        .ok_or_else(|| format!("file {} missing after ignore", file_id))
+}
+
 /// Load settings from the store (defaults when missing).
 pub fn get_settings(settings_store: &Mutex<SettingsStore>) -> Result<AppSettings, String> {
     let store = settings_store
@@ -236,6 +320,7 @@ pub fn save_settings(
     if !settings.avdc_path.trim().is_empty() {
         settings.avdc_path = canonicalize_user_path(&settings.avdc_path);
     }
+    settings.normalize_for_save();
 
     {
         let store = settings_store
@@ -341,8 +426,10 @@ pub async fn scan_directory_command(
     path: String,
     db: State<'_, Arc<Mutex<Database>>>,
     queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<ScanResult, String> {
-    scan_directory(path, &db, &queue).await
+    let settings = get_settings(&settings_store)?;
+    scan_directory(path, &db, &queue, &settings).await
 }
 
 #[tauri::command]
@@ -350,8 +437,10 @@ pub async fn scan_multiple_directories_command(
     paths: Vec<String>,
     db: State<'_, Arc<Mutex<Database>>>,
     queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<ScanResult, String> {
-    scan_multiple_directories(paths, &db, &queue).await
+    let settings = get_settings(&settings_store)?;
+    scan_multiple_directories(paths, &db, &queue, &settings).await
 }
 
 #[tauri::command]
@@ -359,6 +448,20 @@ pub async fn get_all_files_command(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<Vec<FileWithMetadata>, String> {
     get_all_files(&db)
+}
+
+#[tauri::command]
+pub async fn resolve_suspected_duplicate_command(
+    file_id: i64,
+    action: String,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+) -> Result<Option<FileWithMetadata>, String> {
+    match resolve_suspected_duplicate(&db, &queue, file_id, &action) {
+        Ok(file) => Ok(Some(file)),
+        Err(msg) if msg.starts_with("confirmed:") => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 #[tauri::command]
@@ -861,7 +964,7 @@ pub fn enqueue_pipeline_jobs(
                 .map_err(|e| format!("Database lock error: {}", e))?;
             match guard.get_file_by_id(file_id) {
                 Ok(file) => {
-                    if file.status == file_status::missing {
+                    if file_status::blocks_auto_pipeline(&file.status) {
                         skipped += 1;
                         continue;
                     }

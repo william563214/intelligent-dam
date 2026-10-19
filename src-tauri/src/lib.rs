@@ -190,6 +190,7 @@ pub fn run() {
             commands::clear_error_logs_command,
             commands::enqueue_pipeline_jobs_command,
             commands::organize_eligible_files_command,
+            commands::resolve_suspected_duplicate_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

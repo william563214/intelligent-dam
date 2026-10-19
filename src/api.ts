@@ -25,6 +25,14 @@ export async function getAllFiles(): Promise<FileWithMetadata[]> {
   return await invoke("get_all_files_command");
 }
 
+/** Confirm or ignore a near-phash suspected duplicate. Returns null when confirmed (row removed). */
+export async function resolveSuspectedDuplicate(
+  fileId: number,
+  action: "confirm" | "ignore"
+): Promise<FileWithMetadata | null> {
+  return await invoke("resolve_suspected_duplicate_command", { fileId, action });
+}
+
 export async function scrapeFile(
   fileId: number,
   avdcPath?: string,
