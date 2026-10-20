@@ -493,16 +493,19 @@ mod tests {
             let mut file = File::create(&path_for_writer).unwrap();
             for chunk in 0..8u8 {
                 file.write_all(&[chunk; 64]).unwrap();
-                file.flush().unwrap();
-                thread::sleep(Duration::from_millis(50));
+                // sync_all so size is visible to pollers (macOS CI was racing on flush)
+                file.sync_all().unwrap();
+                // Grow faster than the stable window (4 * 40ms) so mid-write
+                // samples cannot look stable under scheduler jitter
+                thread::sleep(Duration::from_millis(15));
             }
             *done_flag.lock().unwrap() = true;
         });
 
         let opts = StabilityOptions {
-            poll_interval: Duration::from_millis(30),
-            stable_checks: 3,
-            timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(40),
+            stable_checks: 4,
+            timeout: Duration::from_secs(8),
             missing_grace: Duration::from_secs(1),
             held_degrade_after: Duration::from_secs(30),
         };
@@ -511,6 +514,7 @@ mod tests {
         writer.join().unwrap();
         assert!(*done.lock().unwrap());
         assert_eq!(size, 8 * 64);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 8 * 64);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -518,32 +522,26 @@ mod tests {
     #[test]
     fn mtime_change_resets_stability_even_when_size_unchanged() {
         let path = unique_temp_file("mtime");
-        fs::write(&path, b"same-size-payload!!").unwrap();
+        let payload = b"same-size-payload!!";
+        fs::write(&path, payload).unwrap();
 
         let path_for_bumper = path.clone();
         let stop = Arc::new(Mutex::new(false));
         let stop_flag = Arc::clone(&stop);
 
         let bumper = thread::spawn(move || {
-            // Keep size fixed but bump mtime so the gate must not declare stable
-            let mut tick = 0u64;
+            // Keep size fixed but bump mtime so the gate must not declare stable.
+            // Rewrite same bytes (more reliable than set_modified on macOS APFS).
             while !*stop_flag.lock().unwrap() {
-                tick += 1;
-                let file = File::options()
-                    .write(true)
-                    .open(&path_for_bumper)
-                    .expect("open for mtime bump");
-                let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + tick);
-                file.set_modified(base).expect("set_modified");
-                drop(file);
-                thread::sleep(Duration::from_millis(35));
+                fs::write(&path_for_bumper, payload).unwrap();
+                thread::sleep(Duration::from_millis(20));
             }
         });
 
         let opts = StabilityOptions {
             poll_interval: Duration::from_millis(25),
             stable_checks: 3,
-            timeout: Duration::from_millis(400),
+            timeout: Duration::from_millis(600),
             missing_grace: Duration::from_millis(100),
             held_degrade_after: Duration::from_secs(30),
         };
@@ -563,7 +561,7 @@ mod tests {
             held_degrade_after: Duration::from_secs(30),
         };
         let size = wait_until_stable(&path, &settle, || false).expect("after settle");
-        assert_eq!(size, b"same-size-payload!!".len() as u64);
+        assert_eq!(size, payload.len() as u64);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
