@@ -2079,58 +2079,51 @@ impl Database {
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
             // S1: re-query who currently owns desired_path (stale occupant_file_id ignored)
+            // Same-file / hardlink: displace + missing (do not delete Metadata/FileTags).
+            // Clear occupant_file_id FKs first so a pending PathCollisions row that
+            // referenced this occupant cannot block the transaction after FS move.
             if let Some(occupant) = self.find_file_occupying_path(&new_path, mover_id)? {
-                if same_file_overwrite {
-                    // Hard link / case-only: same inode as mover. Drop the duplicate
-                    // library row (displacing to a fake path would just be marked
-                    // missing on the next reconcile / get_files_with_metadata).
-                    let occ_path = occupant.path.clone();
-                    let occ_id = occupant.id;
-                    self.conn.execute(
-                        "UPDATE PathCollisions SET occupant_file_id = NULL
-                         WHERE occupant_file_id = ?1",
-                        params![occ_id],
-                    )?;
-                    self.delete_file_record_inner(occ_id)?;
-                    let _ = self.insert_error_log(
-                        "path_collision",
-                        Some(occ_id),
-                        Some(&occ_path),
-                        "occupant row removed (same-file hardlink or case-only overwrite)",
-                        Some(&format!("mover_id={mover_id} same_file=true")),
-                    );
-                } else {
-                    let displaced = normalize_db_path(&format!(
-                        "{}#displaced-{}",
-                        occupant.path, occupant.id
-                    ));
-                    self.conn.execute(
-                        "UPDATE Files SET path = ?1 WHERE id = ?2",
-                        params![displaced, occupant.id],
-                    )?;
-                    if occupant.status != file_status::missing {
-                        if !file_status::can_transition(&occupant.status, file_status::missing) {
-                            return Err(rusqlite::Error::InvalidParameterName(format!(
-                                "illegal status transition: {} -> missing",
-                                occupant.status
-                            )));
-                        }
-                        self.conn.execute(
-                            "UPDATE Files SET status = ?1 WHERE id = ?2",
-                            params![file_status::missing, occupant.id],
-                        )?;
+                self.conn.execute(
+                    "UPDATE PathCollisions SET occupant_file_id = NULL
+                     WHERE occupant_file_id = ?1",
+                    params![occupant.id],
+                )?;
+                let displaced = normalize_db_path(&format!(
+                    "{}#displaced-{}",
+                    occupant.path, occupant.id
+                ));
+                self.conn.execute(
+                    "UPDATE Files SET path = ?1 WHERE id = ?2",
+                    params![displaced, occupant.id],
+                )?;
+                if occupant.status != file_status::missing {
+                    if !file_status::can_transition(&occupant.status, file_status::missing) {
+                        return Err(rusqlite::Error::InvalidParameterName(format!(
+                            "illegal status transition: {} -> missing",
+                            occupant.status
+                        )));
                     }
-                    // #59: record that an occupant library row was overwritten
-                    let _ = self.insert_error_log(
-                        "path_collision",
-                        Some(occupant.id),
-                        Some(&occupant.path),
-                        "occupant row overwritten by path collision resolve",
-                        Some(&format!(
-                            "mover_id={mover_id} displaced_to={displaced}"
-                        )),
-                    );
+                    self.conn.execute(
+                        "UPDATE Files SET status = ?1 WHERE id = ?2",
+                        params![file_status::missing, occupant.id],
+                    )?;
                 }
+                let message = if same_file_overwrite {
+                    // Nit: on Linux hardlink rename may leave the original path
+                    // still present so a later rescan can re-import that path
+                    "occupant row overwritten (same-file hardlink or case-only)"
+                } else {
+                    "occupant row overwritten by path collision resolve"
+                };
+                let _ = self.insert_error_log(
+                    "path_collision",
+                    Some(occupant.id),
+                    Some(&occupant.path),
+                    message,
+                    Some(&format!(
+                        "mover_id={mover_id} displaced_to={displaced} same_file={same_file_overwrite}"
+                    )),
+                );
             }
 
             let mover = self.get_file_by_id(mover_id)?;
@@ -2749,6 +2742,26 @@ impl Database {
             params![category, file_id, path, message, detail],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// True when an ErrorLog row already exists for this category+path+message (S2)
+    pub fn has_error_log_entry(
+        &self,
+        category: &str,
+        path: Option<&str>,
+        message: &str,
+    ) -> SqliteResult<bool> {
+        let flag: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM ErrorLog
+                WHERE category = ?1
+                  AND IFNULL(path, '') = IFNULL(?2, '')
+                  AND message = ?3
+            )",
+            params![category, path, message],
+            |row| row.get(0),
+        )?;
+        Ok(flag != 0)
     }
 
     /// Insert a queued job row; returns new `Jobs.id`

@@ -149,6 +149,15 @@ pub fn is_windows_reserved_device_name(segment: &str) -> bool {
 /// Strip characters that are illegal or awkward in path segments
 /// Windows reserved device names get a trailing `_` (e.g. `CON.mp4` → `CON.mp4_`)
 pub fn sanitize_segment(raw: &str) -> String {
+    sanitize_segment_inner(raw, false)
+}
+
+/// Like `sanitize_segment` but keeps a trailing extension when capping to 255 bytes
+pub fn sanitize_filename_segment(raw: &str) -> String {
+    sanitize_segment_inner(raw, true)
+}
+
+fn sanitize_segment_inner(raw: &str, preserve_extension: bool) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -161,15 +170,26 @@ pub fn sanitize_segment(raw: &str) -> String {
             c => out.push(c),
         }
     }
-    // Collapse runs of dots / spaces at ends of the segment
-    let mut out = out
+    out = finish_segment_cleanup(out);
+    // #59: each path component must fit common FS name limits
+    out = if preserve_extension {
+        cap_filename_utf8_bytes(&out, max_path_segment_bytes)
+    } else {
+        cap_segment_utf8_bytes(&out, max_path_segment_bytes)
+    };
+    // Re-run trailing cleanup + reserved-name after byte cap (S3)
+    finish_segment_cleanup(out)
+}
+
+fn finish_segment_cleanup(raw: String) -> String {
+    let mut out = raw
         .trim_matches(|c: char| c == '.' || c == ' ')
         .to_string();
-    if is_windows_reserved_device_name(&out) {
+    // Skip if we already appended `_` (e.g. CON.mp4_ stem is still CON)
+    if is_windows_reserved_device_name(&out) && !out.ends_with('_') {
         out.push('_');
     }
-    // #59: each path component must fit common FS name limits
-    cap_segment_utf8_bytes(&out, max_path_segment_bytes)
+    out
 }
 
 /// Truncate on UTF-8 char boundaries so the result is at most `max_bytes` long
@@ -182,6 +202,30 @@ fn cap_segment_utf8_bytes(raw: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     raw[..end].to_string()
+}
+
+/// Cap a filename by shortening the stem only so the extension is preserved
+fn cap_filename_utf8_bytes(raw: &str, max_bytes: usize) -> String {
+    if raw.len() <= max_bytes {
+        return raw.to_string();
+    }
+    let path = Path::new(raw);
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    if ext.len() >= max_bytes {
+        // Extension alone does not fit keep a truncated whole name
+        return cap_segment_utf8_bytes(raw, max_bytes);
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(raw);
+    let stem_budget = max_bytes - ext.len();
+    let capped_stem = cap_segment_utf8_bytes(stem, stem_budget);
+    format!("{capped_stem}{ext}")
 }
 
 /// Extract a release-style code from a stem e.g. `ABC-123` or `abc_123`
@@ -420,13 +464,24 @@ pub fn render_output_path(
     let absolute = is_absolute_rendered(&rendered);
     let windows_drive = windows_drive_prefix(&rendered);
 
-    // Sanitize each path component after rendering
-    let parts: Vec<String> = rendered
+    // Sanitize each path component after rendering last segment keeps extension (S3)
+    let raw_parts: Vec<&str> = rendered
         .split('/')
         .filter(|p| !p.is_empty() && *p != "." && *p != "..")
         // Drop Windows drive token from parts list we rebuild it below
         .filter(|p| !is_windows_drive_token(p))
-        .map(sanitize_segment)
+        .collect();
+    let last_idx = raw_parts.len().saturating_sub(1);
+    let parts: Vec<String> = raw_parts
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| {
+            if i == last_idx {
+                sanitize_filename_segment(p)
+            } else {
+                sanitize_segment(p)
+            }
+        })
         .filter(|p| !p.is_empty())
         .collect();
 
@@ -578,14 +633,7 @@ fn is_windows_drive_token(part: &str) -> bool {
 }
 
 /// Ensure destination is unique by appending `_N` before the extension
-/// Only checks the filesystem; prefer `unique_destination_avoiding` when a DB
-/// occupancy predicate is available (#59)
-#[allow(dead_code)]
-pub fn unique_destination(desired: &Path) -> PathBuf {
-    unique_destination_avoiding(desired, |p| p.exists())
-}
-
-/// Like `unique_destination` but `is_taken` may also reject DB-owned paths (#59)
+/// `is_taken` may reject filesystem and DB-owned paths (#59)
 pub fn unique_destination_avoiding<F>(desired: &Path, is_taken: F) -> PathBuf
 where
     F: Fn(&Path) -> bool,
@@ -673,34 +721,63 @@ pub fn primary_idam_bak_path(dest: &Path) -> PathBuf {
     parent.join(format!("{name}{idam_bak_suffix}"))
 }
 
-/// Locate an existing occupant backup beside `dest` (primary or `.idam-bak-N`)
-pub fn find_occupant_bak(dest: &Path) -> Option<PathBuf> {
+/// Result of looking up occupant `.idam-bak` beside an overwrite destination (B1)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OccupantBakLookup {
+    /// Only the primary `name.idam-bak` exists
+    Primary(PathBuf),
+    /// No bak beside dest
+    Missing,
+    /// Numbered `.idam-bak-N` present (alone or with primary) refuse recovery
+    Ambiguous { extras: Vec<PathBuf> },
+}
+
+/// Crash recovery accepts only the main-name `.idam-bak` (never `-N` lexicographic pick)
+pub fn lookup_occupant_bak(dest: &Path) -> OccupantBakLookup {
     let primary = primary_idam_bak_path(dest);
-    if primary.is_file() {
-        return Some(primary);
-    }
-    let parent = dest.parent()?;
-    let name = dest.file_name()?.to_str()?;
-    let prefix = format!("{name}{idam_bak_suffix}-");
-    let mut matches: Vec<PathBuf> = Vec::new();
-    let entries = fs::read_dir(parent).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let fname = entry.file_name();
-        let Some(fname) = fname.to_str() else {
-            continue;
+    let primary_ok = primary.is_file();
+    let mut extras: Vec<PathBuf> = Vec::new();
+    let Some(parent) = dest.parent() else {
+        return if primary_ok {
+            OccupantBakLookup::Primary(primary)
+        } else {
+            OccupantBakLookup::Missing
         };
-        if let Some(num) = fname.strip_prefix(&prefix) {
-            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
-                matches.push(path);
+    };
+    let Some(name) = dest.file_name().and_then(|s| s.to_str()) else {
+        return if primary_ok {
+            OccupantBakLookup::Primary(primary)
+        } else {
+            OccupantBakLookup::Missing
+        };
+    };
+    let prefix = format!("{name}{idam_bak_suffix}-");
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let fname = entry.file_name();
+            let Some(fname) = fname.to_str() else {
+                continue;
+            };
+            if let Some(num) = fname.strip_prefix(&prefix) {
+                if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                    extras.push(path);
+                }
             }
         }
     }
-    matches.sort();
-    matches.into_iter().next()
+    extras.sort();
+    if !extras.is_empty() {
+        return OccupantBakLookup::Ambiguous { extras };
+    }
+    if primary_ok {
+        OccupantBakLookup::Primary(primary)
+    } else {
+        OccupantBakLookup::Missing
+    }
 }
 
 /// Walk configured library roots for leftover overwrite sidecars (#59)
@@ -1251,7 +1328,7 @@ mod tests {
         let dir = unique_temp_dir("uniq");
         let first = dir.join("clip.mp4");
         fs::write(&first, b"a").unwrap();
-        let next = unique_destination(&first);
+        let next = unique_destination_avoiding(&first, |p| p.exists());
         assert_eq!(next, dir.join("clip_2.mp4"));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1401,6 +1478,49 @@ mod tests {
         let out = sanitize_segment(&long);
         assert!(out.len() <= max_path_segment_bytes);
         assert_eq!(out.len(), max_path_segment_bytes);
+    }
+
+    #[test]
+    fn sanitize_filename_segment_keeps_extension_when_capping() {
+        let stem = "a".repeat(300);
+        let raw = format!("{stem}.mp4");
+        let out = sanitize_filename_segment(&raw);
+        assert!(out.len() <= max_path_segment_bytes);
+        assert!(
+            out.ends_with(".mp4"),
+            "extension must survive byte cap got {out}"
+        );
+        assert_eq!(out.len(), max_path_segment_bytes);
+    }
+
+    #[test]
+    fn sanitize_filename_segment_reruns_reserved_name_after_cap() {
+        // Reserved device name still gets trailing _ after cleanup pass
+        let out = sanitize_filename_segment("CON.mp4");
+        assert_eq!(out, "CON.mp4_");
+    }
+
+    #[test]
+    fn lookup_occupant_bak_refuses_numbered_sidecars() {
+        let dir = unique_temp_dir("bak_lookup");
+        let dest = dir.join("Demo.mp4");
+        fs::write(&dest, b"x").unwrap();
+        let primary = dir.join("Demo.mp4.idam-bak");
+        let numbered = dir.join("Demo.mp4.idam-bak-2");
+        fs::write(&primary, b"old").unwrap();
+        fs::write(&numbered, b"old2").unwrap();
+        match lookup_occupant_bak(&dest) {
+            OccupantBakLookup::Ambiguous { extras } => {
+                assert!(extras.iter().any(|p| p == &numbered));
+            }
+            other => panic!("expected Ambiguous got {other:?}"),
+        }
+        fs::remove_file(&numbered).unwrap();
+        match lookup_occupant_bak(&dest) {
+            OccupantBakLookup::Primary(p) => assert_eq!(p, primary),
+            other => panic!("expected Primary got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

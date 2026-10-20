@@ -609,7 +609,10 @@ pub fn resolve_path_collision(
     }
 }
 
-/// Finish an overwrite whose filesystem step already succeeded before a crash (#59 N4)
+/// Finish an overwrite whose filesystem step already succeeded before a crash (#59 N4 / B1)
+///
+/// Never auto-deletes `.idam-bak` — that file is the occupant's only copy until the
+/// user cleans it up. Recovery accepts only the primary bak name.
 fn complete_crashed_overwrite(
     db: &Arc<Mutex<Database>>,
     file_id: i64,
@@ -618,70 +621,112 @@ fn complete_crashed_overwrite(
     mover_size: u64,
     mover_phash: Option<&str>,
 ) -> Result<ResolvePathCollisionOutcome, String> {
-    let bak = path_template::find_occupant_bak(desired);
-    if !desired.is_file() || bak.is_none() {
-        let guard = db
-            .lock()
-            .map_err(|e| format!("Database lock error: {}", e))?;
-        let _ = guard.update_file_status(file_id, file_status::missing);
+    let source = Path::new(source_path_str);
+    // Offline volume: do not mark missing (same rule as #60 S4)
+    if !pipeline::source_parent_reachable(source) {
         return Err(format!(
-            "File missing on disk and overwrite crash recovery not possible: {source_path_str}"
+            "overwrite crash recovery deferred: source parent unreachable (retryable): {source_path_str}"
         ));
     }
-    let bak = bak.expect("checked");
-    let dest_meta = std::fs::metadata(desired)
-        .map_err(|e| format!("Failed to stat desired path: {e}"))?;
-    if dest_meta.len() != mover_size {
-        let guard = db
-            .lock()
-            .map_err(|e| format!("Database lock error: {}", e))?;
-        let _ = guard.insert_error_log(
-            "path_collision",
-            Some(file_id),
-            desired.to_str(),
-            "overwrite crash recovery refused: destination size does not match mover",
-            Some(&format!(
-                "source={source_path_str} dest={} db_size={mover_size} dest_size={}",
-                desired.display(),
-                dest_meta.len()
-            )),
-        );
-        return Err(
-            "overwrite crash recovery refused: destination size does not match mover".into(),
-        );
+
+    match path_template::lookup_occupant_bak(desired) {
+        path_template::OccupantBakLookup::Ambiguous { extras } => {
+            let detail = format!(
+                "source={source_path_str} dest={} extras={extras:?}",
+                desired.display()
+            );
+            if let Ok(guard) = db.lock() {
+                let _ = guard.insert_error_log(
+                    "path_collision",
+                    Some(file_id),
+                    desired.to_str(),
+                    "overwrite crash recovery refused: multiple idam-bak candidates",
+                    Some(&detail),
+                );
+            }
+            Err("overwrite crash recovery refused: multiple idam-bak candidates".into())
+        }
+        path_template::OccupantBakLookup::Missing => {
+            // Source gone and no recoverable bak — true missing
+            if let Ok(guard) = db.lock() {
+                let _ = guard.update_file_status(file_id, file_status::missing);
+            }
+            Err(format!(
+                "File missing on disk and overwrite crash recovery not possible: {source_path_str}"
+            ))
+        }
+        path_template::OccupantBakLookup::Primary(bak) => {
+            if !desired.is_file() {
+                if let Ok(guard) = db.lock() {
+                    let _ = guard.update_file_status(file_id, file_status::missing);
+                }
+                return Err(format!(
+                    "File missing on disk and overwrite crash recovery not possible: {source_path_str}"
+                ));
+            }
+
+            let matches = pipeline::dest_matches_mover_identity(desired, mover_size, mover_phash)
+                .map_err(|e| format!("overwrite crash identity check failed: {e:#}"))?;
+            if !matches {
+                let dest_size = std::fs::metadata(desired)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let detail = format!(
+                    "source={source_path_str} dest={} db_size={mover_size} dest_size={dest_size} phash={:?} bak={}",
+                    desired.display(),
+                    mover_phash,
+                    bak.display()
+                );
+                if let Ok(guard) = db.lock() {
+                    let _ = guard.insert_error_log(
+                        "path_collision",
+                        Some(file_id),
+                        desired.to_str(),
+                        "overwrite crash recovery refused: destination does not match recorded file",
+                        Some(&detail),
+                    );
+                }
+                // Leave mover at path_collision; keep bak for the user
+                return Err(
+                    "overwrite crash recovery refused: destination does not match recorded file"
+                        .into(),
+                );
+            }
+
+            let new_path = desired
+                .to_str()
+                .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
+                .to_string();
+            let phash_note = mover_phash
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("(none)");
+            {
+                let guard = db
+                    .lock()
+                    .map_err(|e| format!("Database lock error: {}", e))?;
+                guard
+                    .commit_path_collision_overwrite(file_id, source_path_str, &new_path, false)
+                    .map_err(|e| format!("Failed to commit crashed overwrite: {e}"))?;
+                // B1: never auto-delete bak; surface path for manual cleanup
+                let _ = guard.insert_error_log(
+                    "path_collision",
+                    Some(file_id),
+                    Some(&new_path),
+                    "completed overwrite after crash before DB commit; occupant bak kept for manual cleanup",
+                    Some(&format!(
+                        "bak={} size={mover_size} phash={phash_note}",
+                        bak.display()
+                    )),
+                );
+            }
+            let file = reload_file_with_metadata(db, file_id)?;
+            Ok(ResolvePathCollisionOutcome::Overwrite {
+                file: Box::new(file),
+                new_path,
+            })
+        }
     }
-    let new_path = desired
-        .to_str()
-        .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
-        .to_string();
-    let phash_note = mover_phash
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("(none)");
-    {
-        let guard = db
-            .lock()
-            .map_err(|e| format!("Database lock error: {}", e))?;
-        guard
-            .commit_path_collision_overwrite(file_id, source_path_str, &new_path, false)
-            .map_err(|e| format!("Failed to commit crashed overwrite: {e}"))?;
-        let _ = guard.insert_error_log(
-            "path_collision",
-            Some(file_id),
-            Some(&new_path),
-            "completed overwrite after crash before DB commit",
-            Some(&format!(
-                "bak={} size={mover_size} phash={phash_note}",
-                bak.display()
-            )),
-        );
-    }
-    path_template::discard_overwrite_backup(Some(&bak));
-    let file = reload_file_with_metadata(db, file_id)?;
-    Ok(ResolvePathCollisionOutcome::Overwrite {
-        file: Box::new(file),
-        new_path,
-    })
 }
 
 fn reload_file_with_metadata(

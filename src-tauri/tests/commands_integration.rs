@@ -8,14 +8,14 @@
 
 use intelligent_dam_lib::test_support::{
     add_file_tag, clear_error_logs, clear_file_tags, current_schema_user_version,
-    enqueue_pipeline_jobs, get_all_files, get_error_logs, get_file_tags, get_or_create_tag,
-    discard_overwrite_backup, get_settings, insert_error_log, is_same_file_identity,
-    list_duplicate_tombstones, move_file_overwrite_via_copy, overwrite_fault,
-    path_collision_tx_fault,
-    preview_output_template, remove_duplicate_tombstone, resolve_path_collision,
-    resolve_suspected_duplicate, resolve_suspected_duplicate_with_enqueue, save_settings,
-    scan_directory, scan_multiple_directories, AppSettings, Database, Metadata, PipelineOptions,
-    ResolvePathCollisionOutcome, ResolveSuspectedOutcome, SettingsStore, TaskQueue,
+    discard_overwrite_backup, enqueue_pipeline_jobs, get_all_files, get_error_logs, get_file_tags,
+    get_or_create_tag, get_settings, heal_identity_override, insert_error_log,
+    is_same_file_identity, list_duplicate_tombstones, move_file_overwrite_via_copy, overwrite_fault,
+    path_collision_tx_fault, preview_output_template, remove_duplicate_tombstone,
+    resolve_path_collision, resolve_suspected_duplicate, resolve_suspected_duplicate_with_enqueue,
+    save_settings, scan_directory, scan_multiple_directories, AppSettings, Database, Metadata,
+    PipelineOptions, ResolvePathCollisionOutcome, ResolveSuspectedOutcome, SettingsStore,
+    TaskQueue,
 };
 use std::fs;
 use std::path::Path;
@@ -904,8 +904,8 @@ fn path_collision_overwrite_via_copy_helper_roundtrip() {
 
 #[test]
 fn path_collision_overwrite_crash_before_commit_recovers_on_restart() {
-    // #59 N4: FS overwrite done, DB not committed, process gone → restart overwrite
-    // completes the commit and discards `.idam-bak`
+    // #59 N4 / B1: FS overwrite done, DB not committed → restart finishes commit
+    // and keeps `.idam-bak` for manual cleanup
     let fx = Fixture::new();
     let media = fx.temp().join("n4_crash");
     fs::create_dir_all(&media).expect("mkdir");
@@ -945,7 +945,8 @@ fn path_collision_overwrite_crash_before_commit_recovers_on_restart() {
         }
         other => panic!("expected Overwrite recovery, got {other:?}"),
     }
-    assert!(!bak.exists(), "bak discarded after recovered commit");
+    assert!(bak.exists(), "bak must be kept for manual cleanup (B1)");
+    assert_eq!(fs::read(&bak).unwrap(), b"old-bytes");
     let db = fx.db.lock().expect("lock");
     let mover = db.get_file_by_id(file_id).expect("mover");
     assert_eq!(Path::new(&mover.path), occupied.as_path());
@@ -956,8 +957,149 @@ fn path_collision_overwrite_crash_before_commit_recovers_on_restart() {
         db.list_error_logs(20).unwrap().iter().any(|e| {
             e.category == "path_collision"
                 && e.message.contains("completed overwrite after crash")
+                && e.detail.as_deref().unwrap_or("").contains("Demo.mp4.idam-bak")
         }),
-        "recovery should log completion"
+        "recovery should log bak path for cleanup"
+    );
+}
+
+fn setup_crashed_overwrite(
+    fx: &Fixture,
+    media_name: &str,
+    mover_bytes: &[u8],
+    bak_bytes: &[u8],
+    mover_phash: Option<&str>,
+) -> (i64, std::path::PathBuf, std::path::PathBuf, String) {
+    let media = fx.temp().join(media_name);
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&occupied, bak_bytes).expect("occupied");
+    fs::write(&incoming, mover_bytes).expect("incoming");
+    let file_id = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(
+                occupied.to_str().expect("utf8"),
+                bak_bytes.len() as u64,
+                None,
+            )
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(
+                incoming.to_str().expect("utf8"),
+                mover_bytes.len() as u64,
+                mover_phash.map(|s| s.to_string()),
+            )
+            .expect("incoming");
+        db.mark_path_collision_atomic(id, occupied.to_str().expect("utf8"), Some(occupant))
+            .expect("mark");
+        id
+    };
+    let bak = media.join("Demo.mp4.idam-bak");
+    fs::rename(&occupied, &bak).expect("bak");
+    fs::rename(&incoming, &occupied).expect("mover to dest");
+    let mover_path = {
+        let db = fx.db.lock().expect("lock");
+        db.get_file_by_id(file_id).unwrap().path
+    };
+    (file_id, occupied, bak, mover_path)
+}
+
+#[test]
+fn path_collision_overwrite_crash_refuses_size_mismatch_keeps_bak() {
+    let fx = Fixture::new();
+    let (file_id, occupied, bak, mover_path) = setup_crashed_overwrite(
+        &fx,
+        "n4_size",
+        b"new-bytes",
+        b"old-bytes",
+        None,
+    );
+    // Dest no longer matches DB size recorded for the mover
+    fs::write(&occupied, b"different-longer-payload").expect("resize dest");
+    let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
+        .expect_err("size mismatch");
+    assert!(
+        err.to_lowercase().contains("does not match") || err.to_lowercase().contains("refused"),
+        "{err}"
+    );
+    assert!(bak.exists(), "bak kept");
+    assert!(occupied.exists(), "dest kept");
+    let db = fx.db.lock().expect("lock");
+    let mover = db.get_file_by_id(file_id).expect("mover");
+    assert_eq!(mover.status, "path_collision", "mover must not be marked missing");
+    assert_eq!(mover.path, mover_path);
+    assert!(
+        db.list_error_logs(20).unwrap().iter().any(|e| {
+            e.category == "path_collision" && e.message.contains("does not match")
+        }),
+        "ErrorLog on size mismatch"
+    );
+}
+
+#[test]
+fn path_collision_overwrite_crash_refuses_phash_mismatch_keeps_bak() {
+    let fx = Fixture::new();
+    let (file_id, occupied, bak, mover_path) = setup_crashed_overwrite(
+        &fx,
+        "n4_phash",
+        b"new-bytes",
+        b"old-bytes",
+        Some("0123456789abcdef"),
+    );
+    heal_identity_override::arm_dest_phash("fedcba9876543210");
+    let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
+        .expect_err("phash mismatch");
+    heal_identity_override::clear();
+    assert!(
+        err.to_lowercase().contains("does not match") || err.to_lowercase().contains("refused"),
+        "{err}"
+    );
+    assert!(bak.exists(), "bak kept");
+    assert!(occupied.exists(), "dest kept");
+    let db = fx.db.lock().expect("lock");
+    let mover = db.get_file_by_id(file_id).expect("mover");
+    assert_eq!(mover.status, "path_collision");
+    assert_eq!(mover.path, mover_path);
+    assert!(
+        db.list_error_logs(20).unwrap().iter().any(|e| {
+            e.category == "path_collision" && e.message.contains("does not match")
+        }),
+        "ErrorLog on phash mismatch"
+    );
+}
+
+#[test]
+fn path_collision_overwrite_crash_refuses_multiple_baks_keeps_them() {
+    let fx = Fixture::new();
+    let (file_id, occupied, bak, mover_path) = setup_crashed_overwrite(
+        &fx,
+        "n4_multi_bak",
+        b"new-bytes",
+        b"old-bytes",
+        None,
+    );
+    let bak2 = occupied.parent().unwrap().join("Demo.mp4.idam-bak-2");
+    fs::write(&bak2, b"other-old").expect("bak2");
+    let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
+        .expect_err("ambiguous bak");
+    assert!(
+        err.to_lowercase().contains("multiple") || err.to_lowercase().contains("refused"),
+        "{err}"
+    );
+    assert!(bak.exists(), "primary bak kept");
+    assert!(bak2.exists(), "numbered bak kept");
+    assert!(occupied.exists());
+    let db = fx.db.lock().expect("lock");
+    let mover = db.get_file_by_id(file_id).expect("mover");
+    assert_eq!(mover.status, "path_collision");
+    assert_eq!(mover.path, mover_path);
+    assert!(
+        db.list_error_logs(20).unwrap().iter().any(|e| {
+            e.category == "path_collision" && e.message.contains("multiple idam-bak")
+        }),
+        "ErrorLog on ambiguous bak"
     );
 }
 
@@ -1005,8 +1147,9 @@ fn path_collision_suffix_avoids_db_owned_path() {
 
 #[cfg(unix)]
 #[test]
-fn path_collision_overwrite_hardlink_occupant_not_marked_missing() {
-    // #59: same-inode overwrite must not mark the hardlink occupant missing
+fn path_collision_overwrite_hardlink_occupant_displaced_missing() {
+    // #59 S1: same-inode overwrite displaces + marks missing (keeps Metadata/Tags)
+    // Nit: on Linux rename of a hard link may leave the original path present
     let fx = Fixture::new();
     let media = fx.temp().join("hardlink_occ");
     fs::create_dir_all(&media).expect("mkdir");
@@ -1041,16 +1184,15 @@ fn path_collision_overwrite_hardlink_occupant_not_marked_missing() {
         other => panic!("expected Overwrite, got {other:?}"),
     }
     let db = fx.db.lock().expect("lock");
-    assert!(
-        db.get_file_by_id(occupant_id).is_err(),
-        "hardlink occupant row must be removed not marked missing"
-    );
+    let occupant = db.get_file_by_id(occupant_id).expect("occupant kept");
+    assert_eq!(occupant.status, "missing");
+    assert!(occupant.path.contains("#displaced-"));
     assert!(
         db.list_error_logs(20).unwrap().iter().any(|e| {
             e.category == "path_collision"
                 && e.message.contains("same-file")
                 && e.file_id == Some(occupant_id)
         }),
-        "expected same-file remove ErrorLog"
+        "expected same-file overwrite ErrorLog"
     );
 }

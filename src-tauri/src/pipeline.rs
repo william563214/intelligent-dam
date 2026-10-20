@@ -751,7 +751,7 @@ pub enum MoveStepOutcome {
 }
 
 /// True when the source parent directory is reachable (drive not offline)
-fn source_parent_reachable(source: &Path) -> bool {
+pub fn source_parent_reachable(source: &Path) -> bool {
     match source.parent() {
         None => true,
         Some(parent) if parent.as_os_str().is_empty() => true,
@@ -759,14 +759,14 @@ fn source_parent_reachable(source: &Path) -> bool {
     }
 }
 
-/// Test hook: inject dest phash for heal identity without ffmpeg
-#[cfg(test)]
-mod heal_identity_override {
+/// Test hook: inject dest phash for heal / overwrite-crash identity without ffmpeg
+#[cfg(any(test, feature = "test-support"))]
+pub mod heal_identity_override {
     use std::cell::RefCell;
 
     thread_local! {
         #[allow(non_upper_case_globals)]
-        static dest_phash: RefCell<Option<String>> = RefCell::new(None);
+        static dest_phash: RefCell<Option<String>> = const { RefCell::new(None) };
     }
 
     pub fn arm_dest_phash(hex: &str) {
@@ -783,17 +783,19 @@ mod heal_identity_override {
 }
 
 fn resolve_dest_phash_for_heal(dest: &Path) -> Option<String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(p) = heal_identity_override::take_dest_phash() {
         return Some(p);
     }
     crate::phash::calculate_video_phash(dest).ok()
 }
 
-/// Confirm dest is the same file we moved
-/// Size always required; when DB has phash both size and phash must match (exact)
-/// Intentionally ignores `.idam-bak` / `.idam-tmp-*` sidecars from #58 overwrite
-fn dest_matches_recorded_file(file: &FileRecord, dest: &Path) -> Result<bool> {
+/// Shared identity check for move heal and overwrite-crash recovery (#50 / #59 B1)
+pub fn dest_matches_mover_identity(
+    dest: &Path,
+    mover_size: u64,
+    mover_phash: Option<&str>,
+) -> Result<bool> {
     if path_template::is_idam_transient_path(dest) {
         return Ok(false);
     }
@@ -801,16 +803,11 @@ fn dest_matches_recorded_file(file: &FileRecord, dest: &Path) -> Result<bool> {
         Ok(m) if m.is_file() => m,
         _ => return Ok(false),
     };
-    if meta.len() != file.size {
+    if meta.len() != mover_size {
         return Ok(false);
     }
-    let db_phash = file
-        .phash
-        .as_ref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty());
+    let db_phash = mover_phash.map(str::trim).filter(|s| !s.is_empty());
     let Some(db_phash) = db_phash else {
-        // No recorded phash → size alone is enough
         return Ok(true);
     };
     let Some(dest_phash) = resolve_dest_phash_for_heal(dest) else {
@@ -823,6 +820,13 @@ fn dest_matches_recorded_file(file: &FileRecord, dest: &Path) -> Result<bool> {
         return Ok(false);
     };
     Ok(a == b)
+}
+
+/// Confirm dest is the same file we moved
+/// Size always required; when DB has phash both size and phash must match (exact)
+/// Intentionally ignores `.idam-bak` / `.idam-tmp-*` sidecars from #58 overwrite
+fn dest_matches_recorded_file(file: &FileRecord, dest: &Path) -> Result<bool> {
+    dest_matches_mover_identity(dest, file.size, file.phash.as_deref())
 }
 
 /// #50: source gone after crash mid-move; dest present → heal Files.path when identity matches
