@@ -548,7 +548,8 @@ pub fn render_output_path(
 ///    stored string matches what macOS APIs typically return after normalization.
 ///    Linux (ext4) and Windows (NTFS) compare bytes: keep original codepoints so an
 ///    on-disk NFD name is not rewritten to a non-existent path. Cross-platform NFC
-///    matching is deferred to a v7 lookup-key column alongside #66.
+///    matching needs a separate lookup-key column (not bundled into #66
+///    `pending_move_to` — different concern, full-table backfill, query changes).
 /// 2. **Trailing separators** — strip trailing `/` or `\` except roots (`/`, `C:\`,
 ///    volume root `\\?\Volume{…}\`). UNC share roots may drop the trailing sep.
 /// 3. **Case** — do **not** ASCII-fold path components for storage. `Files.path` UNIQUE

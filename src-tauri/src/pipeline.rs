@@ -829,7 +829,10 @@ fn dest_matches_recorded_file(file: &FileRecord, dest: &Path) -> Result<bool> {
     dest_matches_mover_identity(dest, file.size, file.phash.as_deref())
 }
 
-/// #50: source gone after crash mid-move; dest present → heal Files.path when identity matches
+/// #50 / #66: source gone after crash mid-move; dest present → heal Files.path
+///
+/// Primary signal is `pending_move_to` when it equals the template dest.
+/// Size/phash identity is only a backup when pending is absent or differs.
 fn heal_move_after_crash(
     db: &Arc<Mutex<Database>>,
     file_id: i64,
@@ -843,6 +846,7 @@ fn heal_move_after_crash(
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
         guard.update_file_status(file_id, file_status::missing)?;
+        let _ = guard.clear_pending_move_to(file_id);
         let _ = guard.insert_error_log(
             "move",
             Some(file_id),
@@ -868,27 +872,40 @@ fn heal_move_after_crash(
         let guard = db
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        let _ = guard.clear_pending_move_to(file_id);
         guard.update_file_status(file_id, file_status::missing)?;
         anyhow::bail!("File missing on disk: {}", source.display());
     }
 
-    let matches = dest_matches_recorded_file(file, desired)?;
     let desired_str = desired
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Desired path is not valid UTF-8"))?
         .to_string();
+    let pending = {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.get_pending_move_to(file_id)?
+    };
+    let pending_matches = pending
+        .as_ref()
+        .map(|p| path_template::normalize_db_path(p) == path_template::normalize_db_path(&desired_str))
+        .unwrap_or(false);
+    let identity_matches = dest_matches_recorded_file(file, desired)?;
 
-    if !matches {
+    // #66: pending is authoritative; size/phash only backs up when pending is absent
+    if !pending_matches && !identity_matches {
         let dest_size = std::fs::metadata(desired)
             .map(|m| m.len())
             .unwrap_or(0);
         let detail = format!(
-            "source={} dest={} db_size={} dest_size={} phash={:?} bak_leftover={}",
+            "source={} dest={} db_size={} dest_size={} phash={:?} pending={:?} bak_leftover={}",
             source.display(),
             desired.display(),
             file.size,
             dest_size,
             file.phash,
+            pending,
             path_template::primary_idam_bak_path(desired).exists()
         );
         {
@@ -917,10 +934,11 @@ fn heal_move_after_crash(
         // Leave any sibling .idam-bak in place (#59); successful heal only repairs DB path
         if let Err(e) = guard.heal_moved_path(file_id, &file.path, &desired_str) {
             let detail = format!(
-                "source={} dest={} err={}",
+                "source={} dest={} err={} pending={:?}",
                 source.display(),
                 desired.display(),
-                e
+                e,
+                pending
             );
             let message = if detail.contains("owned by another") {
                 "move heal refused: destination path owned by another Files row"
@@ -941,6 +959,126 @@ fn heal_move_after_crash(
     Ok(MoveStepOutcome::Moved(desired.to_path_buf()))
 }
 
+/// #66: recover every Files row with `pending_move_to` after startup or before step_move
+///
+/// Crash points:
+/// - before FS: source still present → clear pending (retry will re-set)
+/// - after FS / before DB commit: source gone, dest present → complete path update
+/// - after DB commit: pending already null (no-op)
+pub fn recover_pending_moves(db: &Arc<Mutex<Database>>) -> Result<usize> {
+    let pending_rows = {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.list_pending_moves()?
+    };
+    let mut recovered = 0usize;
+    for row in pending_rows {
+        match recover_one_pending_move(db, &row) {
+            Ok(true) => recovered += 1,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!(
+                    "warn: pending_move recovery failed for file_id={}: {:#}",
+                    row.file_id, e
+                );
+                if let Ok(guard) = db.lock() {
+                    let _ = guard.insert_error_log(
+                        "move",
+                        Some(row.file_id),
+                        Some(&row.path),
+                        "pending_move recovery failed",
+                        Some(&format!("{e:#}")),
+                    );
+                }
+            }
+        }
+    }
+    Ok(recovered)
+}
+
+fn recover_one_pending_move(
+    db: &Arc<Mutex<Database>>,
+    row: &crate::database::PendingMoveRow,
+) -> Result<bool> {
+    let source = Path::new(&row.path);
+    let dest = Path::new(&row.pending_move_to);
+
+    if !source_parent_reachable(source) {
+        // Offline volume — leave pending for a later retry
+        return Ok(false);
+    }
+
+    // Pre-FS crash: source still here → abandon intent
+    if source.is_file() {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.clear_pending_move_to(row.file_id)?;
+        return Ok(true);
+    }
+
+    if path_template::is_idam_transient_path(dest) {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.clear_pending_move_to(row.file_id)?;
+        guard.update_file_status(row.file_id, file_status::missing)?;
+        return Ok(true);
+    }
+
+    if !dest.is_file() {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.clear_pending_move_to(row.file_id)?;
+        guard.update_file_status(row.file_id, file_status::missing)?;
+        return Ok(true);
+    }
+
+    // After FS / before DB: complete using pending as primary authority
+    let pending_collision = {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.get_pending_path_collision(row.file_id)?
+    };
+    let is_overwrite = pending_collision
+        .as_ref()
+        .map(|c| {
+            path_template::normalize_db_path(&c.desired_path)
+                == path_template::normalize_db_path(&row.pending_move_to)
+                && row.status == file_status::path_collision
+        })
+        .unwrap_or(false);
+
+    if is_overwrite {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.commit_path_collision_overwrite(
+            row.file_id,
+            &row.path,
+            &row.pending_move_to,
+            false,
+        )?;
+        let _ = guard.insert_error_log(
+            "path_collision",
+            Some(row.file_id),
+            Some(&row.pending_move_to),
+            "completed overwrite from pending_move_to on startup recovery",
+            Some(&format!("source={} dest={}", row.path, row.pending_move_to)),
+        );
+        return Ok(true);
+    }
+
+    let guard = db
+        .lock()
+        .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+    guard.heal_moved_path(row.file_id, &row.path, &row.pending_move_to)?;
+    Ok(true)
+}
+
 /// Render template move on disk then update Files.path
 /// On collision records PathCollisions and awaits UI (suffix / skip / overwrite)
 /// On DB update failure rolls the file back so DB never points at a wrong path
@@ -956,7 +1094,7 @@ fn step_move(
         anyhow::bail!("output_template is empty");
     }
 
-    let (source, file_snapshot, ctx, base_dir) = {
+    let (source, ctx, base_dir) = {
         let guard = db
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
@@ -980,7 +1118,7 @@ fn step_move(
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        (source, file, ctx, base_dir)
+        (source, ctx, base_dir)
     };
 
     let desired = render_output_path(template, &ctx, &base_dir)?;
@@ -998,6 +1136,40 @@ fn step_move(
         }
         anyhow::bail!("File missing on disk: {}", source.display());
     }
+
+    // #66: finish any durable pending intent before collision / finalize
+    {
+        let pending = {
+            let guard = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+            guard.get_pending_move_to(file_id)?
+        };
+        if pending.is_some() {
+            let _ = recover_pending_moves(db)?;
+            // Reload source after recovery may have updated Files.path
+            let guard = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+            let refreshed = guard.get_file_by_id(file_id)?;
+            let desired_str = desired
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("Desired path is not valid UTF-8"))?;
+            if path_template::normalize_db_path(&refreshed.path)
+                == path_template::normalize_db_path(desired_str)
+            {
+                return Ok(MoveStepOutcome::Moved(desired));
+            }
+        }
+    }
+
+    let (source, file_snapshot) = {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        let file = guard.get_file_by_id(file_id)?;
+        (PathBuf::from(&file.path), file)
+    };
 
     // #50 crash recovery before collision / finalize
     if !source.is_file() {
@@ -1067,29 +1239,45 @@ fn finalize_move_inner(
     dest: &Path,
     suppressions: Option<&PathSuppression>,
 ) -> Result<()> {
-    // Suppress before the rename so recursive watch events are ignored
-    if let Some(supp) = suppressions {
-        supp.suppress(dest);
-    }
-
-    move_file(source, dest).with_context(|| {
-        format!(
-            "Failed to move {} → {}",
-            source.display(),
-            dest.display()
-        )
-    })?;
-
-    if let Some(supp) = suppressions {
-        supp.suppress(dest);
-    }
-
     let new_path_str = dest
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Destination path is not valid UTF-8"))?
         .to_string();
 
-    // Short lock update path only if DB still references the old source
+    // #66: durable intent before any filesystem rename
+    {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard
+            .set_pending_move_to(file_id, &new_path_str)
+            .map_err(|e| anyhow::anyhow!("Failed to set pending_move_to: {}", e))?;
+    }
+
+    // Suppress before the rename so recursive watch events are ignored
+    if let Some(supp) = suppressions {
+        supp.suppress(dest);
+    }
+
+    if let Err(e) = move_file(source, dest).with_context(|| {
+        format!(
+            "Failed to move {} → {}",
+            source.display(),
+            dest.display()
+        )
+    }) {
+        // Pre-FS failure: drop intent so startup does not try to complete a no-op
+        if let Ok(guard) = db.lock() {
+            let _ = guard.clear_pending_move_to(file_id);
+        }
+        return Err(e);
+    }
+
+    if let Some(supp) = suppressions {
+        supp.suppress(dest);
+    }
+
+    // Short lock: path update + clear pending when DB still references the old source
     let update_result = {
         let guard = db
             .lock()
@@ -1102,22 +1290,24 @@ fn finalize_move_inner(
                 file.path
             ))
         } else {
+            // heal_moved_path clears pending_move_to in the same transaction
             guard
-                .update_file_path(file_id, &new_path_str)
-                .map_err(|e| anyhow::anyhow!("Failed to update Files.path: {}", e))?;
-            // Move success = organized (durable; survives Jobs prune)
-            guard
-                .mark_file_organized(file_id)
-                .map_err(|e| anyhow::anyhow!("Failed to mark organized_at: {}", e))
+                .heal_moved_path(file_id, &file.path, &new_path_str)
+                .map_err(|e| anyhow::anyhow!("Failed to commit moved path: {}", e))
         }
     };
 
     if let Err(e) = update_result {
         if let Err(rb) = rollback_move(dest, source) {
+            // Leave pending_move_to set so startup / step_move can finish the commit
             return Err(e).context(format!(
                 "DB path update failed and rollback also failed: {:#}",
                 rb
             ));
+        }
+        // FS rolled back to source — clear stale intent
+        if let Ok(guard) = db.lock() {
+            let _ = guard.clear_pending_move_to(file_id);
         }
         return Err(e).context("DB path update failed file rolled back to original location");
     }
@@ -2051,6 +2241,150 @@ mod tests {
         drop(guard);
         assert_eq!(fs::read(&desired).unwrap(), payload);
         assert!(bak.exists(), "bak leftover must remain (#59)");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_move_cleared_after_successful_finalize() {
+        let dir = unique_temp_dir("pending_ok");
+        let src = dir.join("ABC-100.mp4");
+        fs::write(&src, b"payload").unwrap();
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 7, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        let arc = Arc::new(Mutex::new(db));
+        let outcome = step_move(&arc, file_id, &settings, None).expect("move");
+        assert!(matches!(outcome, MoveStepOutcome::Moved(_)));
+        let guard = arc.lock().unwrap();
+        assert_eq!(guard.get_pending_move_to(file_id).unwrap(), None);
+        assert_eq!(Path::new(&guard.get_file_by_id(file_id).unwrap().path), desired.as_path());
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_move_crash_before_fs_clears_on_startup_recovery() {
+        // Crash point 1: pending written, FS not started — source still present
+        let dir = unique_temp_dir("pending_pre_fs");
+        let src = dir.join("ABC-100.mp4");
+        fs::write(&src, b"still-here").unwrap();
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 10, None)
+            .expect("insert");
+        let dest = dir.join("StudioA").join("out.mp4");
+        db.set_pending_move_to(file_id, dest.to_str().unwrap())
+            .expect("pending");
+        let arc = Arc::new(Mutex::new(db));
+        let n = recover_pending_moves(&arc).expect("recover");
+        assert_eq!(n, 1);
+        let guard = arc.lock().unwrap();
+        assert_eq!(guard.get_pending_move_to(file_id).unwrap(), None);
+        assert_eq!(Path::new(&guard.get_file_by_id(file_id).unwrap().path), src.as_path());
+        assert!(src.exists());
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_move_crash_after_fs_completes_on_startup_recovery() {
+        // Crash point 2: FS done, DB path not updated — pending drives completion
+        let dir = unique_temp_dir("pending_post_fs");
+        let src = dir.join("ABC-100.mp4");
+        let payload = b"moved-via-pending";
+        fs::write(&src, payload).unwrap();
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
+            .expect("insert");
+        let dest = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::rename(&src, &dest).unwrap();
+        db.set_pending_move_to(file_id, dest.to_str().unwrap())
+            .expect("pending");
+        // Identity alone would also match; pending is the primary signal under test
+        let arc = Arc::new(Mutex::new(db));
+        let n = recover_pending_moves(&arc).expect("recover");
+        assert_eq!(n, 1);
+        let guard = arc.lock().unwrap();
+        assert_eq!(guard.get_pending_move_to(file_id).unwrap(), None);
+        assert_eq!(Path::new(&guard.get_file_by_id(file_id).unwrap().path), dest.as_path());
+        assert_eq!(fs::read(&dest).unwrap(), payload);
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_move_absent_after_db_commit_is_noop() {
+        // Crash point 3: commit already cleared pending — recovery finds nothing
+        let dir = unique_temp_dir("pending_post_commit");
+        let dest = dir.join("done.mp4");
+        fs::write(&dest, b"x").unwrap();
+        let db = open_db();
+        let file_id = db
+            .insert_file(dest.to_str().unwrap(), 1, None)
+            .expect("insert");
+        assert_eq!(db.get_pending_move_to(file_id).unwrap(), None);
+        let arc = Arc::new(Mutex::new(db));
+        let n = recover_pending_moves(&arc).expect("recover");
+        assert_eq!(n, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_heals_via_pending_when_identity_would_fail() {
+        // Pending matches dest but size differs from DB — still heal (#66 primary)
+        let dir = unique_temp_dir("pending_over_identity");
+        let src = dir.join("ABC-100.mp4");
+        fs::write(&src, b"original").unwrap();
+        let db = open_db();
+        let file_id = db.insert_file(src.to_str().unwrap(), 8, None).expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        // Dest size != DB size (identity backup would refuse)
+        fs::write(&desired, b"DIFFERENT-SIZE-PAYLOAD").unwrap();
+        fs::remove_file(&src).unwrap();
+        db.set_pending_move_to(file_id, desired.to_str().unwrap())
+            .expect("pending");
+        let arc = Arc::new(Mutex::new(db));
+        let outcome = step_move(&arc, file_id, &settings, None).expect("heal via pending");
+        assert!(matches!(outcome, MoveStepOutcome::Moved(_)));
+        let guard = arc.lock().unwrap();
+        assert_eq!(Path::new(&guard.get_file_by_id(file_id).unwrap().path), desired.as_path());
+        assert_eq!(guard.get_pending_move_to(file_id).unwrap(), None);
+        drop(guard);
         let _ = fs::remove_dir_all(&dir);
     }
 
