@@ -96,3 +96,39 @@ jobs:
       - name: Cargo clippy (release config)
         working-directory: src-tauri
         run: cargo clippy --locked -- -D warnings
+
+  # #63: compile/test macOS-only NFC path normalize without changing ubuntu/windows jobs
+  test-macos:
+    name: test (macos-latest)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install ffmpeg
+        run: brew install ffmpeg
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: "1.83.0"
+          components: clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Cargo test (lib + integration)
+        working-directory: src-tauri
+        run: cargo test --locked --features test-support
+
+      - name: Cargo clippy (test-support)
+        working-directory: src-tauri
+        run: cargo clippy --locked --features test-support -- -D warnings
+
+      - name: Cargo clippy (release config)
+        working-directory: src-tauri
+        run: cargo clippy --locked -- -D warnings
