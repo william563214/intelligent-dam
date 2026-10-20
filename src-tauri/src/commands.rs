@@ -2,7 +2,8 @@ use crate::connectivity::{self, ConnectivityReport};
 use crate::database::{Database, ErrorLogEntry, FileWithMetadata, Metadata, Tag};
 use crate::ffmpeg;
 use crate::file_status;
-use crate::pipeline::PipelineOptions;
+use crate::path_template::{self, TemplateContext};
+use crate::pipeline::{self, PipelineOptions};
 use crate::scanner;
 use crate::scraper::{scrape_metadata, to_database_metadata};
 use crate::settings::{AppSettings, SettingsStore};
@@ -10,7 +11,7 @@ use crate::task_queue::{TaskQueue, TaskQueueStatus};
 use crate::watcher::{self, WatcherManager, WatcherStatus};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, State};
 
@@ -332,6 +333,248 @@ pub fn resolve_suspected_duplicate_with_enqueue(
     })
 }
 
+/// Settings template preview result (#40)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewTemplateResult {
+    pub rendered_path: String,
+    pub template: String,
+    pub base_dir: String,
+}
+
+/// Render `output_template` with sample (or provided) context for Settings preview.
+pub fn preview_output_template(
+    template: &str,
+    base_dir: Option<&str>,
+) -> Result<PreviewTemplateResult, String> {
+    let trimmed = template.trim();
+    if trimmed.is_empty() {
+        return Err("output_template is empty".to_string());
+    }
+    let base = base_dir
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/library");
+    let ctx = TemplateContext::sample();
+    let dest = path_template::render_output_path(trimmed, &ctx, Path::new(base))
+        .map_err(|e| format!("Failed to preview template: {e:#}"))?;
+    let rendered_path = dest.to_string_lossy().to_string();
+    Ok(PreviewTemplateResult {
+        rendered_path,
+        template: trimmed.to_string(),
+        base_dir: base.to_string(),
+    })
+}
+
+/// Outcome of resolving a template path collision (#40).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResolvePathCollisionOutcome {
+    Suffix {
+        file: Box<FileWithMetadata>,
+        new_path: String,
+    },
+    Skip {
+        file: Box<FileWithMetadata>,
+    },
+    Overwrite {
+        file: Box<FileWithMetadata>,
+        new_path: String,
+    },
+}
+
+/// Resolve a pending path collision: `suffix` | `skip` | `overwrite`.
+///
+/// Overwrite requires `confirmed == true` (frontend confirm dialog).
+pub fn resolve_path_collision(
+    db: &Arc<Mutex<Database>>,
+    queue: &Arc<TaskQueue>,
+    file_id: i64,
+    action: &str,
+    confirmed: bool,
+) -> Result<ResolvePathCollisionOutcome, String> {
+    let action = action.trim().to_lowercase();
+    if action != "suffix" && action != "skip" && action != "overwrite" {
+        return Err(format!(
+            "invalid action '{action}' (expected suffix, skip, or overwrite)"
+        ));
+    }
+    if action == "overwrite" && !confirmed {
+        return Err("overwrite requires confirmed=true".to_string());
+    }
+
+    let suppressions = queue.path_suppressions().ok();
+
+    let (source, desired, source_path_str) = {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let file = guard
+            .get_file_by_id(file_id)
+            .map_err(|e| format!("File not found: {}", e))?;
+        if file.status != file_status::path_collision {
+            return Err(format!(
+                "file {} is not path_collision (status={})",
+                file_id, file.status
+            ));
+        }
+        let pending = guard
+            .get_pending_path_collision(file_id)
+            .map_err(|e| format!("Failed to read path collision: {}", e))?
+            .ok_or_else(|| format!("no pending path collision for file {file_id}"))?;
+        let source = PathBuf::from(&file.path);
+        if !source.is_file() {
+            let _ = guard.update_file_status(file_id, file_status::missing);
+            return Err(format!("File missing on disk: {}", file.path));
+        }
+        (
+            source,
+            PathBuf::from(&pending.desired_path),
+            file.path.clone(),
+        )
+    };
+
+    match action.as_str() {
+        "skip" => {
+            {
+                let guard = db
+                    .lock()
+                    .map_err(|e| format!("Database lock error: {}", e))?;
+                guard
+                    .resolve_path_collision(file_id, "skip")
+                    .map_err(|e| format!("Failed to resolve path collision: {}", e))?;
+            }
+            let file = reload_file_with_metadata(db, file_id)?;
+            Ok(ResolvePathCollisionOutcome::Skip {
+                file: Box::new(file),
+            })
+        }
+        "suffix" => {
+            let dest = path_template::unique_destination(&desired);
+            pipeline::finalize_move(db, file_id, &source, &dest, suppressions.as_deref())
+                .map_err(|e| format!("Failed to move with suffix: {e:#}"))?;
+            {
+                let guard = db
+                    .lock()
+                    .map_err(|e| format!("Database lock error: {}", e))?;
+                guard
+                    .resolve_path_collision(file_id, "suffix")
+                    .map_err(|e| format!("Failed to resolve path collision: {}", e))?;
+            }
+            let new_path = dest.to_string_lossy().to_string();
+            let file = reload_file_with_metadata(db, file_id)?;
+            Ok(ResolvePathCollisionOutcome::Suffix {
+                file: Box::new(file),
+                new_path,
+            })
+        }
+        "overwrite" => {
+            if let Some(supp) = suppressions.as_ref() {
+                supp.suppress(&desired);
+            }
+            // Filesystem first (backup occupant); no DB writes until commit
+            let outcome = match path_template::move_file_overwrite(&source, &desired) {
+                Ok(o) => o,
+                Err(e) => {
+                    let detail = format!("{e:#}");
+                    let message = format!("Failed to overwrite move: {detail}");
+                    // Occupant may sit in .idam-bak — surface bak path + ErrorLog
+                    if detail.contains("restore also failed") {
+                        let path_for_log = desired.to_str().or_else(|| source.to_str());
+                        if let Ok(guard) = db.lock() {
+                            if let Err(log_err) = guard.insert_error_log(
+                                "path_collision",
+                                Some(file_id),
+                                path_for_log,
+                                &message,
+                                Some(&detail),
+                            ) {
+                                eprintln!("commands: failed to write ErrorLog: {log_err}");
+                            }
+                        }
+                    }
+                    return Err(message);
+                }
+            };
+            if let Some(supp) = suppressions.as_ref() {
+                supp.suppress(&desired);
+            }
+
+            let new_path = desired
+                .to_str()
+                .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
+                .to_string();
+
+            let commit = {
+                let guard = db
+                    .lock()
+                    .map_err(|e| format!("Database lock error: {}", e))?;
+                guard.commit_path_collision_overwrite(file_id, &source_path_str, &new_path)
+            };
+
+            if let Err(e) = commit {
+                if let Err(rb) = path_template::restore_overwrite_files(
+                    &source,
+                    &desired,
+                    outcome.backup.as_deref(),
+                ) {
+                    let bak_hint = outcome
+                        .backup
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(no bak)".to_string());
+                    let message = format!(
+                        "overwrite commit failed and restore also failed; occupant may remain at {bak_hint}"
+                    );
+                    let detail = format!("{rb:#}");
+                    if let Ok(guard) = db.lock() {
+                        let path_for_log = outcome
+                            .backup
+                            .as_ref()
+                            .and_then(|p| p.to_str())
+                            .or_else(|| desired.to_str());
+                        if let Err(log_err) = guard.insert_error_log(
+                            "path_collision",
+                            Some(file_id),
+                            path_for_log,
+                            &message,
+                            Some(&detail),
+                        ) {
+                            eprintln!("commands: failed to write ErrorLog: {log_err}");
+                        }
+                    }
+                    return Err(format!("{message}; commit: {e}; restore: {detail}"));
+                }
+                return Err(format!("Failed to commit overwrite: {e}"));
+            }
+
+            path_template::discard_overwrite_backup(outcome.backup.as_deref());
+            let file = reload_file_with_metadata(db, file_id)?;
+            Ok(ResolvePathCollisionOutcome::Overwrite {
+                file: Box::new(file),
+                new_path,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn reload_file_with_metadata(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+) -> Result<FileWithMetadata, String> {
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    let files = guard
+        .get_files_with_metadata()
+        .map_err(|e| format!("Failed to reload files: {}", e))?;
+    files
+        .into_iter()
+        .find(|f| f.file.id == file_id)
+        .ok_or_else(|| format!("file {file_id} missing after resolve"))
+}
+
 /// List confirmed-duplicate tombstones (Settings UI).
 pub fn list_duplicate_tombstones(
     db: &Arc<Mutex<Database>>,
@@ -541,6 +784,31 @@ pub fn remove_duplicate_tombstone_command(
     db: State<'_, Arc<Mutex<Database>>>,
 ) -> Result<bool, String> {
     remove_duplicate_tombstone(&db, id)
+}
+
+#[tauri::command]
+pub fn preview_output_template_command(
+    template: String,
+    base_dir: Option<String>,
+) -> Result<PreviewTemplateResult, String> {
+    preview_output_template(&template, base_dir.as_deref())
+}
+
+#[tauri::command]
+pub fn resolve_path_collision_command(
+    file_id: i64,
+    action: String,
+    confirmed: Option<bool>,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+) -> Result<ResolvePathCollisionOutcome, String> {
+    resolve_path_collision(
+        &db,
+        &queue,
+        file_id,
+        &action,
+        confirmed.unwrap_or(false),
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -9,12 +9,15 @@
 use intelligent_dam_lib::test_support::{
     add_file_tag, clear_error_logs, clear_file_tags, current_schema_user_version,
     enqueue_pipeline_jobs, get_all_files, get_error_logs, get_file_tags, get_or_create_tag,
-    get_settings, insert_error_log, list_duplicate_tombstones, remove_duplicate_tombstone,
+    discard_overwrite_backup, get_settings, insert_error_log, list_duplicate_tombstones,
+    move_file_overwrite_via_copy, overwrite_fault, path_collision_tx_fault,
+    preview_output_template, remove_duplicate_tombstone, resolve_path_collision,
     resolve_suspected_duplicate, resolve_suspected_duplicate_with_enqueue, save_settings,
-    scan_directory, scan_multiple_directories, AppSettings, Database, PipelineOptions,
-    ResolveSuspectedOutcome, SettingsStore, TaskQueue,
+    scan_directory, scan_multiple_directories, AppSettings, Database, Metadata, PipelineOptions,
+    ResolvePathCollisionOutcome, ResolveSuspectedOutcome, SettingsStore, TaskQueue,
 };
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 struct Fixture {
@@ -51,7 +54,7 @@ fn fresh_temp_db_applies_user_version_migrations() {
     let db = Database::new(path.to_str().expect("utf8")).expect("open");
     let version = db.read_user_version().expect("user_version");
     assert_eq!(version, current_schema_user_version());
-    assert!(current_schema_user_version() >= 3);
+    assert!(current_schema_user_version() >= 6);
 }
 
 #[test]
@@ -535,4 +538,361 @@ fn deleting_keeper_restores_flagged_file_to_ready() {
         .get_pending_suspected_duplicate(near)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn preview_output_template_renders_sample_with_helpers() {
+    let preview = preview_output_template(
+        "{{studio}}/{{format_date date \"YYYY\"}}_{{truncate title 6}}.{{ext}}",
+        Some("/library"),
+    )
+    .expect("preview");
+    assert!(
+        preview.rendered_path.ends_with("StudioX/2024_Sam....mp4")
+            || preview.rendered_path.replace('\\', "/").ends_with("StudioX/2024_Sam....mp4"),
+        "got {}",
+        preview.rendered_path
+    );
+    assert_eq!(preview.base_dir, "/library");
+}
+
+#[test]
+fn path_collision_suffix_skip_overwrite_flow() {
+    let fx = Fixture::new();
+    let media = fx.temp().join("lib");
+    fs::create_dir_all(media.join("StudioA")).expect("mkdir");
+    let occupied = media.join("StudioA").join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&occupied, b"old-bytes").expect("write occupied");
+    fs::write(&incoming, b"new-bytes").expect("write incoming");
+
+    let (file_id, occupant_id) = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 3, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 4, None)
+            .expect("incoming");
+        db.update_metadata(&Metadata {
+            file_id: id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .expect("meta");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant),
+        )
+        .expect("mark collision");
+        (id, occupant)
+    };
+
+    let denied = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", false);
+    assert!(denied.is_err(), "overwrite needs confirm");
+
+    let skip = resolve_path_collision(&fx.db, &fx.queue, file_id, "skip", false).expect("skip");
+    match skip {
+        ResolvePathCollisionOutcome::Skip { file } => {
+            assert_eq!(file.file.id, file_id);
+            assert_eq!(file.file.status, "ready");
+            assert!(file.path_collision.is_none());
+        }
+        other => panic!("expected Skip, got {other:?}"),
+    }
+    assert!(incoming.exists());
+    assert_eq!(fs::read(&occupied).unwrap(), b"old-bytes");
+
+    {
+        let db = fx.db.lock().expect("lock");
+        db.mark_path_collision_atomic(
+            file_id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant_id),
+        )
+        .expect("re-mark");
+    }
+    let suffix =
+        resolve_path_collision(&fx.db, &fx.queue, file_id, "suffix", false).expect("suffix");
+    match suffix {
+        ResolvePathCollisionOutcome::Suffix { file, new_path } => {
+            assert_eq!(file.file.status, "ready");
+            assert!(Path::new(&new_path).exists());
+            assert!(
+                new_path.contains("Demo_2"),
+                "expected suffix path, got {new_path}"
+            );
+            assert!(!incoming.exists());
+            assert_eq!(fs::read(&occupied).unwrap(), b"old-bytes");
+            assert_eq!(fs::read(&new_path).unwrap(), b"new-bytes");
+        }
+        other => panic!("expected Suffix, got {other:?}"),
+    }
+
+    let incoming2 = media.join("incoming2.mp4");
+    fs::write(&incoming2, b"overwrite-me").expect("write");
+    let file2 = {
+        let db = fx.db.lock().expect("lock");
+        let (id, _) = db
+            .upsert_file(incoming2.to_str().expect("utf8"), 5, None)
+            .expect("incoming2");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant_id),
+        )
+        .expect("mark2");
+        id
+    };
+    let overwrite =
+        resolve_path_collision(&fx.db, &fx.queue, file2, "overwrite", true).expect("overwrite");
+    match overwrite {
+        ResolvePathCollisionOutcome::Overwrite { file, new_path } => {
+            assert_eq!(file.file.status, "ready");
+            assert_eq!(Path::new(&new_path), occupied.as_path());
+            assert_eq!(fs::read(&occupied).unwrap(), b"overwrite-me");
+            assert!(!incoming2.exists());
+        }
+        other => panic!("expected Overwrite, got {other:?}"),
+    }
+    let occupant_status = {
+        let db = fx.db.lock().expect("lock");
+        db.get_file_by_id(occupant_id).expect("occupant").status
+    };
+    assert_eq!(occupant_status, "missing");
+}
+
+#[test]
+fn path_collision_overwrite_fs_failure_leaves_pending_and_occupant() {
+    let fx = Fixture::new();
+    let media = fx.temp().join("fsfail");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&occupied, b"old-bytes").expect("write occupied");
+    fs::write(&incoming, b"new-bytes").expect("write incoming");
+
+    let (file_id, occupant_id, occupant_path) = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 3, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 4, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant),
+        )
+        .expect("mark");
+        let occ_path = db.get_file_by_id(occupant).expect("occ").path;
+        (id, occupant, occ_path)
+    };
+
+    overwrite_fault::arm_fail_after_backup();
+    let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
+        .expect_err("fs fail");
+    overwrite_fault::clear();
+    assert!(err.contains("injected") || err.contains("overwrite"), "{err}");
+
+    assert!(occupied.exists());
+    assert_eq!(fs::read(&occupied).unwrap(), b"old-bytes");
+    assert!(incoming.exists());
+    assert_eq!(fs::read(&incoming).unwrap(), b"new-bytes");
+
+    let db = fx.db.lock().expect("lock");
+    let mover = db.get_file_by_id(file_id).expect("mover");
+    assert_eq!(mover.status, "path_collision");
+    assert!(db.get_pending_path_collision(file_id).unwrap().is_some());
+    let occupant = db.get_file_by_id(occupant_id).expect("occupant");
+    assert_eq!(occupant.path, occupant_path);
+    assert_ne!(occupant.status, "missing");
+}
+
+#[test]
+fn path_collision_overwrite_restore_failure_writes_error_log() {
+    let fx = Fixture::new();
+    let media = fx.temp().join("rbfail");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&occupied, b"old-bytes").expect("write occupied");
+    fs::write(&incoming, b"new-bytes").expect("write incoming");
+
+    let file_id = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 3, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 4, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant),
+        )
+        .expect("mark");
+        id
+    };
+
+    overwrite_fault::arm_fail_after_backup();
+    overwrite_fault::arm_fail_restore();
+    let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
+        .expect_err("restore fail");
+    overwrite_fault::clear();
+    assert!(
+        err.contains("restore also failed") || err.contains("idam-bak"),
+        "{err}"
+    );
+    let bak = media.join("Demo.mp4.idam-bak");
+    assert!(bak.exists(), "occupant must remain in .idam-bak");
+    assert_eq!(fs::read(&bak).unwrap(), b"old-bytes");
+
+    let logs = get_error_logs(&fx.db, Some(20)).expect("logs");
+    assert!(
+        logs.iter().any(|e| {
+            e.category == "path_collision"
+                && (e.message.contains("restore also failed")
+                    || e.message.contains("idam-bak")
+                    || e.detail.as_deref().unwrap_or("").contains("idam-bak"))
+        }),
+        "expected ErrorLog for restore failure, got {logs:?}"
+    );
+}
+
+#[test]
+fn path_collision_overwrite_db_failure_restores_files() {
+    let fx = Fixture::new();
+    let media = fx.temp().join("dbfail");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&occupied, b"old-bytes").expect("write occupied");
+    fs::write(&incoming, b"new-bytes").expect("write incoming");
+
+    let (file_id, occupant_id, occupant_path, mover_path) = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 3, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 4, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant),
+        )
+        .expect("mark");
+        (
+            id,
+            occupant,
+            db.get_file_by_id(occupant).unwrap().path,
+            db.get_file_by_id(id).unwrap().path,
+        )
+    };
+
+    path_collision_tx_fault::arm_fail_commit();
+    let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
+        .expect_err("db fail");
+    path_collision_tx_fault::clear();
+    assert!(
+        err.contains("injected") || err.contains("commit"),
+        "{err}"
+    );
+
+    assert!(occupied.exists(), "occupant file restored");
+    assert_eq!(fs::read(&occupied).unwrap(), b"old-bytes");
+    assert!(incoming.exists(), "source restored");
+    assert_eq!(fs::read(&incoming).unwrap(), b"new-bytes");
+
+    let db = fx.db.lock().expect("lock");
+    let mover = db.get_file_by_id(file_id).expect("mover");
+    assert_eq!(mover.status, "path_collision");
+    assert_eq!(mover.path, mover_path);
+    assert!(db.get_pending_path_collision(file_id).unwrap().is_some());
+    let occupant = db.get_file_by_id(occupant_id).expect("occupant");
+    assert_eq!(occupant.path, occupant_path);
+    assert_ne!(occupant.status, "missing");
+}
+
+#[test]
+fn path_collision_overwrite_requeries_when_occupant_already_moved() {
+    let fx = Fixture::new();
+    let media = fx.temp().join("stale_occ");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    let moved_away = media.join("elsewhere.mp4");
+    fs::write(&occupied, b"orphan-on-disk").expect("write occupied");
+    fs::write(&incoming, b"new-bytes").expect("write incoming");
+    // Keep a real file at the occupant row's new path so reconcile does not mark missing
+    fs::write(&moved_away, b"occupant-elsewhere").expect("write elsewhere");
+
+    let (file_id, stale_occupant) = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 3, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 4, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant),
+        )
+        .expect("mark");
+        // Occupant row moved away; disk file at desired is now untracked
+        db.update_file_path(occupant, moved_away.to_str().expect("utf8"))
+            .expect("move occupant path");
+        (id, occupant)
+    };
+
+    let overwrite =
+        resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true).expect("overwrite");
+    match overwrite {
+        ResolvePathCollisionOutcome::Overwrite { file, new_path } => {
+            assert_eq!(file.file.status, "ready");
+            assert_eq!(Path::new(&new_path), occupied.as_path());
+            assert_eq!(fs::read(&occupied).unwrap(), b"new-bytes");
+        }
+        other => panic!("expected Overwrite, got {other:?}"),
+    }
+    let stale = {
+        let db = fx.db.lock().expect("lock");
+        db.get_file_by_id(stale_occupant).expect("stale")
+    };
+    assert_eq!(stale.path, moved_away.to_string_lossy());
+    assert_ne!(stale.status, "missing", "stale occupant must not be marked missing");
+}
+
+#[test]
+fn path_collision_overwrite_via_copy_helper_roundtrip() {
+    // Unit-level cross-volume path exercised through public test helper
+    let dir = tempfile::tempdir().expect("temp");
+    let src = dir.path().join("new.mp4");
+    let dest = dir.path().join("old.mp4");
+    fs::write(&src, b"new-bytes").expect("src");
+    fs::write(&dest, b"old-bytes").expect("dest");
+    let outcome = move_file_overwrite_via_copy(&src, &dest).expect("copy ovw");
+    assert!(!outcome.case_only);
+    assert!(!src.exists());
+    assert_eq!(fs::read(&dest).unwrap(), b"new-bytes");
+    discard_overwrite_backup(outcome.backup.as_deref());
 }

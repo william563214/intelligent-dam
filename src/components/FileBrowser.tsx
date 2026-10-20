@@ -9,6 +9,10 @@ import {
   handle_resolve_suspected,
   resolve_success_message,
 } from "../utils/resolveSuspectedDuplicate";
+import {
+  collision_success_message,
+  handle_resolve_path_collision,
+} from "../utils/resolvePathCollision";
 import VideoCard from "./VideoCard";
 
 export default function FileBrowser() {
@@ -110,6 +114,34 @@ export default function FileBrowser() {
         ? result.outcome.pipelineEnqueued
         : false;
     setBatchMessage(resolve_success_message(action, fileId, enqueued));
+    setResolveBusyId(null);
+  };
+
+  const handleResolvePathCollision = async (
+    fileId: number,
+    action: "suffix" | "skip" | "overwrite",
+    desiredPath: string
+  ) => {
+    setResolveBusyId(fileId);
+    setBatchMessage(null);
+    const result = await handle_resolve_path_collision(
+      fileId,
+      action,
+      desiredPath
+    );
+    if (!result.ok) {
+      if (result.error !== "已取消覆蓋") {
+        setBatchMessage(`路徑碰撞處理失敗: ${result.error}`);
+      }
+      setResolveBusyId(null);
+      return;
+    }
+    await loadFiles();
+    const newPath =
+      result.outcome.kind === "suffix" || result.outcome.kind === "overwrite"
+        ? result.outcome.newPath
+        : undefined;
+    setBatchMessage(collision_success_message(action, fileId, newPath));
     setResolveBusyId(null);
   };
 
@@ -263,6 +295,7 @@ export default function FileBrowser() {
                 <VideoCard
                   fileWithMetadata={item}
                   onResolveSuspected={handleResolveSuspected}
+                  onResolvePathCollision={handleResolvePathCollision}
                   resolveBusy={resolveBusyId === item.file.id}
                 />
               </div>
