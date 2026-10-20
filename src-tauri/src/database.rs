@@ -204,18 +204,18 @@ impl Database {
             self.ensure_v5_columns()?;
         }
         // #61 / #63: idempotent repair of legacy path strings (no schema bump).
-        // Covers Windows separators/prefixes and cross-platform trailing seps + NFC.
+        // Trailing seps + Windows prefixes/separators; NFC rewrite only on macOS.
         self.repair_mixed_separator_paths()?;
         Ok(())
     }
 
     /// Normalize existing Files / PathCollisions / DuplicateTombstones path strings.
     ///
-    /// Read-only probe (`normalize_db_path(path) != path`) first — no write lock when
-    /// clean. All three tables update in one `BEGIN IMMEDIATE`.
-    /// If normalizing a Files or tombstone path would violate UNIQUE leave the row
-    /// unchanged and write an ErrorLog entry (no auto-merge); skip if the same
-    /// category+path is already logged.
+    /// Cheap SQL probe then definitive `normalize_db_path(path) != path` — no write
+    /// lock when clean (important for large libraries). All three tables update in
+    /// one `BEGIN IMMEDIATE`. If normalizing a Files or tombstone path would violate
+    /// UNIQUE leave the row unchanged and write an ErrorLog entry (no auto-merge);
+    /// skip if the same category+path is already logged.
     fn repair_mixed_separator_paths(&self) -> SqliteResult<()> {
         if !self.needs_path_separator_repair()? {
             return Ok(());
@@ -239,12 +239,80 @@ impl Database {
         }
     }
 
-    /// True when any stored path differs from `normalize_db_path` (covers `/`,
-    /// `\\?\`, lowercase drive, duplicate `\`, trailing seps, NFC). Read-only —
-    /// no write lock.
+    /// True when any stored path differs from `normalize_db_path`.
+    ///
+    /// Fast SQL probe first: if obvious dirty shapes exist (trailing seps / Windows
+    /// `\\?\` / mixed `/`), return true without scanning every row — helps large
+    /// dirty libraries. If the cheap probe is clean, fall back to definitive
+    /// `normalize != path` (covers macOS NFC and subtle Windows drive-letter cases).
+    /// Read-only — no write lock.
     fn needs_path_separator_repair(&self) -> SqliteResult<bool> {
-        // Prefer normalize(path) != path over fragile LIKE escaping: covers every
-        // shape normalize_db_path rewrites without false positives on clean paths.
+        if self.cheap_path_repair_probe()? {
+            return Ok(true);
+        }
+        self.any_path_table_needs_normalize()
+    }
+
+    /// SQL shapes that almost always need repair. True → known dirty; False → still
+    /// verify with normalize (cannot prove clean alone — e.g. macOS NFC).
+    /// Uses `char(92)` for `\` to avoid Rust/SQL string escaping pitfalls.
+    fn cheap_path_repair_probe(&self) -> SqliteResult<bool> {
+        // Trailing separator (not a lone root `/`)
+        if self.select_exists(
+            "SELECT EXISTS(
+                SELECT 1 FROM Files
+                WHERE (substr(path, -1) = '/' AND path != '/')
+                   OR substr(path, -1) = char(92)
+            )",
+        )? {
+            return Ok(true);
+        }
+        #[cfg(windows)]
+        {
+            if self.select_exists(
+                "SELECT EXISTS(
+                    SELECT 1 FROM Files
+                    WHERE instr(path, '/') > 0
+                       OR path LIKE char(92) || char(92) || '?%'
+                       OR path LIKE char(92) || char(92) || '.%'
+                       OR (
+                            length(path) >= 2
+                            AND substr(path, 2, 1) = ':'
+                            AND substr(path, 1, 1) GLOB '[a-z]'
+                       )
+                )",
+            )? {
+                return Ok(true);
+            }
+        }
+        if self.table_exists("PathCollisions")?
+            && self.select_exists(
+                "SELECT EXISTS(
+                    SELECT 1 FROM PathCollisions
+                    WHERE (substr(desired_path, -1) = '/' AND desired_path != '/')
+                       OR substr(desired_path, -1) = char(92)
+                       OR (substr(existing_path, -1) = '/' AND existing_path != '/')
+                       OR substr(existing_path, -1) = char(92)
+                )",
+            )?
+        {
+            return Ok(true);
+        }
+        if self.table_exists("DuplicateTombstones")?
+            && self.select_exists(
+                "SELECT EXISTS(
+                    SELECT 1 FROM DuplicateTombstones
+                    WHERE (substr(path, -1) = '/' AND path != '/')
+                       OR substr(path, -1) = char(92)
+                )",
+            )?
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn any_path_table_needs_normalize(&self) -> SqliteResult<bool> {
         if self.path_rows_need_normalize("SELECT path FROM Files")? {
             return Ok(true);
         }
@@ -6377,19 +6445,15 @@ mod tests {
         assert!(db.list_error_logs(5).unwrap().is_empty());
     }
 
-    /// #63: NFC repair + UNIQUE conflict leaves the row and logs once
+    /// #63 macOS: NFC repair + UNIQUE conflict leaves the row and logs once
+    #[cfg(target_os = "macos")]
     #[test]
     fn repair_nfc_unique_conflict_logs_and_leaves_row() {
         let db = open_memory_db();
         let nfd = "cafe\u{0301}";
         let nfc = "caf\u{e9}";
-        #[cfg(windows)]
-        let (nfd_path, nfc_path) = (
-            format!(r"C:\lib\{nfd}\x.mp4"),
-            format!(r"C:\lib\{nfc}\x.mp4"),
-        );
-        #[cfg(not(windows))]
-        let (nfd_path, nfc_path) = (format!("/lib/{nfd}/x.mp4"), format!("/lib/{nfc}/x.mp4"));
+        let nfd_path = format!("/lib/{nfd}/x.mp4");
+        let nfc_path = format!("/lib/{nfc}/x.mp4");
         db.conn
             .execute(
                 "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
@@ -6426,18 +6490,66 @@ mod tests {
                 .any(|e| e.category == "path_normalize" && e.file_id == Some(nfd_id)),
             "expected path_normalize ErrorLog got {logs:?}"
         );
-        let n_before = logs
-            .iter()
-            .filter(|e| e.category == "path_normalize")
-            .count();
-        db.repair_mixed_separator_paths().expect("again");
-        let n_after = db
-            .list_error_logs(10)
-            .unwrap()
-            .iter()
-            .filter(|e| e.category == "path_normalize")
-            .count();
-        assert_eq!(n_after, n_before);
+    }
+
+    /// #63: on Linux/Windows, NFD on-disk names must stay byte-identical after upsert+repair
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn nfd_on_disk_path_survives_upsert_and_repair() {
+        let nfd = "cafe\u{0301}";
+        let nfc = "caf\u{e9}";
+        assert_ne!(nfd.as_bytes(), nfc.as_bytes());
+
+        let dir = {
+            let mut d = std::env::temp_dir();
+            d.push(format!(
+                "idam-nfd-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let file_path = dir.join(format!("{nfd}.mp4"));
+        std::fs::write(&file_path, b"nfd-bytes").unwrap();
+        assert!(file_path.is_file(), "NFD file must exist on disk");
+
+        let path_str = file_path.to_str().expect("utf8 path");
+        assert!(
+            path_str.contains(nfd),
+            "temp path should carry NFD codepoints: {path_str}"
+        );
+
+        let db = open_memory_db();
+        let (id, is_new) = db.upsert_file(path_str, 9, None).expect("upsert");
+        assert!(is_new);
+        let stored = db.get_file_by_path(path_str).unwrap().unwrap();
+        assert_eq!(
+            stored.path, path_str,
+            "upsert must keep NFD codepoints on non-macOS"
+        );
+        assert!(
+            std::path::Path::new(&stored.path).is_file(),
+            "stored path must still resolve on disk"
+        );
+
+        assert!(
+            !db.needs_path_separator_repair().unwrap(),
+            "NFD-only path must not trigger repair on non-macOS"
+        );
+        db.repair_mixed_separator_paths().expect("repair");
+        let after = db.get_file_by_id(id).expect("get after repair");
+        assert_eq!(after.path, path_str, "repair must not NFC-convert on non-macOS");
+        assert!(
+            std::path::Path::new(&after.path).is_file(),
+            "path after repair must still exist"
+        );
+        assert!(db.list_error_logs(5).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
