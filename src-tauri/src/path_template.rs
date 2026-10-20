@@ -548,8 +548,10 @@ pub fn render_output_path(
 ///    stored string matches what macOS APIs typically return after normalization.
 ///    Linux (ext4) and Windows (NTFS) compare bytes: keep original codepoints so an
 ///    on-disk NFD name is not rewritten to a non-existent path. Cross-platform NFC
-///    matching needs a separate lookup-key column (not bundled into #66
-///    `pending_move_to` — different concern, full-table backfill, query changes).
+///    matching needs a separate lookup-key column — deferred to
+///    https://github.com/william563214/intelligent-dam/issues/72
+///    (not bundled into #66 `pending_move_to` — different concern, full-table backfill,
+///    query changes).
 /// 2. **Trailing separators** — strip trailing `/` or `\` except roots (`/`, `C:\`,
 ///    volume root `\\?\Volume{…}\`). UNC share roots may drop the trailing sep.
 /// 3. **Case** — do **not** ASCII-fold path components for storage. `Files.path` UNIQUE
@@ -813,6 +815,60 @@ where
 /// True when paths refer to the same file (dev/ino or Windows volume+index)
 pub fn is_same_file_identity(a: &Path, b: &Path) -> bool {
     same_file::is_same_file(a, b).unwrap_or(false)
+}
+
+/// Durable filesystem identity for pending_move_to crash recovery (#66 S3)
+///
+/// Unix: `st_dev` + `st_ino`. Windows: volume serial + file index.
+/// Same-volume rename preserves the index so dest can be matched to the
+/// recorded source; cross-volume copy gets a new index (fall back to size/phash).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsFileId {
+    pub volume: u64,
+    pub index: u64,
+}
+
+/// Read volume+index for an existing file path
+pub fn read_fs_file_id(path: &Path) -> std::io::Result<Option<FsFileId>> {
+    let meta = match fs::metadata(path) {
+        Ok(m) if m.is_file() => m,
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    Ok(Some(fs_file_id_from_metadata(&meta)))
+}
+
+fn fs_file_id_from_metadata(meta: &fs::Metadata) -> FsFileId {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FsFileId {
+            volume: meta.dev(),
+            index: meta.ino(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        FsFileId {
+            volume: u64::from(meta.volume_serial_number().unwrap_or(0)),
+            index: meta.file_index().unwrap_or(0),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = meta;
+        FsFileId {
+            volume: 0,
+            index: 0,
+        }
+    }
+}
+
+/// True when both IDs share a volume (rename keeps index; cross-volume does not)
+pub fn fs_file_id_same_volume(a: FsFileId, b: FsFileId) -> bool {
+    a.volume != 0 && a.volume == b.volume
 }
 
 /// True when `desired` already exists on disk and is not the same file as `source`
