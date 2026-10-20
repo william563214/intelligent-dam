@@ -137,10 +137,12 @@ mod tests {
         let dir = unique_temp_dir("ttl");
         let file = dir.join("clip.mp4");
         fs::write(&file, b"x").unwrap();
-        let supp = PathSuppression::new(Duration::from_millis(30));
+        // Use a generous TTL so canonicalize / CI scheduling cannot expire
+        // the entry before the first is_suppressed check (30ms was flaky on Windows)
+        let supp = PathSuppression::new(Duration::from_secs(30));
         supp.suppress(&file);
         assert!(supp.is_suppressed(&file));
-        supp.advance_clock(Duration::from_millis(60));
+        supp.advance_clock(Duration::from_secs(31));
         assert!(!supp.is_suppressed(&file));
         let _ = fs::remove_dir_all(&dir);
     }
