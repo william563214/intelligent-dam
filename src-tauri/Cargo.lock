@@ -2021,6 +2021,7 @@ dependencies = [
  "unicode-normalization",
  "unicode-segmentation",
  "walkdir",
+ "winapi-util",
 ]
 
 [[package]]

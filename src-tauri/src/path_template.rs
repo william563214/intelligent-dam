@@ -830,39 +830,42 @@ pub struct FsFileId {
 
 /// Read volume+index for an existing file path
 pub fn read_fs_file_id(path: &Path) -> std::io::Result<Option<FsFileId>> {
-    let meta = match fs::metadata(path) {
-        Ok(m) if m.is_file() => m,
-        Ok(_) => return Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    Ok(Some(fs_file_id_from_metadata(&meta)))
-}
-
-fn fs_file_id_from_metadata(meta: &fs::Metadata) -> FsFileId {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        FsFileId {
+        let meta = match fs::metadata(path) {
+            Ok(m) if m.is_file() => m,
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(Some(FsFileId {
             volume: meta.dev(),
             index: meta.ino(),
-        }
+        }))
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        FsFileId {
-            volume: u64::from(meta.volume_serial_number().unwrap_or(0)),
-            index: meta.file_index().unwrap_or(0),
+        // std MetadataExt::{volume_serial_number,file_index} need unstable
+        // `windows_by_handle` — use GetFileInformationByHandle via winapi-util.
+        let handle = match winapi_util::Handle::from_path_any(path) {
+            Ok(h) => h,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if !handle.as_file().metadata()?.is_file() {
+            return Ok(None);
         }
+        let info = winapi_util::file::information(&handle)?;
+        Ok(Some(FsFileId {
+            volume: info.volume_serial_number(),
+            index: info.file_index(),
+        }))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = meta;
-        FsFileId {
-            volume: 0,
-            index: 0,
-        }
+        let _ = path;
+        Ok(None)
     }
 }
 
