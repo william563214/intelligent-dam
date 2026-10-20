@@ -120,7 +120,7 @@ pub fn resolve_watch_paths(raw: &[String]) -> Vec<PathBuf> {
         let path = PathBuf::from(trimmed);
         if !path.is_dir() {
             eprintln!(
-                "watcher: skip non-directory or missing path {}",
+                "watcher: 資料夾不存在或不是目錄 {}",
                 path.display()
             );
             continue;
@@ -332,7 +332,7 @@ impl WatcherManager {
         start_workers: bool,
     ) -> Result<WatcherStatus> {
         if paths.is_empty() {
-            anyhow::bail!("No valid watch directories (configure scan directories in settings)");
+            anyhow::bail!("資料夾不存在：沒有有效的監控目錄（請在設定中設定掃描目錄）");
         }
 
         self.stop_with_timeout(worker_join_timeout)?;
