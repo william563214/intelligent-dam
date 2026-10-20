@@ -41,8 +41,6 @@ jobs:
     runs-on: macos-latest
     permissions:
       contents: read
-      # upload-artifact only; never grant contents:write in the job that runs PR code.
-      actions: write
     env:
       # workflow_dispatch uses inputs.tag; release published uses the release tag.
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
@@ -254,7 +252,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      actions: read
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
