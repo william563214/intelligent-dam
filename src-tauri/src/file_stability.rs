@@ -20,7 +20,8 @@
 //!   an exclusive lock delay ingest until they release it. Size+mtime still
 //!   catches writers that never lock. There is no Windows-style share-mode
 //!   fallback: a writer that stalls longer than the stability window without
-//!   holding a lock is treated as complete (follow-up issue material).
+//!   holding a lock is treated as complete
+//!   (https://github.com/william563214/intelligent-dam/issues/68).
 //! - **Windows**: many copy tools do not take an advisory lock; size+mtime
 //!   plus the FILE_SHARE_READ open probe are the primary signals.
 //! - **mtime granularity**: FAT and some SMB mounts update mtime in 2s (or
@@ -451,6 +452,7 @@ fn try_windows_share_read(path: &Path) -> LockProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::collections::HashMap;
     use std::io::{Seek, SeekFrom, Write};
     use std::sync::{Arc, Mutex};
@@ -527,46 +529,15 @@ mod tests {
     #[test]
     fn mtime_change_resets_stability_even_when_size_unchanged() {
         // Refs #68: gate must treat mtime churn (size fixed) as not-complete.
-        // macOS CI (5799a79 run 39435193270) saw Ok(size) here when the bumper
-        // only rewrote identical bytes — that is not a reliable mtime signal
-        // under scheduler load. Stamp mtime explicitly each iteration.
+        // Deterministic: bump mtime inside should_abort (called every poll) so
+        // each sample is guaranteed a new mtime — no second thread / scheduler race.
         let path = unique_temp_file("mtime");
         let payload = b"same-size-payload!!";
         fs::write(&path, payload).unwrap();
 
-        let path_for_bumper = path.clone();
-        let stop = Arc::new(Mutex::new(false));
-        let stop_flag = Arc::clone(&stop);
-
-        let bumper = thread::spawn(move || {
-            // Keep size fixed but advance mtime so the gate must not declare stable.
-            // Open write-only (no truncate): rewrite the same payload at offset 0.
-            // Do not use fs::write — it truncates to 0 first so the poll can see a
-            // size change and the test would pass for the wrong reason.
-            let mut tick = 0u64;
-            while !*stop_flag.lock().unwrap() {
-                let mut file = File::options()
-                    .write(true)
-                    .open(&path_for_bumper)
-                    .expect("open for mtime bump");
-                file.seek(SeekFrom::Start(0)).expect("seek start");
-                file.write_all(payload).expect("rewrite payload");
-                tick = tick.saturating_add(1);
-                // Monotonic stamps independent of wall clock / identical-byte rewrite
-                let stamped =
-                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + tick);
-                file.set_modified(stamped).expect("set_modified");
-                file.sync_all().expect("sync after rewrite");
-                drop(file);
-                assert_eq!(
-                    fs::metadata(&path_for_bumper).unwrap().len(),
-                    payload.len() as u64,
-                    "bumper must not change size"
-                );
-                // Faster than poll_interval so churn outruns stable_checks windows
-                thread::sleep(Duration::from_millis(5));
-            }
-        });
+        let path_for_cb = path.clone();
+        let tick = Cell::new(0u64);
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
 
         let opts = StabilityOptions {
             poll_interval: Duration::from_millis(25),
@@ -576,11 +547,31 @@ mod tests {
             held_degrade_after: Duration::from_secs(30),
         };
 
-        let err = wait_until_stable(&path, &opts, || false).expect_err("mtime churn");
+        let err = wait_until_stable(&path, &opts, || {
+            // Keep size fixed; rewrite without truncate then stamp a new mtime.
+            // Do not use fs::write — it truncates to 0 first so the poll can see a
+            // size change and the test would pass for the wrong reason.
+            let next = tick.get().saturating_add(1);
+            tick.set(next);
+            let mut file = File::options()
+                .write(true)
+                .open(&path_for_cb)
+                .expect("open for mtime bump");
+            file.seek(SeekFrom::Start(0)).expect("seek start");
+            file.write_all(payload).expect("rewrite payload");
+            file.set_modified(base + Duration::from_secs(next))
+                .expect("set_modified");
+            file.sync_all().expect("sync after rewrite");
+            drop(file);
+            assert_eq!(
+                fs::metadata(&path_for_cb).unwrap().len(),
+                payload.len() as u64,
+                "callback must not change size"
+            );
+            false
+        })
+        .expect_err("mtime churn");
         assert!(matches!(err, StabilityError::TimedOut { .. }));
-
-        *stop.lock().unwrap() = true;
-        bumper.join().unwrap();
 
         // After mtime settles the same bytes should pass
         let settle = StabilityOptions {
