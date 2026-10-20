@@ -1051,6 +1051,38 @@ fn pending_fs_id_allows_commit(
     Ok(())
 }
 
+/// Startup refusal ErrorLog — dedupe by category+path+message (same as leftover scan)
+fn insert_pending_recovery_refusal_log(
+    guard: &Database,
+    row: &crate::database::PendingMoveRow,
+    message: &str,
+    detail: &str,
+) {
+    match guard.has_error_log_entry("move", Some(&row.path), message) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!(
+                "warn: ErrorLog dedupe check failed for pending recovery file_id={}: {e}",
+                row.file_id
+            );
+            return;
+        }
+    }
+    if let Err(log_err) = guard.insert_error_log(
+        "move",
+        Some(row.file_id),
+        Some(&row.path),
+        message,
+        Some(detail),
+    ) {
+        eprintln!(
+            "warn: ErrorLog for pending recovery refusal file_id={}: {log_err}",
+            row.file_id
+        );
+    }
+}
+
 /// #66: recover every Files row with `pending_move_to` on startup
 ///
 /// Crash points:
@@ -1158,31 +1190,23 @@ fn recover_one_pending_move(
             "source={} dest={} db_size={} dest_size={} phash={:?}",
             row.path, row.pending_move_to, row.size, dest_size, row.phash
         );
+        let message =
+            "pending_move recovery refused: destination does not match size/phash; keeping pending";
         let guard = db
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
-        let _ = guard.insert_error_log(
-            "move",
-            Some(row.file_id),
-            Some(&row.path),
-            "pending_move recovery refused: destination does not match size/phash; keeping pending",
-            Some(&detail),
-        );
+        insert_pending_recovery_refusal_log(&guard, row, message, &detail);
         return Ok(false);
     }
 
     // S3: same-volume fs id must match when recorded
     if let Err(msg) = pending_fs_id_allows_commit(row, dest) {
+        let message =
+            "pending_move recovery refused: destination fs id does not match pending source; keeping pending";
         let guard = db
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
-        let _ = guard.insert_error_log(
-            "move",
-            Some(row.file_id),
-            Some(&row.path),
-            "pending_move recovery refused: destination fs id does not match pending source; keeping pending",
-            Some(&msg),
-        );
+        insert_pending_recovery_refusal_log(&guard, row, message, &msg);
         return Ok(false);
     }
 
@@ -1393,16 +1417,24 @@ fn finalize_move_inner(
         .ok_or_else(|| anyhow::anyhow!("Destination path is not valid UTF-8"))?
         .to_string();
 
-    // #66: durable intent + source fs id before any filesystem rename
-    let source_fs_id = path_template::read_fs_file_id(source)
-        .with_context(|| format!("Failed to read source fs id {}", source.display()))?
-        .ok_or_else(|| anyhow::anyhow!("Source is not a file: {}", source.display()))?;
+    // #66: durable intent + optional source fs id before any filesystem rename
+    if !source.is_file() {
+        anyhow::bail!("Source is not a file: {}", source.display());
+    }
+    // Windows: missing index → None (size/phash only); other IO errors degrade too
+    let source_fs_id = path_template::read_fs_file_id(source).unwrap_or_else(|e| {
+        eprintln!(
+            "warn: source fs id unavailable ({}): {e}; pending without fs id",
+            source.display()
+        );
+        None
+    });
     {
         let guard = db
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
         guard
-            .set_pending_move_to(file_id, &new_path_str, Some(source_fs_id))
+            .set_pending_move_to(file_id, &new_path_str, source_fs_id)
             .map_err(|e| anyhow::anyhow!("Failed to set pending_move_to: {}", e))?;
     }
 
