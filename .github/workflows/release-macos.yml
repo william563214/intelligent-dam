@@ -137,19 +137,58 @@ jobs:
           exit "$status"
 
       - name: Verify universal binary arches and ad-hoc signing
+        # Tauri removes the .app after building the .dmg ("Cleaning … .app"), so
+        # mount the DMG and inspect the shipped app binary + codesign there.
         shell: bash
         run: |
           set -euo pipefail
-          app_dir="src-tauri/target/universal-apple-darwin/release/bundle/macos"
           shopt -s nullglob
-          apps=("$app_dir"/*.app)
+          dmg_files=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if ((${#dmg_files[@]} == 0)); then
+            echo "Missing universal .dmg before verify"
+            find src-tauri/target -type f -name '*.dmg' -print || true
+            exit 1
+          fi
+          dmg="${dmg_files[0]}"
+          echo "DMG: $dmg"
+
+          # Also lipo the pre-bundle universal executable as a quick sanity check.
+          exe="src-tauri/target/universal-apple-darwin/release/intelligent-dam"
+          if [[ -f "$exe" ]]; then
+            echo "lipo -archs (release exe): $(lipo -archs "$exe")"
+          fi
+
+          attach_dmg() {
+            hdiutil attach -nobrowse -readonly "$dmg"
+          }
+          set +e
+          attach_out="$(attach_dmg 2>&1)"
+          attach_status=$?
+          set -e
+          if [[ "$attach_status" -ne 0 ]]; then
+            printf '%s\n' "$attach_out"
+            if printf '%s\n' "$attach_out" | grep -q 'Resource busy'; then
+              echo "hdiutil attach Resource busy; retrying once after sleep."
+              sleep 10
+              attach_out="$(attach_dmg)"
+            else
+              exit "$attach_status"
+            fi
+          fi
+          printf '%s\n' "$attach_out"
+          # Last field of hdiutil attach output is the mount point.
+          mount_point="$(printf '%s\n' "$attach_out" | awk 'NF{mp=$NF} END{print mp}')"
+          echo "Mount point: $mount_point"
+          cleanup() { hdiutil detach "$mount_point" -quiet || hdiutil detach "$mount_point" -force || true; }
+          trap cleanup EXIT
+
+          apps=("$mount_point"/*.app)
           if ((${#apps[@]} == 0)); then
-            echo "Missing .app under ${app_dir}"
-            find src-tauri/target -type d -name '*.app' -print || true
+            echo "Missing .app inside DMG at ${mount_point}"
+            ls -la "$mount_point" || true
             exit 1
           fi
           app="${apps[0]}"
-          # Product binary lives at Contents/MacOS/<productName>.
           bin="$(find "$app/Contents/MacOS" -type f -perm -111 | head -n 1)"
           echo "App: $app"
           echo "Binary: $bin"
