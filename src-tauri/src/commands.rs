@@ -405,7 +405,7 @@ pub fn resolve_path_collision(
 
     let suppressions = queue.path_suppressions().ok();
 
-    let (source, desired, occupant_id) = {
+    let (source, desired, source_path_str) = {
         let guard = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
@@ -430,7 +430,7 @@ pub fn resolve_path_collision(
         (
             source,
             PathBuf::from(&pending.desired_path),
-            pending.occupant_file_id,
+            file.path.clone(),
         )
     };
 
@@ -469,50 +469,42 @@ pub fn resolve_path_collision(
             })
         }
         "overwrite" => {
-            // Occupant library row loses its file on disk → displace path (UNIQUE)
-            // then mark missing before the mover claims desired_path
-            if let Some(occupant) = occupant_id {
-                if occupant != file_id {
-                    let guard = db
-                        .lock()
-                        .map_err(|e| format!("Database lock error: {}", e))?;
-                    if let Ok(row) = guard.get_file_by_id(occupant) {
-                        let displaced = format!(
-                            "{}#displaced-{}",
-                            row.path, occupant
-                        );
-                        guard
-                            .update_file_path(occupant, &displaced)
-                            .map_err(|e| {
-                                format!("Failed to displace occupant path: {}", e)
-                            })?;
-                        if row.status != file_status::missing {
-                            guard
-                                .update_file_status(occupant, file_status::missing)
-                                .map_err(|e| {
-                                    format!("Failed to mark occupant missing: {}", e)
-                                })?;
-                        }
-                    }
-                }
+            if let Some(supp) = suppressions.as_ref() {
+                supp.suppress(&desired);
             }
-            pipeline::finalize_move_overwrite(
-                db,
-                file_id,
-                &source,
-                &desired,
-                suppressions.as_deref(),
-            )
-            .map_err(|e| format!("Failed to overwrite move: {e:#}"))?;
-            {
+            // Filesystem first (backup occupant); no DB writes until commit
+            let outcome = path_template::move_file_overwrite(&source, &desired)
+                .map_err(|e| format!("Failed to overwrite move: {e:#}"))?;
+            if let Some(supp) = suppressions.as_ref() {
+                supp.suppress(&desired);
+            }
+
+            let new_path = desired
+                .to_str()
+                .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
+                .to_string();
+
+            let commit = {
                 let guard = db
                     .lock()
                     .map_err(|e| format!("Database lock error: {}", e))?;
-                guard
-                    .resolve_path_collision(file_id, "overwrite")
-                    .map_err(|e| format!("Failed to resolve path collision: {}", e))?;
+                guard.commit_path_collision_overwrite(file_id, &source_path_str, &new_path)
+            };
+
+            if let Err(e) = commit {
+                if let Err(rb) = path_template::restore_overwrite_files(
+                    &source,
+                    &desired,
+                    outcome.backup.as_deref(),
+                ) {
+                    return Err(format!(
+                        "Failed to commit overwrite ({e}); file restore also failed: {rb:#}"
+                    ));
+                }
+                return Err(format!("Failed to commit overwrite: {e}"));
             }
-            let new_path = desired.to_string_lossy().to_string();
+
+            path_template::discard_overwrite_backup(outcome.backup.as_deref());
             let file = reload_file_with_metadata(db, file_id)?;
             Ok(ResolvePathCollisionOutcome::Overwrite {
                 file: Box::new(file),
