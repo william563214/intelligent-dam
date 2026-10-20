@@ -25,7 +25,7 @@ on:
     paths:
       - ".github/workflows/release-macos.yml"
 
-# Least privilege at workflow level; job grants contents write only when uploading.
+# Least privilege at workflow level; build stays contents:read, publish alone gets write.
 permissions: {}
 
 concurrency:
@@ -37,30 +37,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-macos:
+  build:
     runs-on: macos-latest
     permissions:
-      # write needed for gh release upload; dry-runs only use upload-artifact.
-      contents: write
+      contents: read
+      # upload-artifact only; never grant contents:write in the job that runs PR code.
+      actions: write
     env:
       # workflow_dispatch uses inputs.tag; release published uses the release tag.
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
-      # pull_request always dry-runs; workflow_dispatch dry-runs when upload is false.
-      IS_DRY_RUN: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.upload == false) }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Required before checkout so gh can target this repo without a local git remote.
-      GH_REPO: ${{ github.repository }}
       # Ad-hoc signing ("-") so the .app is signed without a Developer ID certificate.
       APPLE_SIGNING_IDENTITY: "-"
     steps:
-      - name: Verify target release exists
-        if: env.IS_DRY_RUN != 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Target tag: ${RELEASE_TAG}"
-          gh release view "${RELEASE_TAG}" --json tagName,isDraft,url
-
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -214,7 +202,6 @@ jobs:
           fi
 
       - name: Stage DMG and SHA256SUMS-macos.txt
-        id: stage
         shell: bash
         run: |
           set -euo pipefail
@@ -248,27 +235,63 @@ jobs:
 
           ls -la .temp/macos-release
           cat "$sums_path"
-          echo "sums_path=${sums_path}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-dmg
+          path: |
+            .temp/macos-release/*.dmg
+            .temp/macos-release/SHA256SUMS-macos.txt
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    # Never on pull_request; never when workflow_dispatch sets upload=false.
+    if: >-
+      github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.upload)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: macos-dmg
+          path: .temp/macos-release
+
+      - name: Verify target release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Target tag: ${RELEASE_TAG}"
+          gh release view "${RELEASE_TAG}" --json tagName,isDraft,url
 
       - name: Upload release assets
-        if: env.IS_DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
           staged=(.temp/macos-release/*.dmg)
           sums_path=".temp/macos-release/SHA256SUMS-macos.txt"
+          if ((${#staged[@]} == 0)) || [[ ! -f "$sums_path" ]]; then
+            echo "Missing DMG or SHA256SUMS-macos.txt in downloaded artifacts"
+            ls -la .temp/macos-release || true
+            exit 1
+          fi
           echo "Uploading to release ${RELEASE_TAG}"
+          ls -la .temp/macos-release
+          cat "$sums_path"
           # --clobber replaces same-named macOS assets only; leaves Linux / Windows sums untouched.
           # Does not create tags, edit release notes, or touch Linux / Windows assets.
           gh release upload "${RELEASE_TAG}" "${staged[@]}" "$sums_path" --clobber
-
-      - name: Upload dry-run artifacts
-        if: env.IS_DRY_RUN == 'true'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: macos-dmg-dry-run
-          path: |
-            .temp/macos-release/*.dmg
-            .temp/macos-release/SHA256SUMS-macos.txt
-          if-no-files-found: error
