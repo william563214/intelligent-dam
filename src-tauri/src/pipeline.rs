@@ -1850,12 +1850,25 @@ mod tests {
             output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
             ..AppSettings::default()
         };
-        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        // Must use the same PathBuf string step_move renders (Windows / vs \)
+        let desired = render_output_path(
+            &settings.output_template,
+            &TemplateContext::from_metadata(
+                &src,
+                Some("StudioA"),
+                Some("2024-06-01"),
+                Some("Demo"),
+                None,
+            ),
+            src.parent().unwrap(),
+        )
+        .expect("render");
         fs::create_dir_all(desired.parent().unwrap()).unwrap();
         fs::rename(&src, &desired).unwrap();
 
+        let desired_str = desired.to_str().unwrap().to_string();
         let occupant = db
-            .insert_file(desired.to_str().unwrap(), payload.len() as u64, None)
+            .insert_file(&desired_str, payload.len() as u64, None)
             .expect("occupant");
         assert_ne!(occupant, file_id);
 
@@ -1907,15 +1920,32 @@ mod tests {
             output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
             ..AppSettings::default()
         };
-        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        let desired = render_output_path(
+            &settings.output_template,
+            &TemplateContext::from_metadata(
+                &src,
+                Some("StudioA"),
+                Some("2024-06-01"),
+                Some("Demo"),
+                None,
+            ),
+            src.parent().unwrap(),
+        )
+        .expect("render");
         fs::create_dir_all(desired.parent().unwrap()).unwrap();
         fs::rename(&src, &desired).unwrap();
 
-        // Occupant registered under differently-cased path string
+        // Occupant under differently-cased path string (same FS file on Windows)
         let alt = desired.to_string_lossy().to_uppercase();
-        let _occ = db
+        assert_ne!(
+            alt,
+            desired.to_string_lossy(),
+            "precondition: case must differ"
+        );
+        let occ = db
             .insert_file(&alt, payload.len() as u64, None)
             .expect("occupant nocase");
+        assert_ne!(occ, file_id);
 
         let arc = Arc::new(Mutex::new(db));
         let err = step_move(&arc, file_id, &settings, None).expect_err("nocase occupant");
