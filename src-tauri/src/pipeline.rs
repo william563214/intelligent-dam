@@ -1735,6 +1735,8 @@ mod tests {
         let file_id = db
             .insert_file(src.to_str().unwrap(), 8, None)
             .expect("insert");
+        // #61: insert_file stores normalize_db_path (Windows / → \)
+        let stored_path = db.get_file_by_id(file_id).unwrap().path;
         db.update_metadata(&Metadata {
             file_id,
             title: Some("Demo".to_string()),
@@ -1760,7 +1762,7 @@ mod tests {
         );
         let guard = arc.lock().unwrap();
         let file = guard.get_file_by_id(file_id).unwrap();
-        assert_eq!(file.path, src.to_str().unwrap());
+        assert_eq!(file.path, stored_path);
         assert_ne!(file.status, file_status::missing);
     }
 
