@@ -812,9 +812,8 @@ fn step_move(
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
             guard
-                .get_file_by_path(&desired_str)?
+                .find_file_occupying_path(&desired_str, file_id)?
                 .map(|f| f.id)
-                .filter(|id| *id != file_id)
         };
         {
             let guard = db
@@ -839,18 +838,7 @@ pub fn finalize_move(
     dest: &Path,
     suppressions: Option<&PathSuppression>,
 ) -> Result<()> {
-    finalize_move_inner(db, file_id, source, dest, suppressions, false)
-}
-
-/// Overwrite destination then update Files.path
-pub fn finalize_move_overwrite(
-    db: &Arc<Mutex<Database>>,
-    file_id: i64,
-    source: &Path,
-    dest: &Path,
-    suppressions: Option<&PathSuppression>,
-) -> Result<()> {
-    finalize_move_inner(db, file_id, source, dest, suppressions, true)
+    finalize_move_inner(db, file_id, source, dest, suppressions)
 }
 
 fn finalize_move_inner(
@@ -859,30 +847,19 @@ fn finalize_move_inner(
     source: &Path,
     dest: &Path,
     suppressions: Option<&PathSuppression>,
-    overwrite: bool,
 ) -> Result<()> {
     // Suppress before the rename so recursive watch events are ignored
     if let Some(supp) = suppressions {
         supp.suppress(dest);
     }
 
-    if overwrite {
-        path_template::move_file_overwrite(source, dest).with_context(|| {
-            format!(
-                "Failed to overwrite-move {} → {}",
-                source.display(),
-                dest.display()
-            )
-        })?;
-    } else {
-        move_file(source, dest).with_context(|| {
-            format!(
-                "Failed to move {} → {}",
-                source.display(),
-                dest.display()
-            )
-        })?;
-    }
+    move_file(source, dest).with_context(|| {
+        format!(
+            "Failed to move {} → {}",
+            source.display(),
+            dest.display()
+        )
+    })?;
 
     if let Some(supp) = suppressions {
         supp.suppress(dest);
