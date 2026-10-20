@@ -1,0 +1,130 @@
+# Build a macOS .dmg (universal) and upload it to an existing GitHub Release
+# Does not create tags or releases and does not change draft/prerelease state
+# Unsigned builds trip Gatekeeper users must right-click Open the first time
+name: Release macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build from and upload assets to
+        required: true
+        default: v0.1.0
+        type: string
+  release:
+    types: [published]
+
+# Least privilege at workflow level job grants contents write for gh upload
+permissions: {}
+
+concurrency:
+  group: release-macos-${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      # workflow_dispatch uses inputs.tag release published uses the release tag
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Required before checkout so gh can target this repo without a local git remote
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Verify target release exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Target tag: ${RELEASE_TAG}"
+          gh release view "${RELEASE_TAG}" --json tagName,isDraft,url
+
+      - name: Checkout tag commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # package-lock.json lockfileVersion 3 Node 18+
+          node-version: "20"
+          cache: npm
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build frontend if tag lacks beforeBuildCommand
+        # Checkout is the release tag commit (e.g. v0.1.0) which may predate
+        # beforeBuildCommand. Skip when present so tauri build does not double-build.
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! node -e "process.exit(require('./src-tauri/tauri.conf.json').build?.beforeBuildCommand?0:1)"; then
+            npm run build
+          fi
+
+      - name: Setup Rust toolchain
+        # Action pinned to stable-branch tip toolchain pinned to MSRV
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: "1.83.0"
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: ./src-tauri -> target
+
+      - name: Build macOS DMG (universal)
+        # Frontend already built above when tag has no beforeBuildCommand
+        # otherwise tauri beforeBuildCommand builds it once during this step
+        # --locked keeps Cargo.lock authoritative for the MSRV 1.83 tree
+        # universal-apple-darwin covers Apple Silicon and Intel in one .dmg
+        run: npx tauri build --target universal-apple-darwin --bundles dmg -- --locked
+
+      - name: Upload DMG and SHA256SUMS-macos.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .temp/macos-release
+
+          shopt -s nullglob
+          # Prefer universal output fall back to host-arch dmg if present
+          dmg_files=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
+          if ((${#dmg_files[@]} == 0)); then
+            dmg_files=(src-tauri/target/release/bundle/dmg/*.dmg)
+          fi
+          if ((${#dmg_files[@]} == 0)); then
+            echo "Missing .dmg under src-tauri/target/**/release/bundle/dmg"
+            find src-tauri/target -type f \( -name '*.dmg' -o -name '*.app' \) -print || true
+            exit 1
+          fi
+
+          # Rename spaces to dots so asset names match GitHub Release storage and checksums
+          staged=()
+          for file in "${dmg_files[@]}"; do
+            base="$(basename "$file")"
+            safe_name="${base// /.}"
+            dest=".temp/macos-release/${safe_name}"
+            cp -f "$file" "$dest"
+            staged+=("$dest")
+          done
+
+          sums_path=".temp/macos-release/SHA256SUMS-macos.txt"
+          : > "$sums_path"
+          for file in "${staged[@]}"; do
+            # Portable SHA-256 (macOS shasum) LF-only for Linux sha256sum -c
+            hash="$(shasum -a 256 "$file" | awk '{print $1}')"
+            printf '%s  %s\n' "$hash" "$(basename "$file")" >> "$sums_path"
+          done
+
+          echo "Uploading to release ${RELEASE_TAG}"
+          ls -la .temp/macos-release
+          cat "$sums_path"
+
+          # --clobber replaces same-named macOS assets only leaves Linux/Windows sums untouched
+          # Does not create tags edit release notes or touch Linux/Windows assets
+          gh release upload "${RELEASE_TAG}" "${staged[@]}" "$sums_path" --clobber
