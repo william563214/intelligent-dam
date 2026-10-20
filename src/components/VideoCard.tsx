@@ -283,6 +283,11 @@ export default function VideoCard({
                 {pathCollision.desiredPath.split(/[/\\]/).pop()}
               </span>
             </p>
+            <p className="text-[11px] text-yellow-800/90 mb-2">
+              若曾中斷覆寫，同目錄可能留下{" "}
+              <code className="text-[10px]">.idam-bak</code>
+              ；請手動刪除後再覆寫同一目的地，否則會擋住復原。
+            </p>
             {onResolvePathCollision && (
               <div className="flex flex-wrap gap-2">
                 <button

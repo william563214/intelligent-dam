@@ -1007,6 +1007,64 @@ fn setup_crashed_overwrite(
 }
 
 #[test]
+fn path_collision_overwrite_crash_defers_when_source_parent_unreachable() {
+    // S-A: offline volume → retryable; mover stays path_collision; bak kept
+    let fx = Fixture::new();
+    let (file_id, _occupied, bak, _mover_path) = setup_crashed_overwrite(
+        &fx,
+        "n4_offline",
+        b"new-bytes",
+        b"old-bytes",
+        None,
+    );
+    let offline_path = "/idam-offline-vol-xyz/media/incoming.mp4";
+    {
+        let db = fx.db.lock().expect("lock");
+        db.update_file_path(file_id, offline_path)
+            .expect("point mover at offline parent");
+    }
+    let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
+        .expect_err("offline");
+    assert!(
+        err.to_lowercase().contains("retryable")
+            || err.to_lowercase().contains("unreachable"),
+        "expected retryable offline error got {err}"
+    );
+    assert!(bak.exists(), "bak kept while offline");
+    let db = fx.db.lock().expect("lock");
+    let mover = db.get_file_by_id(file_id).expect("mover");
+    assert_eq!(mover.status, "path_collision");
+    assert_eq!(mover.path, offline_path);
+}
+
+#[test]
+fn path_collision_overwrite_crash_recovers_without_bak_when_identity_matches() {
+    // N1: bak already gone but dest matches mover → complete commit (like #60 heal)
+    let fx = Fixture::new();
+    let (file_id, occupied, bak, _mover_path) = setup_crashed_overwrite(
+        &fx,
+        "n4_no_bak",
+        b"new-bytes",
+        b"old-bytes",
+        None,
+    );
+    fs::remove_file(&bak).expect("drop bak");
+    let outcome =
+        resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true).expect("recover");
+    match outcome {
+        ResolvePathCollisionOutcome::Overwrite { file, new_path } => {
+            assert_eq!(file.file.status, "ready");
+            assert_eq!(Path::new(&new_path), occupied.as_path());
+        }
+        other => panic!("expected Overwrite got {other:?}"),
+    }
+    let db = fx.db.lock().expect("lock");
+    let mover = db.get_file_by_id(file_id).expect("mover");
+    assert_eq!(Path::new(&mover.path), occupied.as_path());
+    assert_ne!(mover.status, "missing");
+}
+
+#[test]
 fn path_collision_overwrite_crash_refuses_size_mismatch_keeps_bak() {
     let fx = Fixture::new();
     let (file_id, occupied, bak, mover_path) = setup_crashed_overwrite(

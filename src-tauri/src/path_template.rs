@@ -147,12 +147,13 @@ pub fn is_windows_reserved_device_name(segment: &str) -> bool {
 }
 
 /// Strip characters that are illegal or awkward in path segments
-/// Windows reserved device names get a trailing `_` (e.g. `CON.mp4` → `CON.mp4_`)
+/// Windows reserved device names get a trailing `_` (e.g. dir `CON.mp4` → `CON.mp4_`)
 pub fn sanitize_segment(raw: &str) -> String {
     sanitize_segment_inner(raw, false)
 }
 
 /// Like `sanitize_segment` but keeps a trailing extension when capping to 255 bytes
+/// Reserved names put `_` on the stem so the extension stays scannable (`CON_.mp4`)
 pub fn sanitize_filename_segment(raw: &str) -> String {
     sanitize_segment_inner(raw, true)
 }
@@ -170,7 +171,7 @@ fn sanitize_segment_inner(raw: &str, preserve_extension: bool) -> String {
             c => out.push(c),
         }
     }
-    out = finish_segment_cleanup(out);
+    out = finish_segment_cleanup(out, preserve_extension);
     // #59: each path component must fit common FS name limits
     out = if preserve_extension {
         cap_filename_utf8_bytes(&out, max_path_segment_bytes)
@@ -178,18 +179,37 @@ fn sanitize_segment_inner(raw: &str, preserve_extension: bool) -> String {
         cap_segment_utf8_bytes(&out, max_path_segment_bytes)
     };
     // Re-run trailing cleanup + reserved-name after byte cap (S3)
-    finish_segment_cleanup(out)
+    finish_segment_cleanup(out, preserve_extension)
 }
 
-fn finish_segment_cleanup(raw: String) -> String {
-    let mut out = raw
+fn finish_segment_cleanup(raw: String, preserve_extension: bool) -> String {
+    let out = raw
         .trim_matches(|c: char| c == '.' || c == ' ')
         .to_string();
-    // Skip if we already appended `_` (e.g. CON.mp4_ stem is still CON)
-    if is_windows_reserved_device_name(&out) && !out.ends_with('_') {
-        out.push('_');
+    if !is_windows_reserved_device_name(&out) {
+        return out;
     }
-    out
+    if preserve_extension {
+        // S-B: CON.mp4 → CON_.mp4 (keep scannable extension)
+        let path = Path::new(&out);
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&out);
+        if stem.ends_with('_') {
+            return out;
+        }
+        format!("{stem}_{ext}")
+    } else if out.ends_with('_') {
+        out
+    } else {
+        format!("{out}_")
+    }
 }
 
 /// Truncate on UTF-8 char boundaries so the result is at most `max_bytes` long
@@ -1494,10 +1514,11 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_filename_segment_reruns_reserved_name_after_cap() {
-        // Reserved device name still gets trailing _ after cleanup pass
-        let out = sanitize_filename_segment("CON.mp4");
-        assert_eq!(out, "CON.mp4_");
+    fn sanitize_filename_segment_puts_underscore_on_stem() {
+        // S-B: keep extension so the scanner still sees a video file
+        assert_eq!(sanitize_filename_segment("CON.mp4"), "CON_.mp4");
+        assert_eq!(sanitize_filename_segment("com1.MKV"), "com1_.MKV");
+        assert_eq!(sanitize_filename_segment("CON"), "CON_");
     }
 
     #[test]
