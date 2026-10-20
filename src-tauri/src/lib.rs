@@ -193,6 +193,8 @@ pub fn run() {
             commands::resolve_suspected_duplicate_command,
             commands::list_duplicate_tombstones_command,
             commands::remove_duplicate_tombstone_command,
+            commands::preview_output_template_command,
+            commands::resolve_path_collision_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

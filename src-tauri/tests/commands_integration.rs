@@ -9,12 +9,14 @@
 use intelligent_dam_lib::test_support::{
     add_file_tag, clear_error_logs, clear_file_tags, current_schema_user_version,
     enqueue_pipeline_jobs, get_all_files, get_error_logs, get_file_tags, get_or_create_tag,
-    get_settings, insert_error_log, list_duplicate_tombstones, remove_duplicate_tombstone,
-    resolve_suspected_duplicate, resolve_suspected_duplicate_with_enqueue, save_settings,
-    scan_directory, scan_multiple_directories, AppSettings, Database, PipelineOptions,
-    ResolveSuspectedOutcome, SettingsStore, TaskQueue,
+    get_settings, insert_error_log, list_duplicate_tombstones, preview_output_template,
+    remove_duplicate_tombstone, resolve_path_collision, resolve_suspected_duplicate,
+    resolve_suspected_duplicate_with_enqueue, save_settings, scan_directory,
+    scan_multiple_directories, AppSettings, Database, Metadata, PipelineOptions,
+    ResolvePathCollisionOutcome, ResolveSuspectedOutcome, SettingsStore, TaskQueue,
 };
 use std::fs;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 struct Fixture {
@@ -51,7 +53,7 @@ fn fresh_temp_db_applies_user_version_migrations() {
     let db = Database::new(path.to_str().expect("utf8")).expect("open");
     let version = db.read_user_version().expect("user_version");
     assert_eq!(version, current_schema_user_version());
-    assert!(current_schema_user_version() >= 3);
+    assert!(current_schema_user_version() >= 6);
 }
 
 #[test]
@@ -535,4 +537,135 @@ fn deleting_keeper_restores_flagged_file_to_ready() {
         .get_pending_suspected_duplicate(near)
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn preview_output_template_renders_sample_with_helpers() {
+    let preview = preview_output_template(
+        "{{studio}}/{{format_date date \"YYYY\"}}_{{truncate title 6}}.{{ext}}",
+        Some("/library"),
+    )
+    .expect("preview");
+    assert!(
+        preview.rendered_path.ends_with("StudioX/2024_Sam....mp4")
+            || preview.rendered_path.replace('\\', "/").ends_with("StudioX/2024_Sam....mp4"),
+        "got {}",
+        preview.rendered_path
+    );
+    assert_eq!(preview.base_dir, "/library");
+}
+
+#[test]
+fn path_collision_suffix_skip_overwrite_flow() {
+    let fx = Fixture::new();
+    let media = fx.temp().join("lib");
+    fs::create_dir_all(media.join("StudioA")).expect("mkdir");
+    let occupied = media.join("StudioA").join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&occupied, b"old-bytes").expect("write occupied");
+    fs::write(&incoming, b"new-bytes").expect("write incoming");
+
+    let (file_id, occupant_id) = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 3, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 4, None)
+            .expect("incoming");
+        db.update_metadata(&Metadata {
+            file_id: id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: None,
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .expect("meta");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant),
+        )
+        .expect("mark collision");
+        (id, occupant)
+    };
+
+    let denied = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", false);
+    assert!(denied.is_err(), "overwrite needs confirm");
+
+    let skip = resolve_path_collision(&fx.db, &fx.queue, file_id, "skip", false).expect("skip");
+    match skip {
+        ResolvePathCollisionOutcome::Skip { file } => {
+            assert_eq!(file.file.id, file_id);
+            assert_eq!(file.file.status, "ready");
+            assert!(file.path_collision.is_none());
+        }
+        other => panic!("expected Skip, got {other:?}"),
+    }
+    assert!(incoming.exists());
+    assert_eq!(fs::read(&occupied).unwrap(), b"old-bytes");
+
+    {
+        let db = fx.db.lock().expect("lock");
+        db.mark_path_collision_atomic(
+            file_id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant_id),
+        )
+        .expect("re-mark");
+    }
+    let suffix =
+        resolve_path_collision(&fx.db, &fx.queue, file_id, "suffix", false).expect("suffix");
+    match suffix {
+        ResolvePathCollisionOutcome::Suffix { file, new_path } => {
+            assert_eq!(file.file.status, "ready");
+            assert!(Path::new(&new_path).exists());
+            assert!(
+                new_path.contains("Demo_2"),
+                "expected suffix path, got {new_path}"
+            );
+            assert!(!incoming.exists());
+            assert_eq!(fs::read(&occupied).unwrap(), b"old-bytes");
+            assert_eq!(fs::read(&new_path).unwrap(), b"new-bytes");
+        }
+        other => panic!("expected Suffix, got {other:?}"),
+    }
+
+    let incoming2 = media.join("incoming2.mp4");
+    fs::write(&incoming2, b"overwrite-me").expect("write");
+    let file2 = {
+        let db = fx.db.lock().expect("lock");
+        let (id, _) = db
+            .upsert_file(incoming2.to_str().expect("utf8"), 5, None)
+            .expect("incoming2");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant_id),
+        )
+        .expect("mark2");
+        id
+    };
+    let overwrite =
+        resolve_path_collision(&fx.db, &fx.queue, file2, "overwrite", true).expect("overwrite");
+    match overwrite {
+        ResolvePathCollisionOutcome::Overwrite { file, new_path } => {
+            assert_eq!(file.file.status, "ready");
+            assert_eq!(Path::new(&new_path), occupied.as_path());
+            assert_eq!(fs::read(&occupied).unwrap(), b"overwrite-me");
+            assert!(!incoming2.exists());
+        }
+        other => panic!("expected Overwrite, got {other:?}"),
+    }
+    let occupant_status = {
+        let db = fx.db.lock().expect("lock");
+        db.get_file_by_id(occupant_id).expect("occupant").status
+    };
+    assert_eq!(occupant_status, "missing");
 }

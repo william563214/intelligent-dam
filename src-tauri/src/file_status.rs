@@ -1,5 +1,5 @@
 //! Files.status 狀態機常數與輕量 helper
-//! processing / ready / scrape_failed / missing / suspected_duplicate
+//! processing / ready / scrape_failed / missing / suspected_duplicate / path_collision
 
 #[allow(non_upper_case_globals)]
 pub const processing: &str = "processing";
@@ -11,6 +11,9 @@ pub const scrape_failed: &str = "scrape_failed";
 pub const missing: &str = "missing";
 #[allow(non_upper_case_globals)]
 pub const suspected_duplicate: &str = "suspected_duplicate";
+/// Template destination already occupied awaiting suffix / skip / overwrite (#40)
+#[allow(non_upper_case_globals)]
+pub const path_collision: &str = "path_collision";
 
 /// 已知狀態集合 用於驗證與測試
 pub fn all_statuses() -> &'static [&'static str] {
@@ -20,6 +23,7 @@ pub fn all_statuses() -> &'static [&'static str] {
         scrape_failed,
         missing,
         suspected_duplicate,
+        path_collision,
     ]
 }
 
@@ -28,26 +32,31 @@ pub fn is_known(status: &str) -> bool {
 }
 
 /// 預覽等工作結束後應回到的狀態
-/// scrape_failed / suspected_duplicate 保留 其餘成功則 ready
+/// scrape_failed / suspected_duplicate / path_collision 保留 其餘成功則 ready
 pub fn after_transient_work(previous: &str) -> &'static str {
     if previous == scrape_failed {
         scrape_failed
     } else if previous == suspected_duplicate {
         suspected_duplicate
+    } else if previous == path_collision {
+        path_collision
     } else {
         ready
     }
 }
 
 /// phash／重掃描背景工作可否覆寫為 processing
-/// scrape_failed / suspected_duplicate / missing 必須保留
+/// scrape_failed / suspected_duplicate / path_collision / missing 必須保留
 pub fn allows_transient_processing(status: &str) -> bool {
-    status != scrape_failed && status != missing && status != suspected_duplicate
+    status != scrape_failed
+        && status != missing
+        && status != suspected_duplicate
+        && status != path_collision
 }
 
 /// True when auto pipeline / organize must not run for this status.
 pub fn blocks_auto_pipeline(status: &str) -> bool {
-    status == missing || status == suspected_duplicate
+    status == missing || status == suspected_duplicate || status == path_collision
 }
 
 /// 合法狀態轉換白名單 同狀態視為合法（冪等）
@@ -74,6 +83,15 @@ pub fn can_transition(from: &str, to: &str) -> bool {
         }
         // 使用者忽略疑似重複 → ready 後可再進流水線
         (s, t) if s == suspected_duplicate && t == ready => true,
+        // 模板目的地碰撞 → 等待使用者選擇（可自 ready / processing / scrape_failed）
+        (s, t)
+            if t == path_collision
+                && (s == ready || s == processing || s == scrape_failed) =>
+        {
+            true
+        }
+        // 碰撞決議後恢復 ready（或略過後繼續）
+        (s, t) if s == path_collision && t == ready => true,
         // 工作結束或刮削結果
         (s, t)
             if s == processing && (t == ready || t == scrape_failed) =>
@@ -100,6 +118,7 @@ mod tests {
         assert!(is_known(scrape_failed));
         assert!(is_known(missing));
         assert!(is_known(suspected_duplicate));
+        assert!(is_known(path_collision));
         assert!(!is_known("unknown"));
     }
 
@@ -107,6 +126,7 @@ mod tests {
     fn after_transient_work_preserves_failure_and_suspected() {
         assert_eq!(after_transient_work(scrape_failed), scrape_failed);
         assert_eq!(after_transient_work(suspected_duplicate), suspected_duplicate);
+        assert_eq!(after_transient_work(path_collision), path_collision);
         assert_eq!(after_transient_work(processing), ready);
         assert_eq!(after_transient_work(ready), ready);
         assert_eq!(after_transient_work(missing), ready);
@@ -119,12 +139,14 @@ mod tests {
         assert!(!allows_transient_processing(scrape_failed));
         assert!(!allows_transient_processing(missing));
         assert!(!allows_transient_processing(suspected_duplicate));
+        assert!(!allows_transient_processing(path_collision));
     }
 
     #[test]
-    fn blocks_auto_pipeline_for_suspected_and_missing() {
+    fn blocks_auto_pipeline_for_suspected_missing_and_collision() {
         assert!(blocks_auto_pipeline(suspected_duplicate));
         assert!(blocks_auto_pipeline(missing));
+        assert!(blocks_auto_pipeline(path_collision));
         assert!(!blocks_auto_pipeline(ready));
         assert!(!blocks_auto_pipeline(processing));
     }
@@ -143,9 +165,15 @@ mod tests {
         assert!(can_transition(processing, suspected_duplicate));
         assert!(can_transition(suspected_duplicate, ready));
         assert!(can_transition(suspected_duplicate, missing));
+        assert!(can_transition(ready, path_collision));
+        assert!(can_transition(processing, path_collision));
+        assert!(can_transition(scrape_failed, path_collision));
+        assert!(can_transition(path_collision, ready));
+        assert!(can_transition(path_collision, missing));
         assert!(!can_transition(missing, processing));
         assert!(!can_transition(missing, scrape_failed));
         assert!(!can_transition(suspected_duplicate, processing));
+        assert!(!can_transition(path_collision, processing));
         assert!(!can_transition(ready, "bogus"));
         assert!(!can_transition("bogus", ready));
     }

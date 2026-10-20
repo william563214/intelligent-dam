@@ -50,7 +50,7 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 | 無 Tauri invoke／整合測試 | 後端多為 `#[cfg(test)]` 單元測試；前端僅 `src/utils/*.test.ts`；無 invoke／tauri-driver E2E | Issue [#35](https://github.com/william563214/intelligent-dam/issues/35)（tauri-driver E2E 延後，見該 Issue） |
 | Watcher 無 E2E | `watcher.rs` 測試僅涵蓋路徑／事件分類／debounce 等 helper，無 notify→穩定度→ingest→queue 端到端 | Issue [#36](https://github.com/william563214/intelligent-dam/issues/36) |
 | Windows 鎖偵測偏重 size stability | `file_stability.rs`：Windows 上多數複製工具不鎖目的檔，**size-stable 為主要可靠訊號**；`try_lock` 回傳 `WouldBlock` 時繼續等待，**僅其他錯誤**才退回 size-stable | Issue [#37](https://github.com/william563214/intelligent-dam/issues/37)；Issue #8 已交付穩定度閘門 |
-| 進階 Handlebars helpers／碰撞 UI 缺席 | `path_template.rs` 僅註冊變數渲染、無 `register_helper`；衝突時後端 `unique_destination` 自動加後綴，前端無碰撞／衝突 UI | Issue [#40](https://github.com/william563214/intelligent-dam/issues/40)；Issue #9 已交付基本模板搬運 |
+| ~~進階 Handlebars helpers／碰撞 UI 缺席~~ | ~~已由 Issue #40 交付~~：helpers（`format_date`／大小寫／`truncate`／`default`／`sanitize`）、Settings 模板預覽、碰撞時 UI 選加後綴／跳過／覆蓋 | Issue [#40](https://github.com/william563214/intelligent-dam/issues/40) |
 | 無 `PRAGMA user_version` schema 版本 | schema 以 `CREATE TABLE IF NOT EXISTS` + 特製遷移為主；未使用 `user_version` 做版本追蹤 | Issue [#32](https://github.com/william563214/intelligent-dam/issues/32) |
 | `get_or_create_tag` 非 `ON CONFLICT` | `database.rs` 為 select-then-insert（`SELECT` 後無列再 `INSERT`），非 `INSERT … ON CONFLICT` | Issue [#33](https://github.com/william563214/intelligent-dam/issues/33)；併發下理論上可能撞 UNIQUE |
 
@@ -122,7 +122,7 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 
 #### 可延後
 
-- [ ] **40. Handlebars helpers + 碰撞 UI** — Issue [#40](https://github.com/william563214/intelligent-dam/issues/40)（需 #35）
+- [x] **40. Handlebars helpers + 碰撞 UI** — Issue [#40](https://github.com/william563214/intelligent-dam/issues/40)（需 #35）
 
 
 ### Deferred / Later（第三階段 / Issue #13 — 明確延後，現階段不要開工）

@@ -5,10 +5,10 @@
 pub use crate::commands::{
     add_file_tag, clear_error_logs, clear_file_tags, enqueue_pipeline_jobs, get_all_files,
     get_error_logs, get_file_tags, get_or_create_tag, get_settings, insert_error_log,
-    list_duplicate_tombstones, remove_duplicate_tombstone,
-    resolve_suspected_duplicate_with_enqueue, save_settings, scan_directory,
-    scan_multiple_directories, EnqueueResult, PipelineOptionsInput, ResolveSuspectedOutcome,
-    ScanResult,
+    list_duplicate_tombstones, preview_output_template, remove_duplicate_tombstone,
+    resolve_path_collision, resolve_suspected_duplicate_with_enqueue, save_settings,
+    scan_directory, scan_multiple_directories, EnqueueResult, PipelineOptionsInput,
+    PreviewTemplateResult, ResolvePathCollisionOutcome, ResolveSuspectedOutcome, ScanResult,
 };
 
 /// Convenience wrapper without pipeline enqueue (integration tests).

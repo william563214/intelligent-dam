@@ -552,12 +552,12 @@ fn ingest_worker(
             continue;
         };
 
-        // Suspected near-phash: keep row but do not auto-enqueue pipeline
-        let is_suspected = {
+        // Suspected near-phash / path collision: keep row but do not auto-enqueue pipeline
+        let blocks_pipeline = {
             match db.lock() {
                 Ok(g) => g
                     .get_file_by_id(entry.file_id)
-                    .map(|f| f.status == crate::file_status::suspected_duplicate)
+                    .map(|f| crate::file_status::blocks_auto_pipeline(&f.status))
                     .unwrap_or(false),
                 Err(_) => false,
             }
@@ -602,9 +602,9 @@ fn ingest_worker(
             }
         }
 
-        if is_suspected {
+        if blocks_pipeline {
             eprintln!(
-                "watcher: skip pipeline enqueue for suspected_duplicate file_id {}",
+                "watcher: skip pipeline enqueue for blocked status file_id {}",
                 file_id
             );
             continue;
