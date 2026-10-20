@@ -40,7 +40,8 @@ jobs:
   build-macos:
     runs-on: macos-latest
     permissions:
-      contents: ${{ github.event_name == 'pull_request' && 'read' || 'write' }}
+      # write needed for gh release upload; dry-runs only use upload-artifact.
+      contents: write
     env:
       # workflow_dispatch uses inputs.tag; release published uses the release tag.
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
