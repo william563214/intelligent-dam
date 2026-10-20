@@ -189,7 +189,13 @@ jobs:
             exit 1
           fi
           app="${apps[0]}"
-          bin="$(find "$app/Contents/MacOS" -type f -perm -111 | head -n 1)"
+          # -print -quit avoids SIGPIPE under pipefail (find | head).
+          bin="$(find "$app/Contents/MacOS" -type f -perm -111 -print -quit)"
+          if [[ -z "$bin" ]]; then
+            echo "Missing executable under $app/Contents/MacOS"
+            ls -la "$app/Contents/MacOS" || true
+            exit 1
+          fi
           echo "App: $app"
           echo "Binary: $bin"
           arches="$(lipo -archs "$bin")"
