@@ -124,6 +124,27 @@ pub fn run() {
             };
             let settings_store = SettingsStore::new(&app_data_dir);
 
+            // #59: report leftover overwrite sidecars under configured library roots
+            {
+                let settings = settings_store.load().unwrap_or_default();
+                let leftovers =
+                    path_template::scan_idam_transient_leftovers(&settings.scan_directories);
+                for leftover in leftovers {
+                    let path_str = leftover.to_string_lossy().to_string();
+                    if let Err(log_err) = db.insert_error_log(
+                        "startup",
+                        None,
+                        Some(&path_str),
+                        "leftover idam sidecar found on startup",
+                        Some("scan for .idam-bak / .idam-tmp-* after crash mid-overwrite"),
+                    ) {
+                        eprintln!("warn: ErrorLog for leftover sidecar: {log_err}");
+                    } else {
+                        eprintln!("warn: leftover idam sidecar: {path_str}");
+                    }
+                }
+            }
+
             // Arc so Watcher ingest worker can share the same mutex
             let db = Arc::new(Mutex::new(db));
             let queue = Arc::new(TaskQueue::new());

@@ -14,12 +14,18 @@ use regex::Regex;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use unicode_segmentation::UnicodeSegmentation;
+use walkdir::WalkDir;
 
 #[allow(non_upper_case_globals)]
 const unknown_studio: &str = "Unknown";
 
 #[allow(non_upper_case_globals)]
 const undated: &str = "undated";
+
+/// POSIX / common FS single-component byte limit
+#[allow(non_upper_case_globals)]
+const max_path_segment_bytes: usize = 255;
 
 /// Values available inside `output_template`
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -162,7 +168,20 @@ pub fn sanitize_segment(raw: &str) -> String {
     if is_windows_reserved_device_name(&out) {
         out.push('_');
     }
-    out
+    // #59: each path component must fit common FS name limits
+    cap_segment_utf8_bytes(&out, max_path_segment_bytes)
+}
+
+/// Truncate on UTF-8 char boundaries so the result is at most `max_bytes` long
+fn cap_segment_utf8_bytes(raw: &str, max_bytes: usize) -> String {
+    if raw.len() <= max_bytes {
+        return raw.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    raw[..end].to_string()
 }
 
 /// Extract a release-style code from a stem e.g. `ABC-123` or `abc_123`
@@ -214,17 +233,18 @@ pub fn format_date_string(date: &str, pattern: &str) -> String {
         .replace("DD", day)
 }
 
-/// Truncate by Unicode scalar values appending ellipsis when cut
+/// Truncate by Unicode grapheme clusters appending ellipsis when cut (#59)
 pub fn truncate_chars(raw: &str, max: usize, ellipsis: &str) -> String {
     if max == 0 {
         return String::new();
     }
-    let count = raw.chars().count();
-    if count <= max {
+    let graphemes: Vec<&str> = raw.graphemes(true).collect();
+    if graphemes.len() <= max {
         return raw.to_string();
     }
-    let keep = max.saturating_sub(ellipsis.chars().count()).max(0);
-    let head: String = raw.chars().take(keep).collect();
+    let ellipsis_len = ellipsis.graphemes(true).count();
+    let keep = max.saturating_sub(ellipsis_len);
+    let head: String = graphemes.into_iter().take(keep).collect();
     format!("{}{}", head, ellipsis)
 }
 
@@ -558,8 +578,19 @@ fn is_windows_drive_token(part: &str) -> bool {
 }
 
 /// Ensure destination is unique by appending `_N` before the extension
+/// Only checks the filesystem; prefer `unique_destination_avoiding` when a DB
+/// occupancy predicate is available (#59)
+#[allow(dead_code)]
 pub fn unique_destination(desired: &Path) -> PathBuf {
-    if !desired.exists() {
+    unique_destination_avoiding(desired, |p| p.exists())
+}
+
+/// Like `unique_destination` but `is_taken` may also reject DB-owned paths (#59)
+pub fn unique_destination_avoiding<F>(desired: &Path, is_taken: F) -> PathBuf
+where
+    F: Fn(&Path) -> bool,
+{
+    if !is_taken(desired) {
         return desired.to_path_buf();
     }
     let parent = desired.parent().unwrap_or_else(|| Path::new("."));
@@ -575,7 +606,7 @@ pub fn unique_destination(desired: &Path) -> PathBuf {
 
     for n in 2..10_000 {
         let candidate = parent.join(format!("{}_{}{}", stem, n, ext));
-        if !candidate.exists() {
+        if !is_taken(&candidate) {
             return candidate;
         }
     }
@@ -640,6 +671,63 @@ pub fn primary_idam_bak_path(dest: &Path) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or("file");
     parent.join(format!("{name}{idam_bak_suffix}"))
+}
+
+/// Locate an existing occupant backup beside `dest` (primary or `.idam-bak-N`)
+pub fn find_occupant_bak(dest: &Path) -> Option<PathBuf> {
+    let primary = primary_idam_bak_path(dest);
+    if primary.is_file() {
+        return Some(primary);
+    }
+    let parent = dest.parent()?;
+    let name = dest.file_name()?.to_str()?;
+    let prefix = format!("{name}{idam_bak_suffix}-");
+    let mut matches: Vec<PathBuf> = Vec::new();
+    let entries = fs::read_dir(parent).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let fname = entry.file_name();
+        let Some(fname) = fname.to_str() else {
+            continue;
+        };
+        if let Some(num) = fname.strip_prefix(&prefix) {
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                matches.push(path);
+            }
+        }
+    }
+    matches.sort();
+    matches.into_iter().next()
+}
+
+/// Walk configured library roots for leftover overwrite sidecars (#59)
+pub fn scan_idam_transient_leftovers(roots: &[impl AsRef<Path>]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for root in roots {
+        let root = root.as_ref();
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.into_path();
+            if is_idam_transient_path(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }
 
 /// Move `source` to `dest` creating parent dirs
@@ -1302,6 +1390,43 @@ mod tests {
         assert_eq!(truncate_chars("abcdef", 10, "..."), "abcdef");
         assert_eq!(truncate_chars("abcdef", 5, ".."), "abc..");
         assert_eq!(truncate_chars("abcdef", 0, "..."), "");
+        // Grapheme cluster (family emoji) counts as one unit not many scalars
+        let family = "👨‍👩‍👧‍👦xyz";
+        assert_eq!(truncate_chars(family, 2, ""), "👨‍👩‍👧‍👦x");
+    }
+
+    #[test]
+    fn sanitize_segment_caps_at_255_bytes() {
+        let long = "a".repeat(300);
+        let out = sanitize_segment(&long);
+        assert!(out.len() <= max_path_segment_bytes);
+        assert_eq!(out.len(), max_path_segment_bytes);
+    }
+
+    #[test]
+    fn unique_destination_avoiding_respects_predicate() {
+        let dir = unique_temp_dir("uniq_db");
+        let desired = dir.join("Demo.mp4");
+        // Nothing on disk but predicate claims desired is taken
+        let next = unique_destination_avoiding(&desired, |p| p == desired.as_path());
+        assert_eq!(next, dir.join("Demo_2.mp4"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_idam_transient_leftovers_reports_bak_and_tmp() {
+        let dir = unique_temp_dir("scan_bak");
+        let bak = dir.join("Demo.mp4.idam-bak");
+        let tmp = dir.join(".idam-tmp-1-2");
+        let keep = dir.join("Demo.mp4");
+        fs::write(&bak, b"old").unwrap();
+        fs::write(&tmp, b"tmp").unwrap();
+        fs::write(&keep, b"ok").unwrap();
+        let found = scan_idam_transient_leftovers(&[dir.as_path()]);
+        assert!(found.iter().any(|p| p == &bak));
+        assert!(found.iter().any(|p| p == &tmp));
+        assert!(!found.iter().any(|p| p == &keep));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

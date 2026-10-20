@@ -9,8 +9,9 @@
 use intelligent_dam_lib::test_support::{
     add_file_tag, clear_error_logs, clear_file_tags, current_schema_user_version,
     enqueue_pipeline_jobs, get_all_files, get_error_logs, get_file_tags, get_or_create_tag,
-    discard_overwrite_backup, get_settings, insert_error_log, list_duplicate_tombstones,
-    move_file_overwrite_via_copy, overwrite_fault, path_collision_tx_fault,
+    discard_overwrite_backup, get_settings, insert_error_log, is_same_file_identity,
+    list_duplicate_tombstones, move_file_overwrite_via_copy, overwrite_fault,
+    path_collision_tx_fault,
     preview_output_template, remove_duplicate_tombstone, resolve_path_collision,
     resolve_suspected_duplicate, resolve_suspected_duplicate_with_enqueue, save_settings,
     scan_directory, scan_multiple_directories, AppSettings, Database, Metadata, PipelineOptions,
@@ -588,7 +589,6 @@ fn path_collision_suffix_skip_overwrite_flow() {
         db.mark_path_collision_atomic(
             id,
             occupied.to_str().expect("utf8"),
-            occupied.to_str().expect("utf8"),
             Some(occupant),
         )
         .expect("mark collision");
@@ -614,7 +614,6 @@ fn path_collision_suffix_skip_overwrite_flow() {
         let db = fx.db.lock().expect("lock");
         db.mark_path_collision_atomic(
             file_id,
-            occupied.to_str().expect("utf8"),
             occupied.to_str().expect("utf8"),
             Some(occupant_id),
         )
@@ -647,7 +646,6 @@ fn path_collision_suffix_skip_overwrite_flow() {
         db.mark_path_collision_atomic(
             id,
             occupied.to_str().expect("utf8"),
-            occupied.to_str().expect("utf8"),
             Some(occupant_id),
         )
         .expect("mark2");
@@ -664,11 +662,22 @@ fn path_collision_suffix_skip_overwrite_flow() {
         }
         other => panic!("expected Overwrite, got {other:?}"),
     }
-    let occupant_status = {
+    let (occupant_status, logs) = {
         let db = fx.db.lock().expect("lock");
-        db.get_file_by_id(occupant_id).expect("occupant").status
+        (
+            db.get_file_by_id(occupant_id).expect("occupant").status,
+            db.list_error_logs(50).expect("logs"),
+        )
     };
     assert_eq!(occupant_status, "missing");
+    assert!(
+        logs.iter().any(|e| {
+            e.category == "path_collision"
+                && e.message.contains("occupant row overwritten")
+                && e.file_id == Some(occupant_id)
+        }),
+        "expected ErrorLog when occupant overwritten, got {logs:?}"
+    );
 }
 
 #[test]
@@ -691,7 +700,6 @@ fn path_collision_overwrite_fs_failure_leaves_pending_and_occupant() {
             .expect("incoming");
         db.mark_path_collision_atomic(
             id,
-            occupied.to_str().expect("utf8"),
             occupied.to_str().expect("utf8"),
             Some(occupant),
         )
@@ -740,7 +748,6 @@ fn path_collision_overwrite_restore_failure_writes_error_log() {
             .expect("incoming");
         db.mark_path_collision_atomic(
             id,
-            occupied.to_str().expect("utf8"),
             occupied.to_str().expect("utf8"),
             Some(occupant),
         )
@@ -793,7 +800,6 @@ fn path_collision_overwrite_db_failure_restores_files() {
             .expect("incoming");
         db.mark_path_collision_atomic(
             id,
-            occupied.to_str().expect("utf8"),
             occupied.to_str().expect("utf8"),
             Some(occupant),
         )
@@ -854,7 +860,6 @@ fn path_collision_overwrite_requeries_when_occupant_already_moved() {
         db.mark_path_collision_atomic(
             id,
             occupied.to_str().expect("utf8"),
-            occupied.to_str().expect("utf8"),
             Some(occupant),
         )
         .expect("mark");
@@ -895,4 +900,157 @@ fn path_collision_overwrite_via_copy_helper_roundtrip() {
     assert!(!src.exists());
     assert_eq!(fs::read(&dest).unwrap(), b"new-bytes");
     discard_overwrite_backup(outcome.backup.as_deref());
+}
+
+#[test]
+fn path_collision_overwrite_crash_before_commit_recovers_on_restart() {
+    // #59 N4: FS overwrite done, DB not committed, process gone → restart overwrite
+    // completes the commit and discards `.idam-bak`
+    let fx = Fixture::new();
+    let media = fx.temp().join("n4_crash");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&occupied, b"old-bytes").expect("write occupied");
+    fs::write(&incoming, b"new-bytes").expect("write incoming");
+
+    let (file_id, occupant_id, mover_path) = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 9, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 9, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(id, occupied.to_str().expect("utf8"), Some(occupant))
+            .expect("mark");
+        (id, occupant, db.get_file_by_id(id).unwrap().path)
+    };
+
+    // Simulate crash after FS success / before commit: mover at dest, occupant in bak
+    let bak = media.join("Demo.mp4.idam-bak");
+    fs::rename(&occupied, &bak).expect("bak");
+    fs::rename(&incoming, &occupied).expect("mover to dest");
+    assert!(!Path::new(&mover_path).exists());
+    assert_eq!(fs::read(&occupied).unwrap(), b"new-bytes");
+    assert!(bak.exists());
+
+    let outcome =
+        resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true).expect("recover");
+    match outcome {
+        ResolvePathCollisionOutcome::Overwrite { file, new_path } => {
+            assert_eq!(file.file.status, "ready");
+            assert_eq!(Path::new(&new_path), occupied.as_path());
+            assert_eq!(fs::read(&occupied).unwrap(), b"new-bytes");
+        }
+        other => panic!("expected Overwrite recovery, got {other:?}"),
+    }
+    assert!(!bak.exists(), "bak discarded after recovered commit");
+    let db = fx.db.lock().expect("lock");
+    let mover = db.get_file_by_id(file_id).expect("mover");
+    assert_eq!(Path::new(&mover.path), occupied.as_path());
+    let occupant = db.get_file_by_id(occupant_id).expect("occupant");
+    assert_eq!(occupant.status, "missing");
+    assert!(occupant.path.contains("#displaced-"));
+    assert!(
+        db.list_error_logs(20).unwrap().iter().any(|e| {
+            e.category == "path_collision"
+                && e.message.contains("completed overwrite after crash")
+        }),
+        "recovery should log completion"
+    );
+}
+
+#[test]
+fn path_collision_suffix_avoids_db_owned_path() {
+    // #59: suffix must skip candidates that exist only as Files.path rows
+    let fx = Fixture::new();
+    let media = fx.temp().join("suffix_db");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    let db_taken = media.join("Demo_2.mp4");
+    fs::write(&occupied, b"old").expect("occupied");
+    fs::write(&incoming, b"new").expect("incoming");
+    // Demo_2 exists only in DB (no file on disk)
+    let file_id = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 3, None)
+            .expect("occupant");
+        let (_ghost, _) = db
+            .upsert_file(db_taken.to_str().expect("utf8"), 1, None)
+            .expect("ghost");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 3, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(id, occupied.to_str().expect("utf8"), Some(occupant))
+            .expect("mark");
+        id
+    };
+    let suffix =
+        resolve_path_collision(&fx.db, &fx.queue, file_id, "suffix", false).expect("suffix");
+    match suffix {
+        ResolvePathCollisionOutcome::Suffix { new_path, .. } => {
+            assert!(
+                new_path.contains("Demo_3"),
+                "expected Demo_3 after DB-owned Demo_2, got {new_path}"
+            );
+            assert!(Path::new(&new_path).exists());
+            assert!(!db_taken.exists(), "must not clobber DB-only path on disk");
+        }
+        other => panic!("expected Suffix, got {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn path_collision_overwrite_hardlink_occupant_not_marked_missing() {
+    // #59: same-inode overwrite must not mark the hardlink occupant missing
+    let fx = Fixture::new();
+    let media = fx.temp().join("hardlink_occ");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&incoming, b"same-bytes").expect("write");
+    fs::hard_link(&incoming, &occupied).expect("hardlink");
+
+    let (file_id, occupant_id) = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 10, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 10, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(id, occupied.to_str().expect("utf8"), Some(occupant))
+            .expect("mark");
+        (id, occupant)
+    };
+
+    assert!(
+        is_same_file_identity(&incoming, &occupied),
+        "precondition: hardlink identity"
+    );
+    let outcome =
+        resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true).expect("ovw");
+    match outcome {
+        ResolvePathCollisionOutcome::Overwrite { file, .. } => {
+            assert_eq!(file.file.status, "ready");
+        }
+        other => panic!("expected Overwrite, got {other:?}"),
+    }
+    let db = fx.db.lock().expect("lock");
+    assert!(
+        db.get_file_by_id(occupant_id).is_err(),
+        "hardlink occupant row must be removed not marked missing"
+    );
+    assert!(
+        db.list_error_logs(20).unwrap().iter().any(|e| {
+            e.category == "path_collision"
+                && e.message.contains("same-file")
+                && e.file_id == Some(occupant_id)
+        }),
+        "expected same-file remove ErrorLog"
+    );
 }
