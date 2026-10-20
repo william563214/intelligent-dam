@@ -11,11 +11,12 @@ use intelligent_dam_lib::test_support::{
     discard_overwrite_backup, enqueue_pipeline_jobs, get_all_files, get_error_logs, get_file_tags,
     get_or_create_tag, get_settings, heal_identity_override, insert_error_log,
     is_same_file_identity, list_duplicate_tombstones, move_file_overwrite_via_copy, overwrite_fault,
-    path_collision_tx_fault, preview_output_template, recover_pending_moves,
-    remove_duplicate_tombstone, resolve_path_collision, resolve_suspected_duplicate,
-    resolve_suspected_duplicate_with_enqueue, save_settings, scan_directory,
-    scan_multiple_directories, AppSettings, Database, Metadata, PipelineOptions,
-    ResolvePathCollisionOutcome, ResolveSuspectedOutcome, SettingsStore, TaskQueue,
+    path_collision_tx_fault, preview_output_template, read_fs_file_id,
+    recover_pending_moves, remove_duplicate_tombstone, resolve_path_collision,
+    resolve_suspected_duplicate, resolve_suspected_duplicate_with_enqueue, save_settings,
+    scan_directory, scan_multiple_directories, AppSettings, Database, Metadata,
+    PipelineOptions, ResolvePathCollisionOutcome, ResolveSuspectedOutcome, SettingsStore,
+    TaskQueue,
 };
 use std::fs;
 use std::path::Path;
@@ -933,7 +934,8 @@ fn path_collision_overwrite_crash_before_commit_recovers_on_restart() {
     fs::rename(&incoming, &occupied).expect("mover to dest");
     {
         let db = fx.db.lock().expect("lock");
-        db.set_pending_move_to(file_id, occupied.to_str().expect("utf8"))
+        let dest_id = read_fs_file_id(&occupied).unwrap().expect("dest id");
+        db.set_pending_move_to(file_id, occupied.to_str().expect("utf8"), Some(dest_id))
             .expect("pending");
     }
     assert!(!Path::new(&mover_path).exists());
@@ -1007,7 +1009,8 @@ fn setup_crashed_overwrite(
     let mover_path = {
         let db = fx.db.lock().expect("lock");
         // #66: overwrite flow writes pending before FS; crash mid-commit leaves it set
-        db.set_pending_move_to(file_id, occupied.to_str().expect("utf8"))
+        let dest_id = read_fs_file_id(&occupied).unwrap().expect("dest id");
+        db.set_pending_move_to(file_id, occupied.to_str().expect("utf8"), Some(dest_id))
             .expect("pending");
         db.get_file_by_id(file_id).unwrap().path
     };
@@ -1334,7 +1337,8 @@ fn startup_recover_pending_overwrite_without_bak_uses_pending() {
     fs::remove_file(&bak).expect("drop bak");
     {
         let db = fx.db.lock().expect("lock");
-        db.set_pending_move_to(file_id, occupied.to_str().expect("utf8"))
+        let dest_id = read_fs_file_id(&occupied).unwrap().expect("dest id");
+        db.set_pending_move_to(file_id, occupied.to_str().expect("utf8"), Some(dest_id))
             .expect("pending");
     }
     let n = recover_pending_moves(&fx.db).expect("startup recover");
@@ -1346,4 +1350,47 @@ fn startup_recover_pending_overwrite_without_bak_uses_pending() {
     let occupant = db.get_file_by_id(occupant_id).expect("occupant");
     assert_eq!(occupant.status, "missing");
     assert!(occupant.path.contains("#displaced-"));
+}
+
+#[test]
+fn startup_recover_refuses_exact_duplicate_different_fs_id() {
+    // S3: same bytes at dest but different inode; size/phash would match — must refuse
+    let fx = Fixture::new();
+    let media = fx.temp().join("pending_refuse_dup");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    let same = b"identical-payload";
+    fs::write(&occupied, same).expect("occupied");
+    fs::write(&incoming, same).expect("incoming");
+    let src_id = read_fs_file_id(&incoming).unwrap().expect("src id");
+    let dest_id = read_fs_file_id(&occupied).unwrap().expect("dest id");
+    assert_ne!(src_id, dest_id);
+    let file_id = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), same.len() as u64, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), same.len() as u64, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(id, occupied.to_str().expect("utf8"), Some(occupant))
+            .expect("mark");
+        id
+    };
+    fs::remove_file(&incoming).expect("drop source without moving");
+    {
+        let db = fx.db.lock().expect("lock");
+        db.set_pending_move_to(file_id, occupied.to_str().expect("utf8"), Some(src_id))
+            .expect("pending");
+    }
+    let n = recover_pending_moves(&fx.db).expect("recover");
+    assert_eq!(n, 0, "must not commit onto a different file");
+    let db = fx.db.lock().expect("lock");
+    assert!(db.get_pending_move_to(file_id).unwrap().is_some());
+    assert_eq!(db.get_file_by_id(file_id).unwrap().status, "path_collision");
+    assert!(
+        db.list_error_logs(20).unwrap().iter().any(|e| e.message.contains("fs id")),
+        "ErrorLog on fs id mismatch"
+    );
 }
