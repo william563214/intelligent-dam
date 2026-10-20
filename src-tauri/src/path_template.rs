@@ -441,7 +441,8 @@ pub fn render_output_path(
 
 /// Normalize a path string for DB storage and string equality lookups.
 ///
-/// On Windows: `/` → `\`, uppercase the drive letter, collapse repeated separators.
+/// On Windows: strip `\\?\` / `\\?\UNC\` verbatim prefixes first, then `/` → `\`,
+/// uppercase the drive letter, collapse repeated separators.
 /// Elsewhere: return the input unchanged (filesystem already uses `/`).
 pub fn normalize_db_path(path: &str) -> String {
     #[cfg(windows)]
@@ -459,7 +460,9 @@ fn normalize_db_path_windows(path: &str) -> String {
     if path.is_empty() {
         return String::new();
     }
-    let mut s = path.replace('/', "\\");
+    // Strip verbatim prefix before any `/` → `\` conversion
+    let stripped = strip_windows_verbatim_prefix(path);
+    let mut s = stripped.replace('/', "\\");
 
     // Uppercase drive letter (`c:\lib` → `C:\lib`)
     let bytes = s.as_bytes();
@@ -474,6 +477,35 @@ fn normalize_db_path_windows(path: &str) -> String {
     } else {
         collapse_separator(&s, '\\')
     }
+}
+
+/// `\\?\C:\...` → `C:\...`; `\\?\UNC\server\share` → `\\server\share`.
+/// Also accepts `/` in the prefix form (`//?/C:/...`). Does not convert the rest.
+#[cfg(windows)]
+fn strip_windows_verbatim_prefix(path: &str) -> String {
+    let bytes = path.as_bytes();
+    if bytes.len() < 4 {
+        return path.to_string();
+    }
+    let is_verbatim = (bytes[0] == b'\\' || bytes[0] == b'/')
+        && (bytes[1] == b'\\' || bytes[1] == b'/')
+        && bytes[2] == b'?'
+        && (bytes[3] == b'\\' || bytes[3] == b'/');
+    if !is_verbatim {
+        return path.to_string();
+    }
+    let rest = &path[4..];
+    // `UNC\server\share` or `UNC/server/share` (case-insensitive)
+    if rest.len() >= 4 {
+        let unc_ok = rest.as_bytes()[0].eq_ignore_ascii_case(&b'U')
+            && rest.as_bytes()[1].eq_ignore_ascii_case(&b'N')
+            && rest.as_bytes()[2].eq_ignore_ascii_case(&b'C')
+            && (rest.as_bytes()[3] == b'\\' || rest.as_bytes()[3] == b'/');
+        if unc_ok {
+            return format!("\\\\{}", &rest[4..]);
+        }
+    }
+    rest.to_string()
 }
 
 #[cfg(windows)]
@@ -1456,5 +1488,47 @@ mod tests {
             normalize_db_path(r"C:\lib\StudioA\x.mp4"),
             r"C:\lib\StudioA\x.mp4"
         );
+        // Lowercase drive with native separators
+        assert_eq!(
+            normalize_db_path(r"c:\lib\StudioA\x.mp4"),
+            r"C:\lib\StudioA\x.mp4"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_db_path_windows_unc_and_verbatim_prefixes() {
+        assert_eq!(
+            normalize_db_path(r"\\server\share\StudioA\x.mp4"),
+            r"\\server\share\StudioA\x.mp4"
+        );
+        assert_eq!(
+            normalize_db_path(r"\\server/share/StudioA/x.mp4"),
+            r"\\server\share\StudioA\x.mp4"
+        );
+        // \\?\C:\ → C:\
+        assert_eq!(
+            normalize_db_path(r"\\?\C:\lib\StudioA\x.mp4"),
+            r"C:\lib\StudioA\x.mp4"
+        );
+        assert_eq!(
+            normalize_db_path(r"\\?\c:\lib/StudioA/x.mp4"),
+            r"C:\lib\StudioA\x.mp4"
+        );
+        // \\?\UNC\server\share → \\server\share
+        assert_eq!(
+            normalize_db_path(r"\\?\UNC\server\share\StudioA\x.mp4"),
+            r"\\server\share\StudioA\x.mp4"
+        );
+        assert_eq!(
+            normalize_db_path(r"\\?\unc\server/share/StudioA/x.mp4"),
+            r"\\server\share\StudioA\x.mp4"
+        );
+        // Never convert `/` while the verbatim prefix is still present:
+        // stripping first then converting yields a drive path, not `\\?\C:/...`
+        let verbatim_mixed = r"\\?\C:/lib/StudioA/x.mp4";
+        let out = normalize_db_path(verbatim_mixed);
+        assert!(!out.starts_with(r"\\?\"), "verbatim prefix must be stripped: {out}");
+        assert_eq!(out, r"C:\lib\StudioA\x.mp4");
     }
 }
