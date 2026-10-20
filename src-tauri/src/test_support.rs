@@ -5,10 +5,10 @@
 pub use crate::commands::{
     add_file_tag, clear_error_logs, clear_file_tags, enqueue_pipeline_jobs, get_all_files,
     get_error_logs, get_file_tags, get_or_create_tag, get_settings, insert_error_log,
-    list_duplicate_tombstones, remove_duplicate_tombstone,
-    resolve_suspected_duplicate_with_enqueue, save_settings, scan_directory,
-    scan_multiple_directories, EnqueueResult, PipelineOptionsInput, ResolveSuspectedOutcome,
-    ScanResult,
+    list_duplicate_tombstones, preview_output_template, remove_duplicate_tombstone,
+    resolve_path_collision, resolve_suspected_duplicate_with_enqueue, save_settings,
+    scan_directory, scan_multiple_directories, EnqueueResult, PipelineOptionsInput,
+    PreviewTemplateResult, ResolvePathCollisionOutcome, ResolveSuspectedOutcome, ScanResult,
 };
 
 /// Convenience wrapper without pipeline enqueue (integration tests).
@@ -21,10 +21,13 @@ pub fn resolve_suspected_duplicate(
     resolve_suspected_duplicate_with_enqueue(db, queue, file_id, action, None, None, None)
 }
 pub use crate::database::{
-    current_schema_user_version, Database, DuplicateTombstone, ErrorLogEntry, FileWithMetadata,
-    JobRow, Metadata, NewJobRow, PathTombstoneAction, Tag,
+    current_schema_user_version, path_collision_tx_fault, Database, DuplicateTombstone,
+    ErrorLogEntry, FileWithMetadata, JobRow, Metadata, NewJobRow, PathTombstoneAction, Tag,
 };
 pub use crate::file_stability::StabilityOptions;
+pub use crate::path_template::{
+    discard_overwrite_backup, move_file_overwrite_via_copy, overwrite_fault,
+};
 pub use crate::pipeline::PipelineOptions;
 pub use crate::settings::{AppSettings, SettingsStore};
 pub use crate::task_queue::{max_terminal_jobs, JobKind, TaskQueue};

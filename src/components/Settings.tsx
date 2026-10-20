@@ -13,6 +13,7 @@ import {
   retryTask,
   testConnectivity,
   canonicalizePath,
+  previewOutputTemplate,
 } from "../api";
 import type {
   AppSettings,
@@ -90,6 +91,11 @@ export default function Settings() {
   const [tombstones, setTombstones] = useState<DuplicateTombstone[]>([]);
   const [tombstoneBusyId, setTombstoneBusyId] = useState<number | null>(null);
   const [tombstoneMessage, setTombstoneMessage] = useState<string | null>(null);
+  const [templatePreview, setTemplatePreview] = useState<string | null>(null);
+  const [templatePreviewError, setTemplatePreviewError] = useState<
+    string | null
+  >(null);
+  const [templatePreviewBusy, setTemplatePreviewBusy] = useState(false);
 
   useEffect(() => {
     loadSettings();
@@ -783,9 +789,56 @@ export default function Settings() {
           />
           <p className="mt-1 text-xs text-gray-500">
             Handlebars 變數: studio date title number filename ext actor。
-            相對路徑以來源檔所在目錄為基準；搬回監控樹內時會抑制 notify
-            重入並略過已刮削檔。建議設定絕對圖書館根目錄以免與下載目錄重疊。
+            Helpers: upper lower titlecase truncate default format_date
+            sanitize／path_safe。相對路徑以來源檔所在目錄為基準；搬回監控樹內時會抑制
+            notify 重入並略過已刮削檔。建議設定絕對圖書館根目錄以免與下載目錄重疊。
+            目的地已存在時會暫停並在影片庫選擇加後綴／跳過／覆蓋。
           </p>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              disabled={templatePreviewBusy}
+              onClick={() => {
+                void (async () => {
+                  try {
+                    setTemplatePreviewBusy(true);
+                    setTemplatePreviewError(null);
+                    const base =
+                      settings.scanDirectories[0]?.trim() || "/library";
+                    const result = await previewOutputTemplate(
+                      settings.outputTemplate,
+                      base
+                    );
+                    setTemplatePreview(result.renderedPath);
+                  } catch (err) {
+                    setTemplatePreview(null);
+                    setTemplatePreviewError(
+                      err instanceof Error ? err.message : String(err)
+                    );
+                  } finally {
+                    setTemplatePreviewBusy(false);
+                  }
+                })();
+              }}
+              className="px-3 py-1.5 text-sm bg-slate-600 text-white rounded hover:bg-slate-700 disabled:bg-gray-400"
+            >
+              {templatePreviewBusy ? "預覽中…" : "預覽範例路徑"}
+            </button>
+            <span className="text-xs text-gray-500">
+              範例：StudioX / 2024-01-02 / Sample Title / ABC-123 / Alice
+            </span>
+          </div>
+          {templatePreview && (
+            <p
+              className="mt-2 text-sm text-emerald-800 break-all font-mono bg-emerald-50 px-2 py-1 rounded"
+              title={templatePreview}
+            >
+              {templatePreview}
+            </p>
+          )}
+          {templatePreviewError && (
+            <p className="mt-2 text-sm text-red-600">{templatePreviewError}</p>
+          )}
         </div>
 
         <div>

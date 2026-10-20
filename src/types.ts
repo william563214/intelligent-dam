@@ -31,11 +31,18 @@ export interface SuspectedDuplicateInfo {
   distance: number;
 }
 
+export interface PathCollisionInfo {
+  desiredPath: string;
+  existingPath: string;
+  occupantFileId?: number | null;
+}
+
 export interface FileWithMetadata {
   file: FileRecord;
   metadata: Metadata | null;
   tags: Tag[];
   suspectedDuplicate?: SuspectedDuplicateInfo | null;
+  pathCollision?: PathCollisionInfo | null;
 }
 
 export interface ScanResult {
@@ -72,6 +79,17 @@ export type ResolveSuspectedOutcome =
       file: FileWithMetadata;
       pipelineEnqueued: boolean;
     };
+
+export type ResolvePathCollisionOutcome =
+  | { kind: "suffix"; file: FileWithMetadata; newPath: string }
+  | { kind: "skip"; file: FileWithMetadata }
+  | { kind: "overwrite"; file: FileWithMetadata; newPath: string };
+
+export interface PreviewTemplateResult {
+  renderedPath: string;
+  template: string;
+  baseDir: string;
+}
 
 export interface DuplicateTombstone {
   id: number;

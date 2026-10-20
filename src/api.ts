@@ -7,6 +7,8 @@ import type {
   ErrorLogEntry,
   FileWithMetadata,
   PipelineOptionsInput,
+  PreviewTemplateResult,
+  ResolvePathCollisionOutcome,
   ResolveSuspectedOutcome,
   ScanResult,
   ScrapeResult,
@@ -34,6 +36,27 @@ export async function resolveSuspectedDuplicate(
   action: "confirm" | "ignore"
 ): Promise<ResolveSuspectedOutcome> {
   return await invoke("resolve_suspected_duplicate_command", { fileId, action });
+}
+
+/** Preview Handlebars output_template with sample metadata (#40). */
+export async function previewOutputTemplate(
+  template: string,
+  baseDir?: string
+): Promise<PreviewTemplateResult> {
+  return await invoke("preview_output_template_command", { template, baseDir });
+}
+
+/** Resolve a template destination collision: suffix / skip / overwrite. */
+export async function resolvePathCollision(
+  fileId: number,
+  action: "suffix" | "skip" | "overwrite",
+  confirmed = false
+): Promise<ResolvePathCollisionOutcome> {
+  return await invoke("resolve_path_collision_command", {
+    fileId,
+    action,
+    confirmed,
+  });
 }
 
 export async function listDuplicateTombstones(): Promise<DuplicateTombstone[]> {
