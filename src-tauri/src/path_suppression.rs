@@ -1,6 +1,7 @@
 //! Suppress filesystem paths we just created/moved so Watcher does not
 //! re-ingest pipeline destinations under a recursive watch tree
 
+use crate::path_template::normalize_db_path;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -93,7 +94,8 @@ impl PathSuppression {
 }
 
 fn normalize_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    // Same rules as DB path strings so suppress matches ingest / template dest
+    normalize_db_path(&path.to_string_lossy())
 }
 
 #[cfg(test)]

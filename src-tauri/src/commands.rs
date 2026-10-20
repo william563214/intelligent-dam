@@ -880,7 +880,7 @@ pub async fn start_watcher_command(
     let paths = watcher::resolve_watch_paths(&settings.scan_directories);
     if paths.is_empty() {
         return Err(
-            "No valid watch directories. Add existing scan directories in Settings first.".to_string(),
+            "資料夾不存在：請先在設定中加入有效的掃描目錄".to_string(),
         );
     }
 

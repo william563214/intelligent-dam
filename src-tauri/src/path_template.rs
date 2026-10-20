@@ -414,18 +414,86 @@ pub fn render_output_path(
         anyhow::bail!("Rendered output path has no valid segments");
     }
 
-    let joined = parts.join("/");
-    let dest = if absolute {
+    // Build with PathBuf::push so Windows uses native `\` (not join("/"))
+    let mut dest = if absolute {
         if let Some(drive) = windows_drive {
-            PathBuf::from(format!("{}:/{}", drive, joined))
+            // Drive root must be absolute on Windows (`C:\` not `C:`)
+            #[cfg(windows)]
+            {
+                PathBuf::from(format!("{}:\\", drive))
+            }
+            #[cfg(not(windows))]
+            {
+                PathBuf::from(format!("{}:", drive))
+            }
         } else {
-            PathBuf::from(format!("/{}", joined))
+            PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
         }
     } else {
-        base_dir.join(joined)
+        base_dir.to_path_buf()
     };
+    for part in &parts {
+        dest.push(part);
+    }
 
     Ok(dest)
+}
+
+/// Normalize a path string for DB storage and string equality lookups.
+///
+/// On Windows: `/` → `\`, uppercase the drive letter, collapse repeated separators.
+/// Elsewhere: return the input unchanged (filesystem already uses `/`).
+pub fn normalize_db_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        normalize_db_path_windows(path)
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
+}
+
+#[cfg(windows)]
+fn normalize_db_path_windows(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let mut s = path.replace('/', "\\");
+
+    // Uppercase drive letter (`c:\lib` → `C:\lib`)
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let drive = (bytes[0] as char).to_ascii_uppercase();
+        s.replace_range(0..1, &drive.to_string());
+    }
+
+    // Collapse repeated `\` while preserving a UNC prefix `\\`
+    if s.starts_with("\\\\") {
+        let rest = &s[2..];
+        format!("\\\\{}", collapse_separator(rest, '\\'))
+    } else {
+        collapse_separator(&s, '\\')
+    }
+}
+
+#[cfg(windows)]
+fn collapse_separator(s: &str, sep: char) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_sep = false;
+    for ch in s.chars() {
+        if ch == sep {
+            if prev_sep {
+                continue;
+            }
+            prev_sep = true;
+            out.push(ch);
+        } else {
+            prev_sep = false;
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn is_absolute_rendered(rendered: &str) -> bool {
@@ -1348,5 +1416,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dest, PathBuf::from("/library/StudioX/2024_Sam....mp4"));
+    }
+
+    /// #61: render must not emit `/` on Windows (native PathBuf::push only)
+    #[cfg(windows)]
+    #[test]
+    fn render_output_path_uses_native_separators_on_windows() {
+        let ctx = TemplateContext {
+            studio: "StudioA".to_string(),
+            date: "2024-06-01".to_string(),
+            title: "Demo".to_string(),
+            number: "ABC-1".to_string(),
+            filename: "ABC-1.mp4".to_string(),
+            ext: "mp4".to_string(),
+            actor: String::new(),
+        };
+        let base = PathBuf::from(r"C:\lib");
+        let dest = render_output_path("{{studio}}/{{date}}_{{title}}.{{ext}}", &ctx, &base)
+            .expect("render");
+        let s = dest.to_string_lossy();
+        assert!(
+            !s.contains('/'),
+            "Windows rendered path must not contain '/': {s}"
+        );
+        assert_eq!(dest, base.join("StudioA").join("2024-06-01_Demo.mp4"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_db_path_windows_slash_drive_and_collapse() {
+        assert_eq!(
+            normalize_db_path(r"c:/lib/StudioA/x.mp4"),
+            r"C:\lib\StudioA\x.mp4"
+        );
+        assert_eq!(
+            normalize_db_path(r"C:\lib\\StudioA\/x.mp4"),
+            r"C:\lib\StudioA\x.mp4"
+        );
+        assert_eq!(
+            normalize_db_path(r"C:\lib\StudioA\x.mp4"),
+            r"C:\lib\StudioA\x.mp4"
+        );
     }
 }

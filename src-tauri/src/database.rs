@@ -1,4 +1,5 @@
 use crate::file_status;
+use crate::path_template::normalize_db_path;
 use crate::phash;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
@@ -201,6 +202,151 @@ impl Database {
         let version_after = self.get_user_version()?;
         if version_after >= 5 {
             self.ensure_v5_columns()?;
+        }
+        // #61: idempotent repair of mixed path separators (no schema bump)
+        self.repair_mixed_separator_paths()?;
+        Ok(())
+    }
+
+    /// Normalize existing Files / PathCollisions / DuplicateTombstones path strings.
+    ///
+    /// If normalizing a Files or tombstone path would violate UNIQUE leave the row
+    /// unchanged and write an ErrorLog entry (no auto-merge).
+    fn repair_mixed_separator_paths(&self) -> SqliteResult<()> {
+        self.repair_files_path_separators()?;
+        self.repair_path_collisions_separators()?;
+        self.repair_tombstone_path_separators()?;
+        Ok(())
+    }
+
+    fn repair_files_path_separators(&self) -> SqliteResult<()> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path FROM Files ORDER BY id ASC")?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        for (id, path) in rows {
+            let normalized = normalize_db_path(&path);
+            if normalized == path {
+                continue;
+            }
+            let conflict: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM Files WHERE path = ?1 AND id != ?2 LIMIT 1",
+                    params![normalized, id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(other_id) = conflict {
+                let _ = self.insert_error_log(
+                    "path_normalize",
+                    Some(id),
+                    Some(&path),
+                    "無法正規化路徑：正規化後會與既有 Files 列撞 UNIQUE 已保留原狀",
+                    Some(&format!(
+                        "normalized={normalized} conflicting_id={other_id}"
+                    )),
+                );
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE Files SET path = ?1 WHERE id = ?2",
+                params![normalized, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn repair_path_collisions_separators(&self) -> SqliteResult<()> {
+        let table_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'PathCollisions'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)?;
+        if !table_exists {
+            return Ok(());
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, desired_path, existing_path FROM PathCollisions",
+        )?;
+        let rows: Vec<(i64, String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        for (file_id, desired, existing) in rows {
+            let desired_n = normalize_db_path(&desired);
+            let existing_n = normalize_db_path(&existing);
+            if desired_n == desired && existing_n == existing {
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE PathCollisions
+                 SET desired_path = ?1, existing_path = ?2
+                 WHERE file_id = ?3",
+                params![desired_n, existing_n, file_id],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn repair_tombstone_path_separators(&self) -> SqliteResult<()> {
+        let table_exists: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'DuplicateTombstones'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)?;
+        if !table_exists {
+            return Ok(());
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, path FROM DuplicateTombstones ORDER BY id ASC")?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        for (id, path) in rows {
+            let normalized = normalize_db_path(&path);
+            if normalized == path {
+                continue;
+            }
+            let conflict: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM DuplicateTombstones WHERE path = ?1 AND id != ?2 LIMIT 1",
+                    params![normalized, id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(other_id) = conflict {
+                let _ = self.insert_error_log(
+                    "path_normalize",
+                    None,
+                    Some(&path),
+                    "無法正規化墓碑路徑：正規化後會與既有 DuplicateTombstones 列撞 UNIQUE 已保留原狀",
+                    Some(&format!(
+                        "tombstone_id={id} normalized={normalized} conflicting_id={other_id}"
+                    )),
+                );
+                continue;
+            }
+            self.conn.execute(
+                "UPDATE DuplicateTombstones SET path = ?1 WHERE id = ?2",
+                params![normalized, id],
+            )?;
         }
         Ok(())
     }
@@ -1176,7 +1322,8 @@ impl Database {
         size: u64,
         phash: Option<String>,
     ) -> SqliteResult<(i64, bool)> {
-        let existed = self.get_file_by_path(path)?.is_some();
+        let path = normalize_db_path(path);
+        let existed = self.get_file_by_path(&path)?.is_some();
         // 掃描再次找到檔案時 若先前為 missing 則恢復 ready
         self.conn.execute(
             "INSERT INTO Files (path, size, phash, status) VALUES (?1, ?2, ?3, ?4)
@@ -1189,7 +1336,7 @@ impl Database {
                END",
             params![path, size as i64, phash, file_status::ready, file_status::missing],
         )?;
-        let id = match self.get_file_by_path(path)? {
+        let id = match self.get_file_by_path(&path)? {
             Some(f) => f.id,
             None => self.conn.last_insert_rowid(),
         };
@@ -1569,6 +1716,8 @@ impl Database {
         existing_path: &str,
         occupant_file_id: Option<i64>,
     ) -> SqliteResult<()> {
+        let desired_path = normalize_db_path(desired_path);
+        let existing_path = normalize_db_path(existing_path);
         // Always re-open as pending: skip/suffix/overwrite may collide again later
         self.conn.execute(
             "INSERT INTO PathCollisions
@@ -1599,12 +1748,15 @@ impl Database {
             )));
         }
 
+        let desired_path = normalize_db_path(desired_path);
+        let existing_path = normalize_db_path(existing_path);
+
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
             self.upsert_path_collision(
                 file_id,
-                desired_path,
-                existing_path,
+                &desired_path,
+                &existing_path,
                 occupant_file_id,
             )?;
             let resolution: Option<String> = self
@@ -1732,6 +1884,7 @@ impl Database {
         path: &str,
         exclude_id: i64,
     ) -> SqliteResult<Option<FileRecord>> {
+        let path = normalize_db_path(path);
         #[cfg(any(windows, target_os = "macos"))]
         let sql = "SELECT id, path, size, created_at, phash, status FROM Files
                    WHERE path = ?1 COLLATE NOCASE AND id != ?2 LIMIT 1";
@@ -1762,11 +1915,16 @@ impl Database {
         expected_old_path: &str,
         new_path: &str,
     ) -> SqliteResult<()> {
+        let expected_old_path = normalize_db_path(expected_old_path);
+        let new_path = normalize_db_path(new_path);
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
             // S1: re-query who currently owns desired_path (stale occupant_file_id ignored)
-            if let Some(occupant) = self.find_file_occupying_path(new_path, mover_id)? {
-                let displaced = format!("{}#displaced-{}", occupant.path, occupant.id);
+            if let Some(occupant) = self.find_file_occupying_path(&new_path, mover_id)? {
+                let displaced = normalize_db_path(&format!(
+                    "{}#displaced-{}",
+                    occupant.path, occupant.id
+                ));
                 self.conn.execute(
                     "UPDATE Files SET path = ?1 WHERE id = ?2",
                     params![displaced, occupant.id],
@@ -1786,7 +1944,7 @@ impl Database {
             }
 
             let mover = self.get_file_by_id(mover_id)?;
-            if mover.path != expected_old_path {
+            if normalize_db_path(&mover.path) != expected_old_path {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "Files.path changed during overwrite (expected {expected_old_path} got {})",
                     mover.path
@@ -1843,6 +2001,7 @@ impl Database {
         phash: Option<&str>,
         keeper_id: Option<i64>,
     ) -> SqliteResult<()> {
+        let path = normalize_db_path(path);
         self.conn.execute(
             "INSERT INTO DuplicateTombstones (path, size, phash, keeper_id)
              VALUES (?1, ?2, ?3, ?4)
@@ -1859,6 +2018,7 @@ impl Database {
         &self,
         path: &str,
     ) -> SqliteResult<Option<DuplicateTombstone>> {
+        let path = normalize_db_path(path);
         let mut stmt = self.conn.prepare(
             "SELECT id, path, size, phash, keeper_id, created_at
              FROM DuplicateTombstones WHERE path = ?1",
@@ -1883,7 +2043,8 @@ impl Database {
         path: &str,
         size: u64,
     ) -> SqliteResult<PathTombstoneAction> {
-        let Some(ts) = self.get_duplicate_tombstone_by_path(path)? else {
+        let path = normalize_db_path(path);
+        let Some(ts) = self.get_duplicate_tombstone_by_path(&path)? else {
             return Ok(PathTombstoneAction::None);
         };
         match ts.size {
@@ -2106,6 +2267,7 @@ impl Database {
     }
 
     pub fn get_file_by_path(&self, path: &str) -> SqliteResult<Option<FileRecord>> {
+        let path = normalize_db_path(path);
         match self.conn.query_row(
             "SELECT id, path, size, created_at, phash, status FROM Files WHERE path = ?1",
             params![path],
@@ -2681,6 +2843,7 @@ impl Database {
     }
 
     pub fn update_file_path(&self, file_id: i64, new_path: &str) -> SqliteResult<()> {
+        let new_path = normalize_db_path(new_path);
         self.conn.execute(
             "UPDATE Files SET path = ?1 WHERE id = ?2",
             params![new_path, file_id],
@@ -5764,6 +5927,129 @@ mod tests {
             .expect("list")
             .len();
         assert_eq!(left, 2);
+    }
+
+    /// #61: native Path::join occupant must be found via rendered desired path
+    #[test]
+    fn find_file_occupying_path_matches_native_join_and_rendered() {
+        let dir = ensure_temp_tests_dir().join(format!(
+            "occ-native-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let occupied = dir.join("StudioA").join("clip.mp4");
+        std::fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+        std::fs::write(&occupied, b"x").unwrap();
+
+        let db = open_memory_db();
+        let occupant = db
+            .insert_file(occupied.to_str().unwrap(), 1, None)
+            .expect("occ");
+        let mover = db
+            .insert_file(dir.join("incoming.mp4").to_str().unwrap(), 2, None)
+            .expect("mover");
+
+        let rendered = crate::path_template::render_output_path(
+            "{{studio}}/{{filename}}",
+            &crate::path_template::TemplateContext {
+                studio: "StudioA".to_string(),
+                date: "d".to_string(),
+                title: "t".to_string(),
+                number: "n".to_string(),
+                filename: "clip.mp4".to_string(),
+                ext: "mp4".to_string(),
+                actor: String::new(),
+            },
+            &dir,
+        )
+        .expect("render");
+
+        #[cfg(windows)]
+        {
+            let s = rendered.to_string_lossy();
+            assert!(!s.contains('/'), "rendered must be native: {s}");
+        }
+
+        let found = db
+            .find_file_occupying_path(rendered.to_str().unwrap(), mover)
+            .expect("query")
+            .expect("occupant");
+        assert_eq!(found.id, occupant);
+        assert_eq!(PathBuf::from(&found.path), occupied);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repair_mixed_separators_normalizes_and_logs_unique_conflict() {
+        let db = open_memory_db();
+        // Bypass upsert normalize to seed legacy mixed-separator rows
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
+                params![r"C:\lib\StudioA\x.mp4"],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 2, 'ready')",
+                params![r"C:\lib/StudioA\x.mp4"],
+            )
+            .unwrap();
+        let mixed_id: i64 = db
+            .conn
+            .query_row(
+                "SELECT id FROM Files WHERE path = ?1",
+                params![r"C:\lib/StudioA\x.mp4"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        db.repair_mixed_separator_paths().expect("repair");
+
+        let mixed_still: String = db
+            .conn
+            .query_row(
+                "SELECT path FROM Files WHERE id = ?1",
+                params![mixed_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mixed_still, r"C:\lib/StudioA\x.mp4",
+            "conflict row must stay unchanged"
+        );
+        let logs = db.list_error_logs(10).expect("logs");
+        assert!(
+            logs.iter().any(|e| e.category == "path_normalize"
+                && e.message.contains("UNIQUE")
+                && e.file_id == Some(mixed_id)),
+            "expected ErrorLog for UNIQUE conflict got {logs:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repair_mixed_separators_updates_when_safe() {
+        let db = open_memory_db();
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
+                params![r"c:/lib/only\y.mp4"],
+            )
+            .unwrap();
+        db.repair_mixed_separator_paths().expect("repair");
+        let path: String = db
+            .conn
+            .query_row("SELECT path FROM Files LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(path, r"C:\lib\only\y.mp4");
+        assert!(db.list_error_logs(5).unwrap().is_empty());
     }
 }
 
