@@ -526,6 +526,10 @@ mod tests {
 
     #[test]
     fn mtime_change_resets_stability_even_when_size_unchanged() {
+        // Refs #68: gate must treat mtime churn (size fixed) as not-complete.
+        // macOS CI (5799a79 run 39435193270) saw Ok(size) here when the bumper
+        // only rewrote identical bytes — that is not a reliable mtime signal
+        // under scheduler load. Stamp mtime explicitly each iteration.
         let path = unique_temp_file("mtime");
         let payload = b"same-size-payload!!";
         fs::write(&path, payload).unwrap();
@@ -535,10 +539,11 @@ mod tests {
         let stop_flag = Arc::clone(&stop);
 
         let bumper = thread::spawn(move || {
-            // Keep size fixed but bump mtime so the gate must not declare stable.
+            // Keep size fixed but advance mtime so the gate must not declare stable.
             // Open write-only (no truncate): rewrite the same payload at offset 0.
             // Do not use fs::write — it truncates to 0 first so the poll can see a
             // size change and the test would pass for the wrong reason.
+            let mut tick = 0u64;
             while !*stop_flag.lock().unwrap() {
                 let mut file = File::options()
                     .write(true)
@@ -546,6 +551,11 @@ mod tests {
                     .expect("open for mtime bump");
                 file.seek(SeekFrom::Start(0)).expect("seek start");
                 file.write_all(payload).expect("rewrite payload");
+                tick = tick.saturating_add(1);
+                // Monotonic stamps independent of wall clock / identical-byte rewrite
+                let stamped =
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + tick);
+                file.set_modified(stamped).expect("set_modified");
                 file.sync_all().expect("sync after rewrite");
                 drop(file);
                 assert_eq!(
@@ -553,7 +563,8 @@ mod tests {
                     payload.len() as u64,
                     "bumper must not change size"
                 );
-                thread::sleep(Duration::from_millis(20));
+                // Faster than poll_interval so churn outruns stable_checks windows
+                thread::sleep(Duration::from_millis(5));
             }
         });
 
