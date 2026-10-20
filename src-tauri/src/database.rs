@@ -1985,6 +1985,68 @@ impl Database {
         }
     }
 
+    /// #50: after crash mid-move, atomically repair Files.path when FS already moved
+    /// Re-checks occupancy (NOCASE where applicable), expected old path, path update,
+    /// organized_at, and missing→ready in one BEGIN IMMEDIATE transaction
+    pub fn heal_moved_path(
+        &self,
+        file_id: i64,
+        expected_old_path: &str,
+        new_path: &str,
+    ) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            if let Some(occupant) = self.find_file_occupying_path(new_path, file_id)? {
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "destination path owned by another Files row id={} path={}",
+                    occupant.id, occupant.path
+                )));
+            }
+
+            let current = self.get_file_by_id(file_id)?;
+            if current.path != expected_old_path {
+                return Err(rusqlite::Error::InvalidParameterName(format!(
+                    "Files.path changed during move heal (expected {expected_old_path} got {})",
+                    current.path
+                )));
+            }
+
+            self.conn.execute(
+                "UPDATE Files SET path = ?1 WHERE id = ?2",
+                params![new_path, file_id],
+            )?;
+            self.mark_file_organized(file_id)?;
+
+            // S2: reconcile may have marked missing while source path was gone
+            let after = self.get_file_by_id(file_id)?;
+            if after.status == file_status::missing {
+                if !file_status::can_transition(file_status::missing, file_status::ready) {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "illegal status transition: {} -> ready",
+                        after.status
+                    )));
+                }
+                self.conn.execute(
+                    "UPDATE Files SET status = ?1 WHERE id = ?2",
+                    params![file_status::ready, file_id],
+                )?;
+            }
+
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after heal_moved_path: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// After a successful overwrite filesystem move: one transaction updates the
     /// live occupant (re-queried), the mover path/organized/ready, and collision.
     pub fn commit_path_collision_overwrite(

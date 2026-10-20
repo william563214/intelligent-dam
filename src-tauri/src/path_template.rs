@@ -608,14 +608,28 @@ const idam_bak_suffix: &str = ".idam-bak";
 #[allow(non_upper_case_globals)]
 const idam_tmp_prefix: &str = ".idam-tmp-";
 
-/// True when `path` is an overwrite sidecar (`.idam-bak` / `.idam-tmp-*`)
+/// True when `path` is an overwrite sidecar (`.idam-bak` / `.idam-bak-N` / `.idam-tmp-*`)
 /// Crash recovery (#50) must never heal Files.path onto these leftovers (#59)
+/// Uses ends_with / numeric suffix so `x.idam-bak.mp4` is not treated as a sidecar
 pub fn is_idam_transient_path(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("");
-    name.starts_with(idam_tmp_prefix) || name.contains(idam_bak_suffix)
+    if name.starts_with(idam_tmp_prefix) {
+        return true;
+    }
+    if name.ends_with(idam_bak_suffix) {
+        return true;
+    }
+    // allocate_backup_path may use Demo.mp4.idam-bak-2
+    if let Some(idx) = name.rfind(idam_bak_suffix) {
+        let after = &name[idx + idam_bak_suffix.len()..];
+        if let Some(num) = after.strip_prefix('-') {
+            return !num.is_empty() && num.chars().all(|c| c.is_ascii_digit());
+        }
+    }
+    false
 }
 
 /// Sibling `.idam-bak` path for an overwrite destination (primary name only)
@@ -1296,6 +1310,9 @@ mod tests {
         assert!(is_idam_transient_path(Path::new("/lib/Demo.mp4.idam-bak-2")));
         assert!(is_idam_transient_path(Path::new("/lib/.idam-tmp-1-2")));
         assert!(!is_idam_transient_path(Path::new("/lib/Demo.mp4")));
+        // Mid-name `.idam-bak` must not false-positive (N1)
+        assert!(!is_idam_transient_path(Path::new("/lib/x.idam-bak.mp4")));
+        assert!(!is_idam_transient_path(Path::new("/lib/idam-bak-not-a-sidecar.mp4")));
         assert_eq!(
             primary_idam_bak_path(Path::new("/lib/Demo.mp4")),
             PathBuf::from("/lib/Demo.mp4.idam-bak")
