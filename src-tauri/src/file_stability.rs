@@ -488,6 +488,7 @@ mod tests {
 
     #[test]
     fn growing_file_waits_until_size_stops() {
+        // Unlocked writer: wait must come from size growth, not lock Held.
         let path = unique_temp_file("growing");
         let path_for_writer = path.clone();
         let done = Arc::new(Mutex::new(false));
@@ -506,6 +507,43 @@ mod tests {
                 // window (without holding flock) is treated as complete.
                 thread::sleep(Duration::from_millis(15));
             }
+            *done_flag.lock().unwrap() = true;
+        });
+
+        let opts = StabilityOptions {
+            poll_interval: Duration::from_millis(40),
+            stable_checks: 4,
+            timeout: Duration::from_secs(8),
+            missing_grace: Duration::from_secs(1),
+            held_degrade_after: Duration::from_secs(30),
+        };
+
+        let size = wait_until_stable(&path, &opts, || false).expect("eventually stable");
+        writer.join().unwrap();
+        assert!(*done.lock().unwrap());
+        assert_eq!(size, 8 * 64);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 8 * 64);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn growing_file_with_exclusive_lock_waits_until_unlock() {
+        // Locked writer: gate must wait on Held, not declare mid-write size stable.
+        let path = unique_temp_file("growing_locked");
+        let path_for_writer = path.clone();
+        let done = Arc::new(Mutex::new(false));
+        let done_flag = Arc::clone(&done);
+
+        let writer = thread::spawn(move || {
+            let mut file = File::create(&path_for_writer).unwrap();
+            FileExt::try_lock(&file).expect("writer holds exclusive lock while growing");
+            for chunk in 0..8u8 {
+                file.write_all(&[chunk; 64]).unwrap();
+                file.sync_all().unwrap();
+                thread::sleep(Duration::from_millis(15));
+            }
+            let _ = FileExt::unlock(&file);
             *done_flag.lock().unwrap() = true;
         });
 

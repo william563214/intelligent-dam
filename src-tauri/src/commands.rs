@@ -521,16 +521,23 @@ pub fn resolve_path_collision(
                 .to_str()
                 .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
                 .to_string();
-            // #66: durable intent + source fs id before overwrite FS ops
-            let source_fs_id = path_template::read_fs_file_id(&source)
-                .map_err(|e| format!("Failed to read source fs id: {e}"))?
-                .ok_or_else(|| format!("Source is not a file: {source_path_str}"))?;
+            // #66: durable intent + optional source fs id before overwrite FS ops
+            if !source.is_file() {
+                return Err(format!("Source is not a file: {source_path_str}"));
+            }
+            // Windows: missing index → None (size/phash only)
+            let source_fs_id = path_template::read_fs_file_id(&source).unwrap_or_else(|e| {
+                eprintln!(
+                    "warn: source fs id unavailable ({source_path_str}): {e}; pending without fs id"
+                );
+                None
+            });
             {
                 let guard = db
                     .lock()
                     .map_err(|e| format!("Database lock error: {}", e))?;
                 guard
-                    .set_pending_move_to(file_id, &desired_str, Some(source_fs_id))
+                    .set_pending_move_to(file_id, &desired_str, source_fs_id)
                     .map_err(|e| format!("Failed to set pending_move_to: {e}"))?;
             }
 

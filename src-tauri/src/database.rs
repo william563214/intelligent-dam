@@ -188,7 +188,7 @@ pub struct Database {
 /// 4 = #38 SuspectedDuplicates（near-phash 疑似重複）
 /// 5 = #38 DuplicateTombstones + Files.organized_at（durable organized）
 /// 6 = #40 PathCollisions（模板目的地碰撞）
-/// 7 = #66 Files.pending_move_to（搬檔前意圖 當機復原依據）
+/// 7 = #66 Files.pending_move_to + pending_source_vol/idx（搬檔前意圖／來源 fs id）
 const SCHEMA_USER_VERSION: i32 = 7;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
@@ -231,6 +231,11 @@ impl Database {
         let version_after = self.get_user_version()?;
         if version_after >= 5 {
             self.ensure_v5_columns()?;
+        }
+        // Mid-flight 7996aae stamped user_version=7 with only pending_move_to;
+        // later builds added pending_source_vol/idx — repair without re-running mig7.
+        if version_after >= 7 {
+            self.ensure_v7_columns()?;
         }
         // #61 / #63: idempotent repair of legacy path strings (no schema bump).
         // Trailing seps + Windows prefixes/separators; NFC rewrite only on macOS.
@@ -848,6 +853,47 @@ impl Database {
         }
     }
 
+    /// Idempotent v7 column repair: `pending_source_vol` / `pending_source_idx`.
+    ///
+    /// Same class of bug as [`Self::ensure_v5_columns`] / #55: mid-flight 7996aae
+    /// stamped `user_version=7` with only `pending_move_to`. Opening those DBs must
+    /// ALTER the fs-id columns or `set_pending_move_to` fails. Shared helper below
+    /// is also used by migration_7 so there is one ADD COLUMN path.
+    fn ensure_v7_columns(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.ensure_pending_source_fs_id_columns()?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after ensure_v7_columns error: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// ADD `pending_source_vol` / `pending_source_idx` when missing (no transaction).
+    fn ensure_pending_source_fs_id_columns(&self) -> SqliteResult<()> {
+        if !self.files_column_exists("pending_source_vol")? {
+            self.conn.execute(
+                "ALTER TABLE Files ADD COLUMN pending_source_vol INTEGER",
+                [],
+            )?;
+        }
+        if !self.files_column_exists("pending_source_idx")? {
+            self.conn.execute(
+                "ALTER TABLE Files ADD COLUMN pending_source_idx INTEGER",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
     /// #66 Files.pending_move_to + source fs id — durable move intent for crash recovery
     ///
     /// Idempotent: skips ADD COLUMN when the column already exists (re-open / partial).
@@ -860,18 +906,7 @@ impl Database {
                     [],
                 )?;
             }
-            if !self.files_column_exists("pending_source_vol")? {
-                self.conn.execute(
-                    "ALTER TABLE Files ADD COLUMN pending_source_vol INTEGER",
-                    [],
-                )?;
-            }
-            if !self.files_column_exists("pending_source_idx")? {
-                self.conn.execute(
-                    "ALTER TABLE Files ADD COLUMN pending_source_idx INTEGER",
-                    [],
-                )?;
-            }
+            self.ensure_pending_source_fs_id_columns()?;
             self.conn.execute_batch(
                 "
                 CREATE INDEX IF NOT EXISTS idx_files_pending_move_to
@@ -6543,6 +6578,82 @@ mod tests {
         );
         assert!(files_has_column(&db, "pending_source_vol"));
         assert!(files_has_column(&db, "pending_source_idx"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Mid-flight 7996aae shape: user_version=7 with pending_move_to only
+    fn write_v7_without_source_fs_id_columns(path: &Path) {
+        write_v6_populated(path);
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "
+            ALTER TABLE Files ADD COLUMN pending_move_to TEXT;
+            CREATE INDEX IF NOT EXISTS idx_files_pending_move_to
+                ON Files(pending_move_to)
+                WHERE pending_move_to IS NOT NULL;
+            PRAGMA user_version = 7;
+            ",
+        )
+        .expect("seed v7 without source fs id columns");
+    }
+
+    #[test]
+    fn v7_without_source_fs_id_columns_is_repaired_on_open() {
+        let path = temp_db_path("v7-no-source-fs-id");
+        write_v7_without_source_fs_id_columns(&path);
+        assert_eq!(raw_user_version(&path), 7);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let cols: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA table_info(Files)").unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .map(|c| c.unwrap())
+                    .collect()
+            };
+            assert!(
+                cols.iter().any(|c| c == "pending_move_to"),
+                "precondition: pending_move_to present"
+            );
+            assert!(
+                !cols.iter().any(|c| c == "pending_source_vol"),
+                "precondition: pending_source_vol absent"
+            );
+            assert!(
+                !cols.iter().any(|c| c == "pending_source_idx"),
+                "precondition: pending_source_idx absent"
+            );
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("open repair");
+        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert!(
+            files_has_column(&db, "pending_source_vol"),
+            "ensure_v7_columns must ADD pending_source_vol on already-v7 DBs"
+        );
+        assert!(
+            files_has_column(&db, "pending_source_idx"),
+            "ensure_v7_columns must ADD pending_source_idx on already-v7 DBs"
+        );
+        db.set_pending_move_to(
+            2,
+            "/lib/dest.mp4",
+            Some(crate::path_template::FsFileId {
+                volume: 1,
+                index: 42,
+            }),
+        )
+        .expect("set_pending_move_to must succeed after repair");
+        assert_eq!(
+            db.get_pending_move_to(2).expect("get"),
+            Some(normalize_db_path("/lib/dest.mp4"))
+        );
+        let row = db
+            .get_pending_move_row(2)
+            .expect("row")
+            .expect("pending row");
+        assert_eq!(row.pending_source_vol, Some(1));
+        assert_eq!(row.pending_source_idx, Some(42));
         let _ = std::fs::remove_file(&path);
     }
 

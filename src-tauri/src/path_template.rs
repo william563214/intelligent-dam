@@ -848,15 +848,22 @@ pub fn read_fs_file_id(path: &Path) -> std::io::Result<Option<FsFileId>> {
     {
         // std MetadataExt::{volume_serial_number,file_index} need unstable
         // `windows_by_handle` — use GetFileInformationByHandle via winapi-util.
+        // If the index cannot be read, degrade to None so pending recovery falls
+        // back to size/phash only (do not fail the move).
         let handle = match winapi_util::Handle::from_path_any(path) {
             Ok(h) => h,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
+            Err(_) => return Ok(None),
         };
-        if !handle.as_file().metadata()?.is_file() {
-            return Ok(None);
+        match handle.as_file().metadata() {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(_) => return Ok(None),
         }
-        let info = winapi_util::file::information(&handle)?;
+        let info = match winapi_util::file::information(&handle) {
+            Ok(info) => info,
+            Err(_) => return Ok(None),
+        };
         Ok(Some(FsFileId {
             volume: info.volume_serial_number(),
             index: info.file_index(),
