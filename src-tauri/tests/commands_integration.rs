@@ -721,6 +721,59 @@ fn path_collision_overwrite_fs_failure_leaves_pending_and_occupant() {
 }
 
 #[test]
+fn path_collision_overwrite_restore_failure_writes_error_log() {
+    let fx = Fixture::new();
+    let media = fx.temp().join("rbfail");
+    fs::create_dir_all(&media).expect("mkdir");
+    let occupied = media.join("Demo.mp4");
+    let incoming = media.join("incoming.mp4");
+    fs::write(&occupied, b"old-bytes").expect("write occupied");
+    fs::write(&incoming, b"new-bytes").expect("write incoming");
+
+    let file_id = {
+        let db = fx.db.lock().expect("lock");
+        let (occupant, _) = db
+            .upsert_file(occupied.to_str().expect("utf8"), 3, None)
+            .expect("occupant");
+        let (id, _) = db
+            .upsert_file(incoming.to_str().expect("utf8"), 4, None)
+            .expect("incoming");
+        db.mark_path_collision_atomic(
+            id,
+            occupied.to_str().expect("utf8"),
+            occupied.to_str().expect("utf8"),
+            Some(occupant),
+        )
+        .expect("mark");
+        id
+    };
+
+    overwrite_fault::arm_fail_after_backup();
+    overwrite_fault::arm_fail_restore();
+    let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
+        .expect_err("restore fail");
+    overwrite_fault::clear();
+    assert!(
+        err.contains("restore also failed") || err.contains("idam-bak"),
+        "{err}"
+    );
+    let bak = media.join("Demo.mp4.idam-bak");
+    assert!(bak.exists(), "occupant must remain in .idam-bak");
+    assert_eq!(fs::read(&bak).unwrap(), b"old-bytes");
+
+    let logs = get_error_logs(&fx.db, Some(20)).expect("logs");
+    assert!(
+        logs.iter().any(|e| {
+            e.category == "path_collision"
+                && (e.message.contains("restore also failed")
+                    || e.message.contains("idam-bak")
+                    || e.detail.as_deref().unwrap_or("").contains("idam-bak"))
+        }),
+        "expected ErrorLog for restore failure, got {logs:?}"
+    );
+}
+
+#[test]
 fn path_collision_overwrite_db_failure_restores_files() {
     let fx = Fixture::new();
     let media = fx.temp().join("dbfail");
