@@ -33,7 +33,7 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 - **v0.1.0：已發布** — tag [`v0.1.0`](https://github.com/william563214/intelligent-dam/releases/tag/v0.1.0) 指向 `6d19ef9`（PR [#29](https://github.com/william563214/intelligent-dam/pull/29) 的 merge commit）。
   - **Linux**：`.deb`／`.rpm`／`.AppImage`（校驗：`SHA256SUMS`）
   - **Windows**：MSI／NSIS（經 PR [#30](https://github.com/william563214/intelligent-dam/pull/30) `release-windows.yml` 上傳至既有 Release；**未簽章**，安裝時可能觸發 SmartScreen；校驗：`SHA256SUMS-windows.txt`）
-  - **macOS**：本版**未提供**
+  - **macOS**：經 `release-macos.yml`（Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)）可建置 universal `.dmg` 並上傳至既有 Release；**未簽章／未公證**，Gatekeeper 會擋，需在 Finder **右鍵 →「打開」**；校驗：`SHA256SUMS-macos.txt`（不動 tag、不覆寫 Linux／Windows 資產）
 - **明確延後（第三階段 / #13）**：ONNX / CLIP、語意搜尋、即時轉碼。
 
 ---
@@ -53,9 +53,10 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 | 進階 Handlebars helpers／碰撞 UI 缺席 | `path_template.rs` 僅註冊變數渲染、無 `register_helper`；衝突時後端 `unique_destination` 自動加後綴，前端無碰撞／衝突 UI | Issue [#40](https://github.com/william563214/intelligent-dam/issues/40)；Issue #9 已交付基本模板搬運 |
 | 無 `PRAGMA user_version` schema 版本 | schema 以 `CREATE TABLE IF NOT EXISTS` + 特製遷移為主；未使用 `user_version` 做版本追蹤 | Issue [#32](https://github.com/william563214/intelligent-dam/issues/32) |
 | `get_or_create_tag` 非 `ON CONFLICT` | `database.rs` 為 select-then-insert（`SELECT` 後無列再 `INSERT`），非 `INSERT … ON CONFLICT` | Issue [#33](https://github.com/william563214/intelligent-dam/issues/33)；併發下理論上可能撞 UNIQUE |
-| 無 macOS 安裝檔 | v0.1.0 未提供 macOS 產物 | Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)（可插隊） |
 
 > 已由 PR [#28](https://github.com/william563214/intelligent-dam/pull/28) 修復、不再列為缺口：正式連線 `PRAGMA foreign_keys = ON`＋啟動 orphan 清理；#20 nits（碰撞斷言、`BEGIN` 失敗仍還原 FK、`Tags_mig` 備份寫入 ErrorLog）。
+>
+> 已由 Issue [#39](https://github.com/william563214/intelligent-dam/issues/39) 交付、不再列為缺口：`release-macos.yml`（universal `.dmg` + `SHA256SUMS-macos.txt`；未簽章／Gatekeeper 需右鍵「打開」）。
 
 ---
 
@@ -96,7 +97,7 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 - [x] **Release prep** — PR [#29](https://github.com/william563214/intelligent-dam/pull/29) merge commit `6d19ef9`；tag [`v0.1.0`](https://github.com/william563214/intelligent-dam/releases/tag/v0.1.0)
 - [x] **Linux 安裝包** — `.deb`／`.rpm`／`.AppImage`（校驗：`SHA256SUMS`）
 - [x] **Windows 安裝包** — MSI／NSIS；PR [#30](https://github.com/william563214/intelligent-dam/pull/30)（`f40cd0b`，`release-windows.yml`）；**未簽章**／可能觸發 SmartScreen（校驗：`SHA256SUMS-windows.txt`）
-- [ ] **macOS 安裝包** — 本版未提供 → 見 v0.2 Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)
+- [x] **macOS 安裝包** — universal `.dmg`；`release-macos.yml`（Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)）；**未簽章**／Gatekeeper 需右鍵「打開」（校驗：`SHA256SUMS-macos.txt`）
 
 ### v0.2（Issues #31–#40）
 
@@ -117,7 +118,7 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 - [ ] **36. Watcher E2E** — Issue [#36](https://github.com/william563214/intelligent-dam/issues/36)：notify→穩定度→ingest→queue（需 #35）
 - [ ] **37. Windows 寫入完成偵測** — Issue [#37](https://github.com/william563214/intelligent-dam/issues/37)（需 #36）
 - [ ] **38. Near-phash 誤判** — Issue [#38](https://github.com/william563214/intelligent-dam/issues/38)：閾值調整＋疑似重複確認
-- [ ] **39. macOS workflow** — Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)：未簽章 macOS 安裝檔（**可插隊**）
+- [x] **39. macOS workflow** — Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)：未簽章 macOS 安裝檔（`release-macos.yml`；Gatekeeper 需右鍵「打開」）
 
 #### 可延後
 
