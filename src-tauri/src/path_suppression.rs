@@ -1,6 +1,7 @@
 //! Suppress filesystem paths we just created/moved so Watcher does not
 //! re-ingest pipeline destinations under a recursive watch tree
 
+use crate::path_template::normalize_db_path;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
@@ -93,7 +94,8 @@ impl PathSuppression {
 }
 
 fn normalize_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    // Same rules as DB path strings so suppress matches ingest / template dest
+    normalize_db_path(&path.to_string_lossy())
 }
 
 #[cfg(test)]
@@ -141,5 +143,19 @@ mod tests {
         supp.advance_clock(Duration::from_millis(60));
         assert!(!supp.is_suppressed(&file));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #61: suppress with `/` must match a query that uses `\`.
+    #[cfg(windows)]
+    #[test]
+    fn suppress_slash_matches_backslash_query() {
+        let with_slash = Path::new(r"C:/lib/StudioA/clip.mp4");
+        let with_backslash = Path::new(r"C:\lib\StudioA\clip.mp4");
+        let supp = PathSuppression::new(Duration::from_secs(30));
+        supp.suppress(with_slash);
+        assert!(
+            supp.is_suppressed(with_backslash),
+            "PathSuppression must normalize separators for lookup"
+        );
     }
 }
