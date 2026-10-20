@@ -16,9 +16,11 @@
 //!      missed ingest). Zero disables degrade.
 //!
 //! # Platform / filesystem notes
-//! - **Unix**: advisory `flock` (or equivalent). Downloaders that hold an
-//!   exclusive lock delay ingest until they release it. Size+mtime still
-//!   catches writers that never lock.
+//! - **Unix / macOS**: advisory `flock` (or equivalent). Downloaders that hold
+//!   an exclusive lock delay ingest until they release it. Size+mtime still
+//!   catches writers that never lock. There is no Windows-style share-mode
+//!   fallback: a writer that stalls longer than the stability window without
+//!   holding a lock is treated as complete (follow-up issue material).
 //! - **Windows**: many copy tools do not take an advisory lock; size+mtime
 //!   plus the FILE_SHARE_READ open probe are the primary signals.
 //! - **mtime granularity**: FAT and some SMB mounts update mtime in 2s (or
@@ -450,7 +452,7 @@ fn try_windows_share_read(path: &Path) -> LockProbe {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -493,16 +495,22 @@ mod tests {
             let mut file = File::create(&path_for_writer).unwrap();
             for chunk in 0..8u8 {
                 file.write_all(&[chunk; 64]).unwrap();
-                file.flush().unwrap();
-                thread::sleep(Duration::from_millis(50));
+                // Persist before sleep so a crash mid-test does not leave a
+                // partial buffer; size is already visible via metadata() after write
+                file.sync_all().unwrap();
+                // Grow faster than the stable window (4 * 40ms) so mid-write
+                // samples cannot look stable under scheduler jitter.
+                // macOS has no share-mode lock fallback: a stall longer than that
+                // window (without holding flock) is treated as complete.
+                thread::sleep(Duration::from_millis(15));
             }
             *done_flag.lock().unwrap() = true;
         });
 
         let opts = StabilityOptions {
-            poll_interval: Duration::from_millis(30),
-            stable_checks: 3,
-            timeout: Duration::from_secs(5),
+            poll_interval: Duration::from_millis(40),
+            stable_checks: 4,
+            timeout: Duration::from_secs(8),
             missing_grace: Duration::from_secs(1),
             held_degrade_after: Duration::from_secs(30),
         };
@@ -511,6 +519,7 @@ mod tests {
         writer.join().unwrap();
         assert!(*done.lock().unwrap());
         assert_eq!(size, 8 * 64);
+        assert_eq!(fs::metadata(&path).unwrap().len(), 8 * 64);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
@@ -518,32 +527,40 @@ mod tests {
     #[test]
     fn mtime_change_resets_stability_even_when_size_unchanged() {
         let path = unique_temp_file("mtime");
-        fs::write(&path, b"same-size-payload!!").unwrap();
+        let payload = b"same-size-payload!!";
+        fs::write(&path, payload).unwrap();
 
         let path_for_bumper = path.clone();
         let stop = Arc::new(Mutex::new(false));
         let stop_flag = Arc::clone(&stop);
 
         let bumper = thread::spawn(move || {
-            // Keep size fixed but bump mtime so the gate must not declare stable
-            let mut tick = 0u64;
+            // Keep size fixed but bump mtime so the gate must not declare stable.
+            // Open write-only (no truncate): rewrite the same payload at offset 0.
+            // Do not use fs::write — it truncates to 0 first so the poll can see a
+            // size change and the test would pass for the wrong reason.
             while !*stop_flag.lock().unwrap() {
-                tick += 1;
-                let file = File::options()
+                let mut file = File::options()
                     .write(true)
                     .open(&path_for_bumper)
                     .expect("open for mtime bump");
-                let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + tick);
-                file.set_modified(base).expect("set_modified");
+                file.seek(SeekFrom::Start(0)).expect("seek start");
+                file.write_all(payload).expect("rewrite payload");
+                file.sync_all().expect("sync after rewrite");
                 drop(file);
-                thread::sleep(Duration::from_millis(35));
+                assert_eq!(
+                    fs::metadata(&path_for_bumper).unwrap().len(),
+                    payload.len() as u64,
+                    "bumper must not change size"
+                );
+                thread::sleep(Duration::from_millis(20));
             }
         });
 
         let opts = StabilityOptions {
             poll_interval: Duration::from_millis(25),
             stable_checks: 3,
-            timeout: Duration::from_millis(400),
+            timeout: Duration::from_millis(600),
             missing_grace: Duration::from_millis(100),
             held_degrade_after: Duration::from_secs(30),
         };
@@ -563,7 +580,7 @@ mod tests {
             held_degrade_after: Duration::from_secs(30),
         };
         let size = wait_until_stable(&path, &settle, || false).expect("after settle");
-        assert_eq!(size, b"same-size-payload!!".len() as u64);
+        assert_eq!(size, payload.len() as u64);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

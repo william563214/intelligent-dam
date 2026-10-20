@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use unicode_segmentation::UnicodeSegmentation;
 use walkdir::WalkDir;
 
+#[cfg(target_os = "macos")]
+use unicode_normalization::UnicodeNormalization;
+
 #[allow(non_upper_case_globals)]
 const unknown_studio: &str = "Unknown";
 
@@ -147,13 +150,13 @@ pub fn is_windows_reserved_device_name(segment: &str) -> bool {
 }
 
 /// Strip characters that are illegal or awkward in path segments
-/// Windows reserved device names get a trailing `_` (e.g. dir `CON.mp4` → `CON.mp4_`)
+/// Reserved device names put `_` before the first `.` (`CON.foo` → `CON_.foo`)
 pub fn sanitize_segment(raw: &str) -> String {
     sanitize_segment_inner(raw, false)
 }
 
 /// Like `sanitize_segment` but keeps a trailing extension when capping to 255 bytes
-/// Reserved names put `_` on the stem so the extension stays scannable (`CON_.mp4`)
+/// Reserved names use the same first-dot rule (`CON_.mp4`, `CON_.tar.gz`)
 pub fn sanitize_filename_segment(raw: &str) -> String {
     sanitize_segment_inner(raw, true)
 }
@@ -182,33 +185,36 @@ fn sanitize_segment_inner(raw: &str, preserve_extension: bool) -> String {
     finish_segment_cleanup(out, preserve_extension)
 }
 
-fn finish_segment_cleanup(raw: String, preserve_extension: bool) -> String {
+fn finish_segment_cleanup(raw: String, _preserve_extension: bool) -> String {
     let out = raw
         .trim_matches(|c: char| c == '.' || c == ' ')
         .to_string();
-    if !is_windows_reserved_device_name(&out) {
-        return out;
+    escape_windows_reserved_device_name(&out)
+}
+
+/// Windows treats the substring before the FIRST `.` as the device name.
+/// Put `_` before that first dot so `CON.tar.gz` → `CON_.tar.gz` and dir
+/// `CON.foo` → `CON_.foo` (appending `_` at the end leaves `CON.foo_` reserved).
+fn escape_windows_reserved_device_name(name: &str) -> String {
+    if !is_windows_reserved_device_name(name) {
+        return name.to_string();
     }
-    if preserve_extension {
-        // S-B: CON.mp4 → CON_.mp4 (keep scannable extension)
-        let path = Path::new(&out);
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(|e| format!(".{e}"))
-            .unwrap_or_default();
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&out);
-        if stem.ends_with('_') {
-            return out;
+    match name.find('.') {
+        Some(i) => {
+            let (head, tail) = name.split_at(i);
+            if head.ends_with('_') {
+                name.to_string()
+            } else {
+                format!("{head}_{tail}")
+            }
         }
-        format!("{stem}_{ext}")
-    } else if out.ends_with('_') {
-        out
-    } else {
-        format!("{out}_")
+        None => {
+            if name.ends_with('_') {
+                name.to_string()
+            } else {
+                format!("{name}_")
+            }
+        }
     }
 }
 
@@ -536,27 +542,55 @@ pub fn render_output_path(
 
 /// Normalize a path string for DB storage and string equality lookups.
 ///
-/// On Windows: strip `\\?\` / `\\?\UNC\` verbatim prefixes first, then `/` → `\`,
-/// uppercase the drive letter, collapse repeated separators.
-/// Elsewhere: return the input unchanged (filesystem already uses `/`).
+/// Chosen rules (#63) documented for callers and the PR:
+///
+/// 1. **NFC (macOS only)** — APFS/HFS+ often expose NFD; apply Unicode NFC so the
+///    stored string matches what macOS APIs typically return after normalization.
+///    Linux (ext4) and Windows (NTFS) compare bytes: keep original codepoints so an
+///    on-disk NFD name is not rewritten to a non-existent path. Cross-platform NFC
+///    matching is deferred to a v7 lookup-key column alongside #66.
+/// 2. **Trailing separators** — strip trailing `/` or `\` except roots (`/`, `C:\`,
+///    volume root `\\?\Volume{…}\`). UNC share roots may drop the trailing sep.
+/// 3. **Case** — do **not** ASCII-fold path components for storage. `Files.path` UNIQUE
+///    is case-sensitive; Win/macOS occupancy uses `COLLATE NOCASE` (ASCII A–Z only).
+///    Drive letters are still uppercased on Windows (`c:\` → `C:\`).
+/// 4. **Windows prefixes** — see [`normalize_windows_extended_prefix`].
+/// 5. **Windows separators** — `/` → `\`, collapse repeated `\`, keep UNC `\\` prefix.
+///
+/// This is the single entry point for DB path writes and string lookups.
 pub fn normalize_db_path(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
     #[cfg(windows)]
     {
         normalize_db_path_windows(path)
     }
     #[cfg(not(windows))]
     {
-        path.to_string()
+        normalize_db_path_unix(path)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_nfc(s: &str) -> String {
+    s.nfc().collect()
+}
+
+#[cfg(not(windows))]
+fn normalize_db_path_unix(path: &str) -> String {
+    #[cfg(target_os = "macos")]
+    let owned = apply_nfc(path);
+    #[cfg(target_os = "macos")]
+    let path = owned.as_str();
+    let collapsed = collapse_separator(path, '/');
+    strip_trailing_separators(&collapsed, '/')
 }
 
 #[cfg(windows)]
 fn normalize_db_path_windows(path: &str) -> String {
-    if path.is_empty() {
-        return String::new();
-    }
-    // Strip verbatim prefix before any `/` → `\` conversion
-    let stripped = strip_windows_verbatim_prefix(path);
+    // Prefix handling before `/` → `\` so Volume / UNC forms stay recognizable
+    let stripped = normalize_windows_extended_prefix(path);
     let mut s = stripped.replace('/', "\\");
 
     // Uppercase drive letter (`c:\lib` → `C:\lib`)
@@ -566,44 +600,83 @@ fn normalize_db_path_windows(path: &str) -> String {
         s.replace_range(0..1, &drive.to_string());
     }
 
-    // Collapse repeated `\` while preserving a UNC prefix `\\`
-    if let Some(rest) = s.strip_prefix("\\\\") {
+    // Collapse repeated `\` while preserving a UNC / Volume `\\` prefix
+    let collapsed = if let Some(rest) = s.strip_prefix("\\\\") {
         format!("\\\\{}", collapse_separator(rest, '\\'))
     } else {
         collapse_separator(&s, '\\')
-    }
+    };
+    // No NFC on Windows — NTFS compares bytes; rewriting NFD would orphan rows
+    strip_trailing_separators(&collapsed, '\\')
 }
 
-/// `\\?\C:\...` → `C:\...`; `\\?\UNC\server\share` → `\\server\share`.
-/// Also accepts `/` in the prefix form (`//?/C:/...`). Does not convert the rest.
+/// Windows `\\?\` / `\\.\` (also `/` forms):
+/// - `\\?\C:\…` / `\\.\C:\…` → `C:\…`
+/// - `\\?\UNC\server\share\…` → `\\server\share\…`
+/// - `\\?\Volume{GUID}\…` / `\\.\Volume{GUID}\…` → keep `\\?\Volume{GUID}\…`
+///   (never strip to a bare `Volume{…}` path)
+/// - other `\\.\device` → keep `\\.\device`
 #[cfg(windows)]
-fn strip_windows_verbatim_prefix(path: &str) -> String {
+fn normalize_windows_extended_prefix(path: &str) -> String {
     let bytes = path.as_bytes();
     if bytes.len() < 4 {
         return path.to_string();
     }
-    let is_verbatim = (bytes[0] == b'\\' || bytes[0] == b'/')
+    let is_extended = (bytes[0] == b'\\' || bytes[0] == b'/')
         && (bytes[1] == b'\\' || bytes[1] == b'/')
-        && bytes[2] == b'?'
+        && (bytes[2] == b'?' || bytes[2] == b'.')
         && (bytes[3] == b'\\' || bytes[3] == b'/');
-    if !is_verbatim {
+    if !is_extended {
         return path.to_string();
     }
+    let prefix_mark = bytes[2];
     let rest = &path[4..];
-    // `UNC\server\share` or `UNC/server/share` (case-insensitive)
-    if rest.len() >= 4 {
-        let unc_ok = rest.as_bytes()[0].eq_ignore_ascii_case(&b'U')
-            && rest.as_bytes()[1].eq_ignore_ascii_case(&b'N')
-            && rest.as_bytes()[2].eq_ignore_ascii_case(&b'C')
-            && (rest.as_bytes()[3] == b'\\' || rest.as_bytes()[3] == b'/');
-        if unc_ok {
-            return format!("\\\\{}", &rest[4..]);
-        }
+    if is_windows_volume_prefix(rest) {
+        return format!("\\\\?\\{rest}");
     }
+    if is_windows_unc_prefix(rest) {
+        return format!("\\\\{}", &rest[4..]);
+    }
+    if is_windows_drive_prefix(rest) {
+        return rest.to_string();
+    }
+    if prefix_mark == b'.' {
+        // Non-drive device namespace (`\\.\PhysicalDrive0`)
+        return format!("\\\\.\\{rest}");
+    }
+    // Other `\\?\…` — strip like drive/UNC (legacy behavior)
     rest.to_string()
 }
 
 #[cfg(windows)]
+fn is_windows_volume_prefix(rest: &str) -> bool {
+    let b = rest.as_bytes();
+    b.len() >= 7
+        && b[0].eq_ignore_ascii_case(&b'V')
+        && b[1].eq_ignore_ascii_case(&b'O')
+        && b[2].eq_ignore_ascii_case(&b'L')
+        && b[3].eq_ignore_ascii_case(&b'U')
+        && b[4].eq_ignore_ascii_case(&b'M')
+        && b[5].eq_ignore_ascii_case(&b'E')
+        && b[6] == b'{'
+}
+
+#[cfg(windows)]
+fn is_windows_unc_prefix(rest: &str) -> bool {
+    let b = rest.as_bytes();
+    b.len() >= 4
+        && b[0].eq_ignore_ascii_case(&b'U')
+        && b[1].eq_ignore_ascii_case(&b'N')
+        && b[2].eq_ignore_ascii_case(&b'C')
+        && (b[3] == b'\\' || b[3] == b'/')
+}
+
+#[cfg(windows)]
+fn is_windows_drive_prefix(rest: &str) -> bool {
+    let b = rest.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+}
+
 fn collapse_separator(s: &str, sep: char) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_sep = false;
@@ -620,6 +693,61 @@ fn collapse_separator(s: &str, sep: char) -> String {
         }
     }
     out
+}
+
+/// Strip trailing `sep` unless doing so would destroy a filesystem root.
+fn strip_trailing_separators(path: &str, sep: char) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let mut end = path.len();
+    while end > 0 {
+        let ch = match path[..end].chars().next_back() {
+            Some(c) if c == sep => c,
+            _ => break,
+        };
+        let prev = end - ch.len_utf8();
+        let candidate = &path[..prev];
+        if is_path_root_prefix(candidate, sep) {
+            break;
+        }
+        end = prev;
+    }
+    path[..end].to_string()
+}
+
+/// True when `candidate` is a root that must keep its trailing separator,
+/// or a drive letter (`C:`) that must stay as `C:\`.
+fn is_path_root_prefix(candidate: &str, sep: char) -> bool {
+    if candidate.is_empty() {
+        // `/` or `\` alone — keep the separator
+        return true;
+    }
+    if sep == '/' && candidate == "/" {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let b = candidate.as_bytes();
+        // `C:` → keep `C:\`
+        if b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            return true;
+        }
+        // Volume root `\\?\Volume{guid}` keeps trailing `\`
+        // UNC share roots may drop the trailing sep (`\\server\share\` → `\\server\share`)
+        if let Some(rest) = candidate.strip_prefix(r"\\?\") {
+            if is_windows_volume_prefix(rest) {
+                if let Some(close) = rest.find('}') {
+                    return close + 1 == rest.len();
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = sep;
+    }
+    false
 }
 
 fn is_absolute_rendered(rendered: &str) -> bool {
@@ -1257,8 +1385,9 @@ mod tests {
         assert_eq!(sanitize_segment("com9"), "com9_");
         assert_eq!(sanitize_segment("LPT1"), "LPT1_");
         assert_eq!(sanitize_segment("lpt9"), "lpt9_");
-        assert_eq!(sanitize_segment("CON.mp4"), "CON.mp4_");
-        assert_eq!(sanitize_segment("com1.AVI"), "com1.AVI_");
+        // First-dot rule (#63): dirs and multi-dot names stay non-reserved
+        assert_eq!(sanitize_segment("CON.mp4"), "CON_.mp4");
+        assert_eq!(sanitize_segment("com1.AVI"), "com1_.AVI");
         assert_eq!(sanitize_segment("normal"), "normal");
         assert_eq!(sanitize_segment("CONSOLE"), "CONSOLE");
         assert!(!is_windows_reserved_device_name("COM10"));
@@ -1845,5 +1974,123 @@ mod tests {
         let out = normalize_db_path(verbatim_mixed);
         assert!(!out.starts_with(r"\\?\"), "verbatim prefix must be stripped: {out}");
         assert_eq!(out, r"C:\lib\StudioA\x.mp4");
+    }
+
+    /// #63: trailing separators must be stripped (roots keep a single separator)
+    #[test]
+    fn normalize_db_path_strips_trailing_separators() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                normalize_db_path(r"C:\lib\StudioA\"),
+                r"C:\lib\StudioA"
+            );
+            assert_eq!(
+                normalize_db_path(r"C:\lib\StudioA\\"),
+                r"C:\lib\StudioA"
+            );
+            assert_eq!(normalize_db_path(r"C:\"), r"C:\");
+            assert_eq!(
+                normalize_db_path(r"\\server\share\StudioA\"),
+                r"\\server\share\StudioA"
+            );
+            assert_eq!(
+                normalize_db_path(r"\\server\share\"),
+                r"\\server\share"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(normalize_db_path("/lib/StudioA/"), "/lib/StudioA");
+            assert_eq!(normalize_db_path("/lib/StudioA///"), "/lib/StudioA");
+            assert_eq!(normalize_db_path("/"), "/");
+        }
+    }
+
+    /// #63: `\\?\Volume{…}` must stay a volume path; `\\.\` drive form folds to `C:\`
+    #[cfg(windows)]
+    #[test]
+    fn normalize_db_path_windows_volume_and_dot_prefixes() {
+        let guid = r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\lib\x.mp4";
+        let out = normalize_db_path(guid);
+        assert!(
+            out.starts_with(r"\\?\Volume{"),
+            "Volume GUID prefix must be kept: {out}"
+        );
+        assert_eq!(
+            out,
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\lib\x.mp4"
+        );
+        // Mixed separators under Volume — still Volume, never bare `Volume{…}`
+        let mixed = r"\\?\Volume{12345678-1234-1234-1234-123456789abc}/lib/x.mp4";
+        let mixed_out = normalize_db_path(mixed);
+        assert!(
+            mixed_out.starts_with(r"\\?\Volume{"),
+            "must not strip Volume to bare name: {mixed_out}"
+        );
+        assert!(!mixed_out.contains('/'), "seps normalized under Volume: {mixed_out}");
+
+        assert_eq!(
+            normalize_db_path(r"\\.\C:\lib\x.mp4"),
+            r"C:\lib\x.mp4"
+        );
+        assert_eq!(
+            normalize_db_path(r"\\.\c:/lib/x.mp4"),
+            r"C:\lib\x.mp4"
+        );
+        let vol_dot = r"\\.\Volume{12345678-1234-1234-1234-123456789abc}\lib\x.mp4";
+        let vol_dot_out = normalize_db_path(vol_dot);
+        assert_eq!(
+            vol_dot_out,
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\lib\x.mp4"
+        );
+        // Non-drive device namespace keeps \\.\
+        assert_eq!(
+            normalize_db_path(r"\\.\PhysicalDrive0"),
+            r"\\.\PhysicalDrive0"
+        );
+    }
+
+    /// #63: NFC only on macOS; Linux/Windows keep original codepoints
+    #[test]
+    fn normalize_db_path_nfc_macos_only_preserves_elsewhere() {
+        // é as e + combining acute (NFD) vs precomposed (NFC)
+        let nfd = "cafe\u{0301}";
+        let nfc = "caf\u{e9}";
+        assert_ne!(nfd, nfc, "precondition: NFD != NFC as Rust strings");
+        #[cfg(windows)]
+        let input = format!(r"C:\lib\{nfd}\x.mp4");
+        #[cfg(not(windows))]
+        let input = format!("/lib/{nfd}/x.mp4");
+        let out = normalize_db_path(&input);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(out, format!("/lib/{nfc}/x.mp4"));
+            assert_eq!(normalize_db_path(&out), out, "NFC idempotent");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                out.contains(nfd),
+                "non-macOS must keep NFD codepoints got {out}"
+            );
+            assert_eq!(out, normalize_db_path(&out));
+            // nfc only used on macOS branch; keep binding for assert_ne precondition
+            let _ = nfc;
+        }
+    }
+
+    /// #63: reserved device escape puts `_` before the FIRST dot
+    #[test]
+    fn sanitize_reserved_puts_underscore_before_first_dot() {
+        assert_eq!(sanitize_segment("CON.tar.gz"), "CON_.tar.gz");
+        assert_eq!(sanitize_segment("CON.foo"), "CON_.foo");
+        assert_eq!(sanitize_segment("con.mp4"), "con_.mp4");
+        assert_eq!(sanitize_filename_segment("CON.tar.gz"), "CON_.tar.gz");
+        assert_eq!(sanitize_filename_segment("COM1.foo.bar"), "COM1_.foo.bar");
+        // Still reserved if `_` were only appended after the last component
+        assert!(!is_windows_reserved_device_name("CON_.tar.gz"));
+        assert!(!is_windows_reserved_device_name("CON_.foo"));
+        assert!(is_windows_reserved_device_name("CON.foo_"));
     }
 }
