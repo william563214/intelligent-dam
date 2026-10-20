@@ -124,6 +124,10 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 
 - [x] **40. Handlebars helpers + 碰撞 UI** — Issue [#40](https://github.com/william563214/intelligent-dam/issues/40)（需 #35）
 
+#### #34 / #40 後續
+
+- [x] **50. 搬檔中途當機後補寫 DB 路徑** — Issue [#50](https://github.com/william563214/intelligent-dam/issues/50)：來源不在、目的地在且可確認同一檔時 heal `Files.path`（schema 維持 v6；與 #59 的 `.idam-bak`／`.idam-tmp-*` 殘檔互不混淆）
+
 
 ### Deferred / Later（第三階段 / Issue #13 — 明確延後，現階段不要開工）
 

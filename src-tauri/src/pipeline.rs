@@ -4,7 +4,7 @@
 //! watcher worker keeps running Status follows #19 rules (scrape_failed
 //! preserved across transient preview work)
 
-use crate::database::{Database, Metadata};
+use crate::database::{Database, FileRecord, Metadata};
 use crate::ffmpeg;
 use crate::file_status;
 use crate::path_suppression::PathSuppression;
@@ -750,9 +750,197 @@ pub enum MoveStepOutcome {
     CollisionPending { desired: PathBuf },
 }
 
+/// True when the source parent directory is reachable (drive not offline)
+fn source_parent_reachable(source: &Path) -> bool {
+    match source.parent() {
+        None => true,
+        Some(parent) if parent.as_os_str().is_empty() => true,
+        Some(parent) => parent.exists(),
+    }
+}
+
+/// Test hook: inject dest phash for heal identity without ffmpeg
+#[cfg(test)]
+mod heal_identity_override {
+    use std::cell::RefCell;
+
+    thread_local! {
+        #[allow(non_upper_case_globals)]
+        static dest_phash: RefCell<Option<String>> = RefCell::new(None);
+    }
+
+    pub fn arm_dest_phash(hex: &str) {
+        dest_phash.with(|c| *c.borrow_mut() = Some(hex.to_string()));
+    }
+
+    pub fn clear() {
+        dest_phash.with(|c| *c.borrow_mut() = None);
+    }
+
+    pub fn take_dest_phash() -> Option<String> {
+        dest_phash.with(|c| c.borrow_mut().take())
+    }
+}
+
+fn resolve_dest_phash_for_heal(dest: &Path) -> Option<String> {
+    #[cfg(test)]
+    if let Some(p) = heal_identity_override::take_dest_phash() {
+        return Some(p);
+    }
+    crate::phash::calculate_video_phash(dest).ok()
+}
+
+/// Confirm dest is the same file we moved
+/// Size always required; when DB has phash both size and phash must match (exact)
+/// Intentionally ignores `.idam-bak` / `.idam-tmp-*` sidecars from #58 overwrite
+fn dest_matches_recorded_file(file: &FileRecord, dest: &Path) -> Result<bool> {
+    if path_template::is_idam_transient_path(dest) {
+        return Ok(false);
+    }
+    let meta = match std::fs::metadata(dest) {
+        Ok(m) if m.is_file() => m,
+        _ => return Ok(false),
+    };
+    if meta.len() != file.size {
+        return Ok(false);
+    }
+    let db_phash = file
+        .phash
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let Some(db_phash) = db_phash else {
+        // No recorded phash → size alone is enough
+        return Ok(true);
+    };
+    let Some(dest_phash) = resolve_dest_phash_for_heal(dest) else {
+        return Ok(false);
+    };
+    let Some(a) = crate::phash::parse_phash_hex(db_phash) else {
+        return Ok(false);
+    };
+    let Some(b) = crate::phash::parse_phash_hex(&dest_phash) else {
+        return Ok(false);
+    };
+    Ok(a == b)
+}
+
+/// #50: source gone after crash mid-move; dest present → heal Files.path when identity matches
+fn heal_move_after_crash(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+    file: &FileRecord,
+    source: &Path,
+    desired: &Path,
+) -> Result<MoveStepOutcome> {
+    // Never heal onto overwrite leftovers (#59)
+    if path_template::is_idam_transient_path(desired) {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.update_file_status(file_id, file_status::missing)?;
+        let _ = guard.insert_error_log(
+            "move",
+            Some(file_id),
+            source.to_str(),
+            "move heal refused: desired path is an idam sidecar",
+            Some(&desired.display().to_string()),
+        );
+        anyhow::bail!(
+            "File missing on disk and desired path is idam sidecar: {}",
+            source.display()
+        );
+    }
+
+    if !desired.is_file() {
+        // S4: parent gone (offline volume) → retryable, do not mark missing
+        if !source_parent_reachable(source) {
+            anyhow::bail!(
+                "move heal deferred: source parent unreachable (retryable): {}",
+                source.display()
+            );
+        }
+        // Source and template dest both gone (bak leftovers are not a substitute)
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        guard.update_file_status(file_id, file_status::missing)?;
+        anyhow::bail!("File missing on disk: {}", source.display());
+    }
+
+    let matches = dest_matches_recorded_file(file, desired)?;
+    let desired_str = desired
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Desired path is not valid UTF-8"))?
+        .to_string();
+
+    if !matches {
+        let dest_size = std::fs::metadata(desired)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let detail = format!(
+            "source={} dest={} db_size={} dest_size={} phash={:?} bak_leftover={}",
+            source.display(),
+            desired.display(),
+            file.size,
+            dest_size,
+            file.phash,
+            path_template::primary_idam_bak_path(desired).exists()
+        );
+        {
+            let guard = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+            // Do not mark missing: a file exists at dest but identity is unconfirmed
+            let _ = guard.insert_error_log(
+                "move",
+                Some(file_id),
+                source.to_str(),
+                "move heal refused: destination exists but does not match recorded file",
+                Some(&detail),
+            );
+        }
+        anyhow::bail!(
+            "move heal refused: destination exists but does not match recorded file ({})",
+            detail
+        );
+    }
+
+    {
+        let guard = db
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+        // Leave any sibling .idam-bak in place (#59); successful heal only repairs DB path
+        if let Err(e) = guard.heal_moved_path(file_id, &file.path, &desired_str) {
+            let detail = format!(
+                "source={} dest={} err={}",
+                source.display(),
+                desired.display(),
+                e
+            );
+            let message = if detail.contains("owned by another") {
+                "move heal refused: destination path owned by another Files row"
+            } else {
+                "move heal refused: failed to commit path repair"
+            };
+            let _ = guard.insert_error_log(
+                "move",
+                Some(file_id),
+                source.to_str(),
+                message,
+                Some(&detail),
+            );
+            anyhow::bail!("{message} ({detail})");
+        }
+    }
+
+    Ok(MoveStepOutcome::Moved(desired.to_path_buf()))
+}
+
 /// Render template move on disk then update Files.path
 /// On collision records PathCollisions and awaits UI (suffix / skip / overwrite)
 /// On DB update failure rolls the file back so DB never points at a wrong path
+/// #50: when source is gone but template dest matches recorded size heal DB path
 fn step_move(
     db: &Arc<Mutex<Database>>,
     file_id: i64,
@@ -764,16 +952,12 @@ fn step_move(
         anyhow::bail!("output_template is empty");
     }
 
-    let (source, ctx, base_dir) = {
+    let (source, file_snapshot, ctx, base_dir) = {
         let guard = db
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
         let file = guard.get_file_by_id(file_id)?;
         let source = PathBuf::from(&file.path);
-        if !source.is_file() {
-            guard.update_file_status(file_id, file_status::missing)?;
-            anyhow::bail!("File missing on disk: {}", file.path);
-        }
         let meta = guard.get_metadata(file_id)?;
         let tags = guard.get_file_tags(file_id).unwrap_or_default();
         let first_actor = tags
@@ -792,13 +976,35 @@ fn step_move(
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
-        (source, ctx, base_dir)
+        (source, file, ctx, base_dir)
     };
 
     let desired = render_output_path(template, &ctx, &base_dir)?;
     // If rendered path is the source itself skip (no collision / no move)
     if path_template::paths_equal(&source, &desired) {
-        return Ok(MoveStepOutcome::Unchanged);
+        if source.is_file() {
+            return Ok(MoveStepOutcome::Unchanged);
+        }
+        // Path equal but file gone → true missing
+        {
+            let guard = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+            guard.update_file_status(file_id, file_status::missing)?;
+        }
+        anyhow::bail!("File missing on disk: {}", source.display());
+    }
+
+    // #50 crash recovery before collision / finalize
+    if !source.is_file() {
+        // S4: offline volume looks like a missing source — do not heal or mark missing
+        if !source_parent_reachable(&source) {
+            anyhow::bail!(
+                "move heal deferred: source parent unreachable (retryable): {}",
+                source.display()
+            );
+        }
+        return heal_move_after_crash(db, file_id, &file_snapshot, &source, &desired);
     }
 
     // #40: do not auto-suffix; pause for UI when destination already exists
@@ -1244,6 +1450,537 @@ mod tests {
             path_template::normalize_db_path("/tmp/idam-missing-pipeline-xyz.mp4")
         );
         assert_eq!(file.status, file_status::missing);
+    }
+
+    #[test]
+    fn step_move_heals_db_path_after_crash_mid_move() {
+        // Simulate FS move succeeded then crash before Files.path update (#50)
+        let dir = unique_temp_dir("heal_ok");
+        let src = dir.join("ABC-100.mp4");
+        let payload = b"heal-payload-bytes";
+        fs::write(&src, payload).unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        // Crash mid-move: bytes already at dest, DB still points at source
+        fs::rename(&src, &desired).unwrap();
+        assert!(!src.exists());
+        assert!(desired.exists());
+
+        let arc = Arc::new(Mutex::new(db));
+        let outcome = step_move(&arc, file_id, &settings, None).expect("heal ok");
+        let MoveStepOutcome::Moved(moved) = outcome else {
+            panic!("expected Moved got {outcome:?}");
+        };
+        assert_eq!(moved, desired);
+        assert!(desired.exists(), "must not re-move or delete dest");
+        assert!(!src.exists());
+        assert_eq!(fs::read(&desired).unwrap(), payload);
+
+        let guard = arc.lock().unwrap();
+        let file = guard.get_file_by_id(file_id).unwrap();
+        assert_eq!(Path::new(&file.path), desired.as_path());
+        assert_ne!(file.status, file_status::missing);
+        assert!(
+            guard.list_error_logs(20).unwrap().is_empty(),
+            "successful heal must not write ErrorLog"
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_heal_refuses_size_mismatch_and_logs_error() {
+        let dir = unique_temp_dir("heal_bad");
+        let src = dir.join("ABC-100.mp4");
+        fs::write(&src, b"original-seven").unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 14, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        // Different file already at dest (wrong size vs DB)
+        fs::write(&desired, b"OTHER").unwrap();
+        fs::remove_file(&src).unwrap();
+
+        let old_path = src.to_str().unwrap().to_string();
+        let arc = Arc::new(Mutex::new(db));
+        let err = step_move(&arc, file_id, &settings, None).expect_err("heal must refuse");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("heal refused") || msg.contains("does not match"),
+            "expected heal-refuse error got {err}"
+        );
+
+        let guard = arc.lock().unwrap();
+        let file = guard.get_file_by_id(file_id).unwrap();
+        assert_eq!(file.path, old_path, "must not overwrite DB path");
+        assert_ne!(file.status, file_status::missing);
+        let logs = guard.list_error_logs(20).unwrap();
+        assert!(
+            logs.iter().any(|e| {
+                e.category == "move"
+                    && e.message.contains("heal refused")
+                    && e.detail
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("db_size=")
+            }),
+            "expected ErrorLog on heal refuse got {logs:?}"
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_heal_refuses_same_size_different_phash() {
+        let dir = unique_temp_dir("heal_phash");
+        let src = dir.join("ABC-100.mp4");
+        let payload = b"same-size-payload!";
+        fs::write(&src, payload).unwrap();
+
+        let db_phash = "0123456789abcdef";
+        let db = open_db();
+        let file_id = db
+            .insert_file(
+                src.to_str().unwrap(),
+                payload.len() as u64,
+                Some(db_phash.into()),
+            )
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        fs::rename(&src, &desired).unwrap();
+
+        heal_identity_override::arm_dest_phash("fedcba9876543210");
+        let old_path = src.to_str().unwrap().to_string();
+        let arc = Arc::new(Mutex::new(db));
+        let err = step_move(&arc, file_id, &settings, None).expect_err("phash mismatch");
+        heal_identity_override::clear();
+        assert!(
+            err.to_string().contains("heal refused"),
+            "expected heal refuse got {err}"
+        );
+
+        let guard = arc.lock().unwrap();
+        let file = guard.get_file_by_id(file_id).unwrap();
+        assert_eq!(file.path, old_path);
+        assert!(
+            guard.list_error_logs(20).unwrap().iter().any(|e| {
+                e.category == "move" && e.message.contains("heal refused")
+            }),
+            "ErrorLog required on phash mismatch"
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_heals_same_size_when_no_phash() {
+        // S3: without recorded phash, size alone is enough
+        let dir = unique_temp_dir("heal_nophash");
+        let src = dir.join("ABC-100.mp4");
+        let payload = b"size-only-identity";
+        fs::write(&src, payload).unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        fs::rename(&src, &desired).unwrap();
+
+        let arc = Arc::new(Mutex::new(db));
+        let outcome = step_move(&arc, file_id, &settings, None).expect("heal");
+        assert!(matches!(outcome, MoveStepOutcome::Moved(_)));
+        let guard = arc.lock().unwrap();
+        assert_eq!(
+            Path::new(&guard.get_file_by_id(file_id).unwrap().path),
+            desired.as_path()
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_heal_after_reconcile_restores_ready() {
+        // S2: reconcile marks missing while DB still points at old path; heal → ready
+        let dir = unique_temp_dir("heal_recon");
+        let src = dir.join("ABC-100.mp4");
+        let payload = b"reconcile-then-heal";
+        fs::write(&src, payload).unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        fs::rename(&src, &desired).unwrap();
+
+        let n = db.reconcile_missing_files().expect("reconcile");
+        assert!(n >= 1);
+        assert_eq!(
+            db.get_file_by_id(file_id).unwrap().status,
+            file_status::missing
+        );
+
+        let arc = Arc::new(Mutex::new(db));
+        let outcome = step_move(&arc, file_id, &settings, None).expect("heal");
+        assert!(matches!(outcome, MoveStepOutcome::Moved(_)));
+        let guard = arc.lock().unwrap();
+        let file = guard.get_file_by_id(file_id).unwrap();
+        assert_eq!(Path::new(&file.path), desired.as_path());
+        assert_eq!(file.status, file_status::ready);
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_defers_when_source_parent_unreachable() {
+        // S4: offline volume — parent missing → retryable, no heal, not missing
+        let db = open_db();
+        let src = PathBuf::from("/idam-offline-vol-xyz/media/ABC-100.mp4");
+        assert!(
+            !src.parent().unwrap().exists(),
+            "precondition: parent must not exist"
+        );
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 8, None)
+            .expect("insert");
+        // #61: insert_file stores normalize_db_path (Windows / → \)
+        let stored_path = db.get_file_by_id(file_id).unwrap().path;
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let arc = Arc::new(Mutex::new(db));
+        let err = step_move(&arc, file_id, &settings, None).expect_err("deferred");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("retryable") && msg.contains("unreachable"),
+            "expected retryable offline error got {err}"
+        );
+        let guard = arc.lock().unwrap();
+        let file = guard.get_file_by_id(file_id).unwrap();
+        assert_eq!(file.path, stored_path);
+        assert_ne!(file.status, file_status::missing);
+    }
+
+    #[test]
+    fn step_move_heal_ignores_idam_bak_leftover_as_destination() {
+        // N2: template itself renders onto a .idam-bak sidecar path
+        let dir = unique_temp_dir("heal_bak");
+        let src = dir.join("incoming.mp4");
+        let payload = b"mover-bytes";
+        fs::write(&src, payload).unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}.idam-bak".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4.idam-bak");
+        assert!(
+            path_template::is_idam_transient_path(&desired),
+            "template must resolve to sidecar"
+        );
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        fs::write(&desired, payload).unwrap();
+        fs::remove_file(&src).unwrap();
+
+        let old_path = src.to_str().unwrap().to_string();
+        let arc = Arc::new(Mutex::new(db));
+        let err = step_move(&arc, file_id, &settings, None).expect_err("sidecar refused");
+        assert!(
+            err.to_string().to_lowercase().contains("sidecar")
+                || err.to_string().to_lowercase().contains("idam"),
+            "expected sidecar refuse got {err}"
+        );
+
+        let guard = arc.lock().unwrap();
+        let file = guard.get_file_by_id(file_id).unwrap();
+        assert_eq!(file.path, old_path);
+        assert!(
+            guard.list_error_logs(20).unwrap().iter().any(|e| {
+                e.message.contains("sidecar")
+            }),
+            "ErrorLog for sidecar heal refuse"
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_heal_refuses_occupant_row() {
+        let dir = unique_temp_dir("heal_occ");
+        let src = dir.join("incoming.mp4");
+        let payload = b"mover-payload-xx";
+        fs::write(&src, payload).unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
+            .expect("insert");
+        let old_path = db.get_file_by_id(file_id).unwrap().path;
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        // Native OS separators (#61 / revert 2705a3d rendered-path workaround)
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        fs::rename(&src, &desired).unwrap();
+
+        let occupant = db
+            .insert_file(desired.to_str().unwrap(), payload.len() as u64, None)
+            .expect("occupant");
+        assert_ne!(occupant, file_id);
+
+        let arc = Arc::new(Mutex::new(db));
+        let err = step_move(&arc, file_id, &settings, None).expect_err("occupant");
+        assert!(
+            err.to_string().contains("owned by another"),
+            "expected occupant refuse got {err}"
+        );
+        let guard = arc.lock().unwrap();
+        assert_eq!(guard.get_file_by_id(file_id).unwrap().path, old_path);
+        assert!(
+            guard.list_error_logs(20).unwrap().iter().any(|e| {
+                e.message.contains("owned by another")
+            }),
+            "ErrorLog on occupant refuse"
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn step_move_heal_refuses_occupant_nocase() {
+        // N3: find_file_occupying_path uses COLLATE NOCASE on Windows/macOS
+        let dir = unique_temp_dir("heal_nocase");
+        let src = dir.join("incoming.mp4");
+        let payload = b"nocase-payload!!!";
+        fs::write(&src, payload).unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        // Native OS separators — same as #61 collision occupant tests
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        fs::rename(&src, &desired).unwrap();
+
+        // Occupant under differently-cased path string (same FS file on Windows)
+        let alt = desired.to_string_lossy().to_uppercase();
+        assert_ne!(
+            alt,
+            desired.to_string_lossy(),
+            "precondition: case must differ"
+        );
+        let occ = db
+            .insert_file(&alt, payload.len() as u64, None)
+            .expect("occupant nocase");
+        assert_ne!(occ, file_id);
+
+        let arc = Arc::new(Mutex::new(db));
+        let err = step_move(&arc, file_id, &settings, None).expect_err("nocase occupant");
+        assert!(
+            err.to_string().contains("owned by another"),
+            "expected NOCASE occupant refuse got {err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_heal_with_matching_dest_and_bak_leftover_still_heals() {
+        // Overwrite left a bak; dest holds our bytes → heal DB only leave bak alone
+        let dir = unique_temp_dir("heal_bak_ok");
+        let src = dir.join("incoming.mp4");
+        let payload = b"our-moved-bytes";
+        fs::write(&src, payload).unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(desired.parent().unwrap()).unwrap();
+        fs::rename(&src, &desired).unwrap();
+        let bak = path_template::primary_idam_bak_path(&desired);
+        fs::write(&bak, b"old-occupant").unwrap();
+
+        let arc = Arc::new(Mutex::new(db));
+        let outcome = step_move(&arc, file_id, &settings, None).expect("heal");
+        assert!(matches!(outcome, MoveStepOutcome::Moved(_)));
+
+        let guard = arc.lock().unwrap();
+        let file = guard.get_file_by_id(file_id).unwrap();
+        assert_eq!(Path::new(&file.path), desired.as_path());
+        drop(guard);
+        assert_eq!(fs::read(&desired).unwrap(), payload);
+        assert!(bak.exists(), "bak leftover must remain (#59)");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
