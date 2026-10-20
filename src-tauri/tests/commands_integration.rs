@@ -1017,12 +1017,14 @@ fn path_collision_overwrite_crash_defers_when_source_parent_unreachable() {
         b"old-bytes",
         None,
     );
+    // #61: update_file_path stores normalize_db_path (Windows / → \)
     let offline_path = "/idam-offline-vol-xyz/media/incoming.mp4";
-    {
+    let stored_path = {
         let db = fx.db.lock().expect("lock");
         db.update_file_path(file_id, offline_path)
             .expect("point mover at offline parent");
-    }
+        db.get_file_by_id(file_id).expect("mover").path
+    };
     let err = resolve_path_collision(&fx.db, &fx.queue, file_id, "overwrite", true)
         .expect_err("offline");
     assert!(
@@ -1034,7 +1036,7 @@ fn path_collision_overwrite_crash_defers_when_source_parent_unreachable() {
     let db = fx.db.lock().expect("lock");
     let mover = db.get_file_by_id(file_id).expect("mover");
     assert_eq!(mover.status, "path_collision");
-    assert_eq!(mover.path, offline_path);
+    assert_eq!(mover.path, stored_path);
 }
 
 #[test]
