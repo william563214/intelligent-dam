@@ -210,13 +210,75 @@ impl Database {
 
     /// Normalize existing Files / PathCollisions / DuplicateTombstones path strings.
     ///
-    /// If normalizing a Files or tombstone path would violate UNIQUE leave the row
-    /// unchanged and write an ErrorLog entry (no auto-merge).
+    /// Cheap `EXISTS(path LIKE '%/%')` probe first — no write lock when clean.
+    /// All three tables update in one `BEGIN IMMEDIATE`. If normalizing a Files or
+    /// tombstone path would violate UNIQUE leave the row unchanged and write an
+    /// ErrorLog entry (no auto-merge); skip if the same category+path is already logged.
     fn repair_mixed_separator_paths(&self) -> SqliteResult<()> {
-        self.repair_files_path_separators()?;
-        self.repair_path_collisions_separators()?;
-        self.repair_tombstone_path_separators()?;
-        Ok(())
+        if !self.needs_path_separator_repair()? {
+            return Ok(());
+        }
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.repair_files_path_separators()?;
+            self.repair_path_collisions_separators()?;
+            self.repair_tombstone_path_separators()?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after path separator repair: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// True when any stored path still contains `/` (mixed-separator legacy rows).
+    fn needs_path_separator_repair(&self) -> SqliteResult<bool> {
+        if self.select_exists("SELECT EXISTS(SELECT 1 FROM Files WHERE path LIKE '%/%')")? {
+            return Ok(true);
+        }
+        if self.table_exists("PathCollisions")?
+            && self.select_exists(
+                "SELECT EXISTS(
+                    SELECT 1 FROM PathCollisions
+                    WHERE desired_path LIKE '%/%' OR existing_path LIKE '%/%'
+                )",
+            )?
+        {
+            return Ok(true);
+        }
+        if self.table_exists("DuplicateTombstones")?
+            && self.select_exists(
+                "SELECT EXISTS(SELECT 1 FROM DuplicateTombstones WHERE path LIKE '%/%')",
+            )?
+        {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn has_path_normalize_error_log(&self, path: &str) -> SqliteResult<bool> {
+        self.select_exists_params(
+            "SELECT EXISTS(
+                SELECT 1 FROM ErrorLog
+                WHERE category = 'path_normalize' AND path = ?1
+            )",
+            params![path],
+        )
+    }
+
+    fn select_exists_params(
+        &self,
+        sql: &str,
+        params: impl rusqlite::Params,
+    ) -> SqliteResult<bool> {
+        let flag: i64 = self.conn.query_row(sql, params, |row| row.get(0))?;
+        Ok(flag != 0)
     }
 
     fn repair_files_path_separators(&self) -> SqliteResult<()> {
@@ -241,15 +303,17 @@ impl Database {
                 )
                 .optional()?;
             if let Some(other_id) = conflict {
-                let _ = self.insert_error_log(
-                    "path_normalize",
-                    Some(id),
-                    Some(&path),
-                    "無法正規化路徑：正規化後會與既有 Files 列撞 UNIQUE 已保留原狀",
-                    Some(&format!(
-                        "normalized={normalized} conflicting_id={other_id}"
-                    )),
-                );
+                if !self.has_path_normalize_error_log(&path)? {
+                    let _ = self.insert_error_log(
+                        "path_normalize",
+                        Some(id),
+                        Some(&path),
+                        "無法正規化路徑：正規化後會與既有 Files 列撞 UNIQUE 已保留原狀",
+                        Some(&format!(
+                            "normalized={normalized} conflicting_id={other_id}"
+                        )),
+                    );
+                }
                 continue;
             }
             self.conn.execute(
@@ -261,16 +325,7 @@ impl Database {
     }
 
     fn repair_path_collisions_separators(&self) -> SqliteResult<()> {
-        let table_exists: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'PathCollisions'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|n| n > 0)?;
-        if !table_exists {
+        if !self.table_exists("PathCollisions")? {
             return Ok(());
         }
 
@@ -287,27 +342,22 @@ impl Database {
             if desired_n == desired && existing_n == existing {
                 continue;
             }
+            // Re-query who currently occupies the normalized desired path
+            let occupant_id = self
+                .find_file_occupying_path(&desired_n, file_id)?
+                .map(|f| f.id);
             self.conn.execute(
                 "UPDATE PathCollisions
-                 SET desired_path = ?1, existing_path = ?2
-                 WHERE file_id = ?3",
-                params![desired_n, existing_n, file_id],
+                 SET desired_path = ?1, existing_path = ?2, occupant_file_id = ?3
+                 WHERE file_id = ?4",
+                params![desired_n, existing_n, occupant_id, file_id],
             )?;
         }
         Ok(())
     }
 
     fn repair_tombstone_path_separators(&self) -> SqliteResult<()> {
-        let table_exists: bool = self
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'DuplicateTombstones'",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .map(|n| n > 0)?;
-        if !table_exists {
+        if !self.table_exists("DuplicateTombstones")? {
             return Ok(());
         }
 
@@ -332,15 +382,17 @@ impl Database {
                 )
                 .optional()?;
             if let Some(other_id) = conflict {
-                let _ = self.insert_error_log(
-                    "path_normalize",
-                    None,
-                    Some(&path),
-                    "無法正規化墓碑路徑：正規化後會與既有 DuplicateTombstones 列撞 UNIQUE 已保留原狀",
-                    Some(&format!(
-                        "tombstone_id={id} normalized={normalized} conflicting_id={other_id}"
-                    )),
-                );
+                if !self.has_path_normalize_error_log(&path)? {
+                    let _ = self.insert_error_log(
+                        "path_normalize",
+                        None,
+                        Some(&path),
+                        "無法正規化墓碑路徑：正規化後會與既有 DuplicateTombstones 列撞 UNIQUE 已保留原狀",
+                        Some(&format!(
+                            "tombstone_id={id} normalized={normalized} conflicting_id={other_id}"
+                        )),
+                    );
+                }
                 continue;
             }
             self.conn.execute(
@@ -6038,6 +6090,19 @@ mod tests {
                 && e.file_id == Some(mixed_id)),
             "expected ErrorLog for UNIQUE conflict got {logs:?}"
         );
+        let n_before = logs
+            .iter()
+            .filter(|e| e.category == "path_normalize")
+            .count();
+        // Second open/repair must not rewrite the same category+path ErrorLog
+        db.repair_mixed_separator_paths().expect("repair again");
+        let n_after = db
+            .list_error_logs(10)
+            .unwrap()
+            .iter()
+            .filter(|e| e.category == "path_normalize")
+            .count();
+        assert_eq!(n_after, n_before, "ErrorLog must not duplicate on reopen");
     }
 
     #[cfg(windows)]
@@ -6057,6 +6122,58 @@ mod tests {
             .unwrap();
         assert_eq!(path, r"C:\lib\only\y.mp4");
         assert!(db.list_error_logs(5).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn upsert_mixed_separator_hits_existing_native_row() {
+        let db = open_memory_db();
+        let native = r"C:\lib\StudioA\clip.mp4";
+        let (id1, is_new1) = db.upsert_file(native, 10, None).expect("first");
+        assert!(is_new1);
+        let (id2, is_new2) = db
+            .upsert_file(r"C:/lib/StudioA/clip.mp4", 20, None)
+            .expect("mixed");
+        assert!(!is_new2, "mixed-separator upsert must hit existing row");
+        assert_eq!(id1, id2);
+        assert_eq!(db.count_files().unwrap(), 1);
+        let row = db.get_file_by_path(native).unwrap().unwrap();
+        assert_eq!(row.path, r"C:\lib\StudioA\clip.mp4");
+        assert_eq!(row.size, 20);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn repair_path_collisions_requeries_occupant_file_id() {
+        let db = open_memory_db();
+        let desired_native = r"C:\lib\StudioA\out.mp4";
+        let occupant = db
+            .insert_file(desired_native, 1, None)
+            .expect("occupant");
+        let mover = db
+            .insert_file(r"C:\lib\incoming.mp4", 2, None)
+            .expect("mover");
+        db.conn
+            .execute(
+                "INSERT INTO PathCollisions
+                    (file_id, desired_path, existing_path, occupant_file_id, resolution)
+                 VALUES (?1, ?2, ?3, NULL, 'pending')",
+                params![mover, r"C:\lib/StudioA/out.mp4", r"C:\lib/StudioA/out.mp4"],
+            )
+            .unwrap();
+        db.repair_mixed_separator_paths().expect("repair");
+        let (desired, existing, occ): (String, String, Option<i64>) = db
+            .conn
+            .query_row(
+                "SELECT desired_path, existing_path, occupant_file_id
+                 FROM PathCollisions WHERE file_id = ?1",
+                params![mover],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(desired, desired_native);
+        assert_eq!(existing, desired_native);
+        assert_eq!(occ, Some(occupant));
     }
 }
 

@@ -144,4 +144,18 @@ mod tests {
         assert!(!supp.is_suppressed(&file));
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// #61: suppress with `/` must match a query that uses `\`.
+    #[cfg(windows)]
+    #[test]
+    fn suppress_slash_matches_backslash_query() {
+        let with_slash = Path::new(r"C:/lib/StudioA/clip.mp4");
+        let with_backslash = Path::new(r"C:\lib\StudioA\clip.mp4");
+        let supp = PathSuppression::new(Duration::from_secs(30));
+        supp.suppress(with_slash);
+        assert!(
+            supp.is_suppressed(with_backslash),
+            "PathSuppression must normalize separators for lookup"
+        );
+    }
 }
