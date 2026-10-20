@@ -158,9 +158,13 @@ jobs:
             echo "lipo -archs (release exe): $(lipo -archs "$exe")"
           fi
 
+          # Use an explicit mountpoint so spaces in the volume name cannot break parsing.
+          mount_point="$(mktemp -d /tmp/idam-dmg.XXXXXX)"
           attach_dmg() {
-            hdiutil attach -nobrowse -readonly "$dmg"
+            hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg"
           }
+          cleanup() { hdiutil detach "$mount_point" -quiet || hdiutil detach "$mount_point" -force || true; rm -rf "$mount_point" || true; }
+          trap cleanup EXIT
           set +e
           attach_out="$(attach_dmg 2>&1)"
           attach_status=$?
@@ -176,11 +180,7 @@ jobs:
             fi
           fi
           printf '%s\n' "$attach_out"
-          # Last field of hdiutil attach output is the mount point.
-          mount_point="$(printf '%s\n' "$attach_out" | awk 'NF{mp=$NF} END{print mp}')"
           echo "Mount point: $mount_point"
-          cleanup() { hdiutil detach "$mount_point" -quiet || hdiutil detach "$mount_point" -force || true; }
-          trap cleanup EXIT
 
           apps=("$mount_point"/*.app)
           if ((${#apps[@]} == 0)); then
