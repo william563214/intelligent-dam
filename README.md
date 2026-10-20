@@ -53,7 +53,19 @@ sudo apt-get install ffmpeg  # Debian/Ubuntu
 sudo yum install ffmpeg      # CentOS/RHEL
 ```
 
-### 3. 設定 AV_Data_Capture (可選)
+### 3. macOS 安裝（`.dmg`，未簽章）
+
+1. 安裝 FFmpeg（應用執行時需要）：`brew install ffmpeg`
+2. 從 [Releases](https://github.com/william563214/intelligent-dam/releases) 下載 `.dmg`（校驗：`SHA256SUMS-macos.txt`），開啟後將 **Intelligent DAM** 拖入「應用程式」
+3. 本安裝包**未簽章／未公證**。若系統擋下 App，請至 **系統設定 → 隱私權與安全性 → 強制打開**，或在終端機執行：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Intelligent DAM.app"
+```
+
+> macOS 15+ 已無法再靠 Finder 右鍵「打開」繞過 Gatekeeper。
+
+### 4. 設定 AV_Data_Capture (可選)
 
 1. 下載 [AV_Data_Capture](https://github.com/YEreed/AV_Data_Capture)
 2. 在應用程式的「設定」頁面中配置 AV_Data_Capture 的路徑
