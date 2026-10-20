@@ -1013,6 +1013,15 @@ fn step_move(
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("Desired path is not valid UTF-8"))?
             .to_string();
+        // #59: after skip, same desired path must not re-enter path_collision
+        {
+            let guard = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+            if guard.has_skipped_same_path_collision(file_id, &desired_str)? {
+                return Ok(MoveStepOutcome::Unchanged);
+            }
+        }
         let occupant_id = {
             let guard = db
                 .lock()
@@ -1026,7 +1035,7 @@ fn step_move(
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
             guard
-                .mark_path_collision_atomic(file_id, &desired_str, &desired_str, occupant_id)
+                .mark_path_collision_atomic(file_id, &desired_str, occupant_id)
                 .map_err(|e| anyhow::anyhow!("Failed to mark path collision: {}", e))?;
         }
         return Ok(MoveStepOutcome::CollisionPending { desired });
@@ -1331,6 +1340,64 @@ mod tests {
             .get_pending_path_collision(file_id)
             .unwrap()
             .is_some());
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_skips_same_desired_after_user_skip() {
+        // #59: after skip, re-running move must not re-enter path_collision
+        let dir = unique_temp_dir("collide_skip_once");
+        let src = dir.join("incoming.mp4");
+        let occupied = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+        fs::write(&src, b"new").unwrap();
+        fs::write(&occupied, b"old").unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 7, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let arc = Arc::new(Mutex::new(db));
+        let first = step_move(&arc, file_id, &settings, None).expect("collision");
+        assert!(matches!(first, MoveStepOutcome::CollisionPending { .. }));
+        {
+            let guard = arc.lock().unwrap();
+            guard
+                .resolve_path_collision(file_id, "skip")
+                .expect("skip");
+            assert_eq!(
+                guard.get_file_by_id(file_id).unwrap().status,
+                file_status::ready
+            );
+        }
+        let second = step_move(&arc, file_id, &settings, None).expect("second");
+        assert_eq!(second, MoveStepOutcome::Unchanged);
+        let guard = arc.lock().unwrap();
+        assert_eq!(
+            guard.get_file_by_id(file_id).unwrap().status,
+            file_status::ready
+        );
+        assert!(guard
+            .get_pending_path_collision(file_id)
+            .unwrap()
+            .is_none());
         drop(guard);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1873,9 +1940,9 @@ mod tests {
         assert_eq!(guard.get_file_by_id(file_id).unwrap().path, old_path);
         assert!(
             guard.list_error_logs(20).unwrap().iter().any(|e| {
-                e.message.contains("owned by another")
+                e.category == "move" && e.message.contains("owned by another")
             }),
-            "ErrorLog on occupant refuse"
+            "ErrorLog on occupant refuse must use category move"
         );
         drop(guard);
         let _ = fs::remove_dir_all(&dir);

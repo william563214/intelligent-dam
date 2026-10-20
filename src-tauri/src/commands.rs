@@ -405,7 +405,7 @@ pub fn resolve_path_collision(
 
     let suppressions = queue.path_suppressions().ok();
 
-    let (source, desired, source_path_str) = {
+    let (source, desired, source_path_str, mover_size, mover_phash) = {
         let guard = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
@@ -423,19 +423,24 @@ pub fn resolve_path_collision(
             .map_err(|e| format!("Failed to read path collision: {}", e))?
             .ok_or_else(|| format!("no pending path collision for file {file_id}"))?;
         let source = PathBuf::from(&file.path);
-        if !source.is_file() {
-            let _ = guard.update_file_status(file_id, file_status::missing);
-            return Err(format!("File missing on disk: {}", file.path));
-        }
         (
             source,
             PathBuf::from(&pending.desired_path),
             file.path.clone(),
+            file.size,
+            file.phash.clone(),
         )
     };
 
     match action.as_str() {
         "skip" => {
+            if !source.is_file() {
+                let guard = db
+                    .lock()
+                    .map_err(|e| format!("Database lock error: {}", e))?;
+                let _ = guard.update_file_status(file_id, file_status::missing);
+                return Err(format!("File missing on disk: {}", source_path_str));
+            }
             {
                 let guard = db
                     .lock()
@@ -450,7 +455,32 @@ pub fn resolve_path_collision(
             })
         }
         "suffix" => {
-            let dest = path_template::unique_destination(&desired);
+            if !source.is_file() {
+                let guard = db
+                    .lock()
+                    .map_err(|e| format!("Database lock error: {}", e))?;
+                let _ = guard.update_file_status(file_id, file_status::missing);
+                return Err(format!("File missing on disk: {}", source_path_str));
+            }
+            // #59: suffix must also avoid paths already claimed in Files
+            let dest = {
+                let guard = db
+                    .lock()
+                    .map_err(|e| format!("Database lock error: {}", e))?;
+                path_template::unique_destination_avoiding(&desired, |candidate| {
+                    if candidate.exists() {
+                        return true;
+                    }
+                    let Some(s) = candidate.to_str() else {
+                        return true;
+                    };
+                    guard
+                        .find_file_occupying_path(s, file_id)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
+            };
             pipeline::finalize_move(db, file_id, &source, &dest, suppressions.as_deref())
                 .map_err(|e| format!("Failed to move with suffix: {e:#}"))?;
             {
@@ -472,6 +502,21 @@ pub fn resolve_path_collision(
             if let Some(supp) = suppressions.as_ref() {
                 supp.suppress(&desired);
             }
+
+            // N4 / #59: crash after FS overwrite before DB commit leaves source gone,
+            // desired holding mover bytes, and occupant in `.idam-bak`. On restart,
+            // finish the DB commit and discard the bak (do not mark mover missing).
+            if !source.is_file() {
+                return complete_crashed_overwrite(
+                    db,
+                    file_id,
+                    &source_path_str,
+                    &desired,
+                    mover_size,
+                    mover_phash.as_deref(),
+                );
+            }
+
             // Filesystem first (backup occupant); no DB writes until commit
             let outcome = match path_template::move_file_overwrite(&source, &desired) {
                 Ok(o) => o,
@@ -509,7 +554,12 @@ pub fn resolve_path_collision(
                 let guard = db
                     .lock()
                     .map_err(|e| format!("Database lock error: {}", e))?;
-                guard.commit_path_collision_overwrite(file_id, &source_path_str, &new_path)
+                guard.commit_path_collision_overwrite(
+                    file_id,
+                    &source_path_str,
+                    &new_path,
+                    outcome.case_only,
+                )
             };
 
             if let Err(e) = commit {
@@ -557,6 +607,81 @@ pub fn resolve_path_collision(
         }
         _ => unreachable!(),
     }
+}
+
+/// Finish an overwrite whose filesystem step already succeeded before a crash (#59 N4)
+fn complete_crashed_overwrite(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+    source_path_str: &str,
+    desired: &Path,
+    mover_size: u64,
+    mover_phash: Option<&str>,
+) -> Result<ResolvePathCollisionOutcome, String> {
+    let bak = path_template::find_occupant_bak(desired);
+    if !desired.is_file() || bak.is_none() {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let _ = guard.update_file_status(file_id, file_status::missing);
+        return Err(format!(
+            "File missing on disk and overwrite crash recovery not possible: {source_path_str}"
+        ));
+    }
+    let bak = bak.expect("checked");
+    let dest_meta = std::fs::metadata(desired)
+        .map_err(|e| format!("Failed to stat desired path: {e}"))?;
+    if dest_meta.len() != mover_size {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let _ = guard.insert_error_log(
+            "path_collision",
+            Some(file_id),
+            desired.to_str(),
+            "overwrite crash recovery refused: destination size does not match mover",
+            Some(&format!(
+                "source={source_path_str} dest={} db_size={mover_size} dest_size={}",
+                desired.display(),
+                dest_meta.len()
+            )),
+        );
+        return Err(
+            "overwrite crash recovery refused: destination size does not match mover".into(),
+        );
+    }
+    let new_path = desired
+        .to_str()
+        .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
+        .to_string();
+    let phash_note = mover_phash
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(none)");
+    {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        guard
+            .commit_path_collision_overwrite(file_id, source_path_str, &new_path, false)
+            .map_err(|e| format!("Failed to commit crashed overwrite: {e}"))?;
+        let _ = guard.insert_error_log(
+            "path_collision",
+            Some(file_id),
+            Some(&new_path),
+            "completed overwrite after crash before DB commit",
+            Some(&format!(
+                "bak={} size={mover_size} phash={phash_note}",
+                bak.display()
+            )),
+        );
+    }
+    path_template::discard_overwrite_backup(Some(&bak));
+    let file = reload_file_with_metadata(db, file_id)?;
+    Ok(ResolvePathCollisionOutcome::Overwrite {
+        file: Box::new(file),
+        new_path,
+    })
 }
 
 fn reload_file_with_metadata(

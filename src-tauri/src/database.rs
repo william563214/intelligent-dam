@@ -44,11 +44,11 @@ pub struct SuspectedDuplicateInfo {
 }
 
 /// Pending template destination collision (#40)
+/// `existing_path` was redundant with `desired_path` (#59) and is omitted from the API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PathCollisionInfo {
     pub desired_path: String,
-    pub existing_path: String,
     pub occupant_file_id: Option<i64>,
 }
 
@@ -371,11 +371,12 @@ impl Database {
             let occupant_id = self
                 .find_file_occupying_path(&desired_n, file_id)?
                 .map(|f| f.id);
+            // existing_path mirrors desired_path (#59); keep column for schema v6
             self.conn.execute(
                 "UPDATE PathCollisions
-                 SET desired_path = ?1, existing_path = ?2, occupant_file_id = ?3
-                 WHERE file_id = ?4",
-                params![desired_n, existing_n, occupant_id, file_id],
+                 SET desired_path = ?1, existing_path = ?1, occupant_file_id = ?2
+                 WHERE file_id = ?3",
+                params![desired_n, occupant_id, file_id],
             )?;
         }
         Ok(())
@@ -1787,28 +1788,46 @@ impl Database {
     }
 
     /// Upsert pending path collision; refreshes paths while still pending.
+    /// DB column `existing_path` is kept for schema v6 but always mirrors desired (#59)
     pub fn upsert_path_collision(
         &self,
         file_id: i64,
         desired_path: &str,
-        existing_path: &str,
         occupant_file_id: Option<i64>,
     ) -> SqliteResult<()> {
         let desired_path = normalize_db_path(desired_path);
-        let existing_path = normalize_db_path(existing_path);
-        // Always re-open as pending: skip/suffix/overwrite may collide again later
+        // Re-open as pending when desired changes or prior resolution was not skip
+        // Same desired after skip stays skipped (caller should avoid calling)
         self.conn.execute(
             "INSERT INTO PathCollisions
                 (file_id, desired_path, existing_path, occupant_file_id, resolution)
-             VALUES (?1, ?2, ?3, ?4, 'pending')
+             VALUES (?1, ?2, ?2, ?3, 'pending')
              ON CONFLICT(file_id) DO UPDATE SET
                desired_path = excluded.desired_path,
                existing_path = excluded.existing_path,
                occupant_file_id = excluded.occupant_file_id,
                resolution = 'pending'",
-            params![file_id, desired_path, existing_path, occupant_file_id],
+            params![file_id, desired_path, occupant_file_id],
         )?;
         Ok(())
+    }
+
+    /// True when this file already skipped the same desired path (#59)
+    pub fn has_skipped_same_path_collision(
+        &self,
+        file_id: i64,
+        desired_path: &str,
+    ) -> SqliteResult<bool> {
+        let desired_path = normalize_db_path(desired_path);
+        let mut stmt = self.conn.prepare(
+            "SELECT 1 FROM PathCollisions
+             WHERE file_id = ?1 AND resolution = 'skip' AND desired_path = ?2
+             LIMIT 1",
+        )?;
+        let found = stmt
+            .query_row(params![file_id, desired_path], |_| Ok(()))
+            .optional()?;
+        Ok(found.is_some())
     }
 
     /// Atomically record a template destination collision and set status.
@@ -1816,7 +1835,6 @@ impl Database {
         &self,
         file_id: i64,
         desired_path: &str,
-        existing_path: &str,
         occupant_file_id: Option<i64>,
     ) -> SqliteResult<()> {
         let current = self.get_file_by_id(file_id)?.status;
@@ -1827,16 +1845,10 @@ impl Database {
         }
 
         let desired_path = normalize_db_path(desired_path);
-        let existing_path = normalize_db_path(existing_path);
 
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
-            self.upsert_path_collision(
-                file_id,
-                &desired_path,
-                &existing_path,
-                occupant_file_id,
-            )?;
+            self.upsert_path_collision(file_id, &desired_path, occupant_file_id)?;
             let resolution: Option<String> = self
                 .conn
                 .query_row(
@@ -2052,11 +2064,15 @@ impl Database {
 
     /// After a successful overwrite filesystem move: one transaction updates the
     /// live occupant (re-queried), the mover path/organized/ready, and collision.
+    ///
+    /// `same_file_overwrite` is true for case-only / hard-link renames (#59): the
+    /// occupant row is displaced but not marked missing (same inode as the mover).
     pub fn commit_path_collision_overwrite(
         &self,
         mover_id: i64,
         expected_old_path: &str,
         new_path: &str,
+        same_file_overwrite: bool,
     ) -> SqliteResult<()> {
         let expected_old_path = normalize_db_path(expected_old_path);
         let new_path = normalize_db_path(new_path);
@@ -2064,25 +2080,56 @@ impl Database {
         let tx_result = (|| -> SqliteResult<()> {
             // S1: re-query who currently owns desired_path (stale occupant_file_id ignored)
             if let Some(occupant) = self.find_file_occupying_path(&new_path, mover_id)? {
-                let displaced = normalize_db_path(&format!(
-                    "{}#displaced-{}",
-                    occupant.path, occupant.id
-                ));
-                self.conn.execute(
-                    "UPDATE Files SET path = ?1 WHERE id = ?2",
-                    params![displaced, occupant.id],
-                )?;
-                if occupant.status != file_status::missing {
-                    if !file_status::can_transition(&occupant.status, file_status::missing) {
-                        return Err(rusqlite::Error::InvalidParameterName(format!(
-                            "illegal status transition: {} -> missing",
-                            occupant.status
-                        )));
-                    }
+                if same_file_overwrite {
+                    // Hard link / case-only: same inode as mover. Drop the duplicate
+                    // library row (displacing to a fake path would just be marked
+                    // missing on the next reconcile / get_files_with_metadata).
+                    let occ_path = occupant.path.clone();
+                    let occ_id = occupant.id;
                     self.conn.execute(
-                        "UPDATE Files SET status = ?1 WHERE id = ?2",
-                        params![file_status::missing, occupant.id],
+                        "UPDATE PathCollisions SET occupant_file_id = NULL
+                         WHERE occupant_file_id = ?1",
+                        params![occ_id],
                     )?;
+                    self.delete_file_record_inner(occ_id)?;
+                    let _ = self.insert_error_log(
+                        "path_collision",
+                        Some(occ_id),
+                        Some(&occ_path),
+                        "occupant row removed (same-file hardlink or case-only overwrite)",
+                        Some(&format!("mover_id={mover_id} same_file=true")),
+                    );
+                } else {
+                    let displaced = normalize_db_path(&format!(
+                        "{}#displaced-{}",
+                        occupant.path, occupant.id
+                    ));
+                    self.conn.execute(
+                        "UPDATE Files SET path = ?1 WHERE id = ?2",
+                        params![displaced, occupant.id],
+                    )?;
+                    if occupant.status != file_status::missing {
+                        if !file_status::can_transition(&occupant.status, file_status::missing) {
+                            return Err(rusqlite::Error::InvalidParameterName(format!(
+                                "illegal status transition: {} -> missing",
+                                occupant.status
+                            )));
+                        }
+                        self.conn.execute(
+                            "UPDATE Files SET status = ?1 WHERE id = ?2",
+                            params![file_status::missing, occupant.id],
+                        )?;
+                    }
+                    // #59: record that an occupant library row was overwritten
+                    let _ = self.insert_error_log(
+                        "path_collision",
+                        Some(occupant.id),
+                        Some(&occupant.path),
+                        "occupant row overwritten by path collision resolve",
+                        Some(&format!(
+                            "mover_id={mover_id} displaced_to={displaced}"
+                        )),
+                    );
                 }
             }
 
@@ -2675,7 +2722,6 @@ impl Database {
                 row.get::<_, i64>(0)?,
                 PathCollisionInfo {
                     desired_path: row.get(1)?,
-                    existing_path: row.get(2)?,
                     occupant_file_id: row.get(3)?,
                 },
             ))
