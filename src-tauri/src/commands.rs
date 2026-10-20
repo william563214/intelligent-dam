@@ -616,6 +616,10 @@ pub fn resolve_path_collision(
 ///
 /// N1: when bak is already gone but dest matches mover identity (same as #60 heal),
 /// still complete the DB commit instead of marking the mover missing.
+///
+/// Without a bak, size/phash identity cannot tell an exact-duplicate occupant apart
+/// from the mover that already landed on dest; #66 (`pending_move_to`) is required
+/// before recovery can disambiguate those cases.
 fn complete_crashed_overwrite(
     db: &Arc<Mutex<Database>>,
     file_id: i64,

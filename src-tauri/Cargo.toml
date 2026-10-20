@@ -39,6 +39,7 @@ handlebars = "5"
 same-file = "1"
 unicode-segmentation = "1.12"
 tauri-plugin-dialog = "~2.6.0"
+unicode-normalization = "0.1"
 
 # Linux 禁用 rfd gtk3 後備 以免在 tao setup MainContext 下 GtkGlobalThread 死鎖
 # macOS / Windows 使用原生 rfd 對話框 無需 xdg-portal/gtk3 預設特徵

@@ -203,22 +203,19 @@ impl Database {
         if version_after >= 5 {
             self.ensure_v5_columns()?;
         }
-        // #61: Windows-only idempotent repair of legacy path strings (no schema bump)
-        #[cfg(windows)]
-        {
-            self.repair_mixed_separator_paths()?;
-        }
+        // #61 / #63: idempotent repair of legacy path strings (no schema bump).
+        // Covers Windows separators/prefixes and cross-platform trailing seps + NFC.
+        self.repair_mixed_separator_paths()?;
         Ok(())
     }
 
     /// Normalize existing Files / PathCollisions / DuplicateTombstones path strings.
     ///
-    /// Windows only. Read-only probe (`normalize_db_path(path) != path`) first — no
-    /// write lock when clean. All three tables update in one `BEGIN IMMEDIATE`.
+    /// Read-only probe (`normalize_db_path(path) != path`) first — no write lock when
+    /// clean. All three tables update in one `BEGIN IMMEDIATE`.
     /// If normalizing a Files or tombstone path would violate UNIQUE leave the row
     /// unchanged and write an ErrorLog entry (no auto-merge); skip if the same
     /// category+path is already logged.
-    #[cfg(windows)]
     fn repair_mixed_separator_paths(&self) -> SqliteResult<()> {
         if !self.needs_path_separator_repair()? {
             return Ok(());
@@ -243,12 +240,11 @@ impl Database {
     }
 
     /// True when any stored path differs from `normalize_db_path` (covers `/`,
-    /// `\\?\`, lowercase drive, and duplicate `\`). Read-only — no write lock.
-    #[cfg(windows)]
+    /// `\\?\`, lowercase drive, duplicate `\`, trailing seps, NFC). Read-only —
+    /// no write lock.
     fn needs_path_separator_repair(&self) -> SqliteResult<bool> {
         // Prefer normalize(path) != path over fragile LIKE escaping: covers every
-        // shape the SQL probes would list (forward slash, verbatim, lowercase
-        // drive, doubled `\`) without false positives on clean native paths.
+        // shape normalize_db_path rewrites without false positives on clean paths.
         if self.path_rows_need_normalize("SELECT path FROM Files")? {
             return Ok(true);
         }
@@ -270,7 +266,6 @@ impl Database {
     }
 
     /// Definitive probe: any row where normalize changes the stored string.
-    #[cfg(windows)]
     fn path_rows_need_normalize(&self, sql: &str) -> SqliteResult<bool> {
         let mut stmt = self.conn.prepare(sql)?;
         let mut rows = stmt.query([])?;
@@ -283,7 +278,6 @@ impl Database {
         Ok(false)
     }
 
-    #[cfg(windows)]
     fn has_path_normalize_error_log(&self, path: &str) -> SqliteResult<bool> {
         self.select_exists_params(
             "SELECT EXISTS(
@@ -294,7 +288,6 @@ impl Database {
         )
     }
 
-    #[cfg(windows)]
     fn select_exists_params(
         &self,
         sql: &str,
@@ -304,7 +297,6 @@ impl Database {
         Ok(flag != 0)
     }
 
-    #[cfg(windows)]
     fn repair_files_path_separators(&self) -> SqliteResult<()> {
         let mut stmt = self
             .conn
@@ -348,7 +340,6 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(windows)]
     fn repair_path_collisions_separators(&self) -> SqliteResult<()> {
         if !self.table_exists("PathCollisions")? {
             return Ok(());
@@ -382,7 +373,6 @@ impl Database {
         Ok(())
     }
 
-    #[cfg(windows)]
     fn repair_tombstone_path_separators(&self) -> SqliteResult<()> {
         if !self.table_exists("DuplicateTombstones")? {
             return Ok(());
@@ -6359,6 +6349,95 @@ mod tests {
         assert_eq!(desired, desired_native);
         assert_eq!(existing, desired_native);
         assert_eq!(occ, Some(occupant));
+    }
+
+    /// #63: trailing-separator repair is idempotent and skips the write path when clean
+    #[test]
+    fn repair_trailing_separator_paths_idempotent() {
+        let db = open_memory_db();
+        #[cfg(windows)]
+        let (raw, expect) = (r"C:\lib\StudioA\", r"C:\lib\StudioA");
+        #[cfg(not(windows))]
+        let (raw, expect) = ("/lib/StudioA/", "/lib/StudioA");
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
+                params![raw],
+            )
+            .unwrap();
+        assert!(db.needs_path_separator_repair().unwrap());
+        db.repair_mixed_separator_paths().expect("repair");
+        let path: String = db
+            .conn
+            .query_row("SELECT path FROM Files LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(path, expect);
+        assert!(!db.needs_path_separator_repair().unwrap());
+        db.repair_mixed_separator_paths().expect("second repair no-op");
+        assert!(db.list_error_logs(5).unwrap().is_empty());
+    }
+
+    /// #63: NFC repair + UNIQUE conflict leaves the row and logs once
+    #[test]
+    fn repair_nfc_unique_conflict_logs_and_leaves_row() {
+        let db = open_memory_db();
+        let nfd = "cafe\u{0301}";
+        let nfc = "caf\u{e9}";
+        #[cfg(windows)]
+        let (nfd_path, nfc_path) = (
+            format!(r"C:\lib\{nfd}\x.mp4"),
+            format!(r"C:\lib\{nfc}\x.mp4"),
+        );
+        #[cfg(not(windows))]
+        let (nfd_path, nfc_path) = (format!("/lib/{nfd}/x.mp4"), format!("/lib/{nfc}/x.mp4"));
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
+                params![nfc_path.as_str()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 2, 'ready')",
+                params![nfd_path.as_str()],
+            )
+            .unwrap();
+        let nfd_id: i64 = db
+            .conn
+            .query_row(
+                "SELECT id FROM Files WHERE path = ?1",
+                params![nfd_path.as_str()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        db.repair_mixed_separator_paths().expect("repair");
+        let still: String = db
+            .conn
+            .query_row(
+                "SELECT path FROM Files WHERE id = ?1",
+                params![nfd_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, nfd_path, "UNIQUE conflict must leave NFD row unchanged");
+        let logs = db.list_error_logs(10).unwrap();
+        assert!(
+            logs.iter()
+                .any(|e| e.category == "path_normalize" && e.file_id == Some(nfd_id)),
+            "expected path_normalize ErrorLog got {logs:?}"
+        );
+        let n_before = logs
+            .iter()
+            .filter(|e| e.category == "path_normalize")
+            .count();
+        db.repair_mixed_separator_paths().expect("again");
+        let n_after = db
+            .list_error_logs(10)
+            .unwrap()
+            .iter()
+            .filter(|e| e.category == "path_normalize")
+            .count();
+        assert_eq!(n_after, n_before);
     }
 }
 
