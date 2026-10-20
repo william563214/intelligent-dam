@@ -1,6 +1,9 @@
-# Build a macOS .dmg (universal) and upload it to an existing GitHub Release
-# Does not create tags or releases and does not change draft/prerelease state
-# Unsigned builds trip Gatekeeper users must right-click Open the first time
+# Build a macOS .dmg (universal) and upload it to an existing GitHub Release.
+# Does not create tags or releases and does not change draft / prerelease state.
+# Unsigned / ad-hoc builds trip Gatekeeper on modern macOS: use
+# 系統設定 → 隱私權與安全性 → 強制打開, or
+# xattr -dr com.apple.quarantine "/Applications/Intelligent DAM.app".
+# (Right-click Open no longer works on macOS 15+.)
 name: Release macOS
 
 on:
@@ -11,45 +14,63 @@ on:
         required: true
         default: v0.1.0
         type: string
+      upload:
+        description: Upload DMG to the GitHub Release (false = dry-run artifact only)
+        required: false
+        default: true
+        type: boolean
   release:
     types: [published]
+  pull_request:
+    paths:
+      - ".github/workflows/release-macos.yml"
 
-# Least privilege at workflow level job grants contents write for gh upload
+# Least privilege at workflow level; job grants contents write only when uploading.
 permissions: {}
 
 concurrency:
-  group: release-macos-${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+  group: >-
+    release-macos-${{
+      github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) ||
+      (github.event_name == 'release' && github.event.release.tag_name || inputs.tag)
+    }}
   cancel-in-progress: false
 
 jobs:
   build-macos:
     runs-on: macos-latest
     permissions:
-      contents: write
+      contents: ${{ github.event_name == 'pull_request' && 'read' || 'write' }}
     env:
-      # workflow_dispatch uses inputs.tag release published uses the release tag
+      # workflow_dispatch uses inputs.tag; release published uses the release tag.
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+      # pull_request always dry-runs; workflow_dispatch dry-runs when upload is false.
+      IS_DRY_RUN: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.upload == false) }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # Required before checkout so gh can target this repo without a local git remote
+      # Required before checkout so gh can target this repo without a local git remote.
       GH_REPO: ${{ github.repository }}
+      # Ad-hoc signing ("-") so the .app is signed without a Developer ID certificate.
+      APPLE_SIGNING_IDENTITY: "-"
     steps:
       - name: Verify target release exists
+        if: env.IS_DRY_RUN != 'true'
         shell: bash
         run: |
           set -euo pipefail
           echo "Target tag: ${RELEASE_TAG}"
           gh release view "${RELEASE_TAG}" --json tagName,isDraft,url
 
-      - name: Checkout tag commit
+      - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          # PR dry-run builds the PR head; release / dispatch builds the tag commit.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || env.RELEASE_TAG }}
           persist-credentials: false
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          # package-lock.json lockfileVersion 3 Node 18+
+          # package-lock.json lockfileVersion 3 needs Node 18+.
           node-version: "20"
           cache: npm
 
@@ -57,7 +78,7 @@ jobs:
         run: npm ci
 
       - name: Build frontend if tag lacks beforeBuildCommand
-        # Checkout is the release tag commit (e.g. v0.1.0) which may predate
+        # Checkout may be a release tag commit (e.g. v0.1.0) which may predate
         # beforeBuildCommand. Skip when present so tauri build does not double-build.
         shell: bash
         run: |
@@ -67,11 +88,18 @@ jobs:
           fi
 
       - name: Setup Rust toolchain
-        # Action pinned to stable-branch tip toolchain pinned to MSRV
+        # Action pinned to stable-branch tip; toolchain pinned to MSRV.
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           toolchain: "1.83.0"
           targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Ensure universal Rust targets installed
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          rustup target list --installed | grep -E '^(aarch64|x86_64)-apple-darwin$' | sort
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -79,31 +107,82 @@ jobs:
           workspaces: ./src-tauri -> target
 
       - name: Build macOS DMG (universal)
-        # Frontend already built above when tag has no beforeBuildCommand
-        # otherwise tauri beforeBuildCommand builds it once during this step
-        # --locked keeps Cargo.lock authoritative for the MSRV 1.83 tree
-        # universal-apple-darwin covers Apple Silicon and Intel in one .dmg
-        run: npx tauri build --target universal-apple-darwin --bundles dmg -- --locked
+        # Frontend already built above when the tree has no beforeBuildCommand;
+        # otherwise tauri beforeBuildCommand builds it once during this step.
+        # --locked keeps Cargo.lock authoritative for the MSRV 1.83 tree.
+        # universal-apple-darwin covers Apple Silicon and Intel in one .dmg.
+        # APPLE_SIGNING_IDENTITY="-" requests ad-hoc codesign (no Developer ID).
+        # Retry once if hdiutil fails with "Resource busy" (common on GHA runners).
+        shell: bash
+        run: |
+          set -euo pipefail
+          build_dmg() {
+            npx tauri build --target universal-apple-darwin --bundles dmg -- --locked
+          }
+          set +e
+          out="$(build_dmg 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$out"
+          if [[ "$status" -eq 0 ]]; then
+            exit 0
+          fi
+          if printf '%s\n' "$out" | grep -q 'Resource busy'; then
+            echo "hdiutil reported Resource busy; retrying build once after sleep."
+            sleep 10
+            build_dmg
+            exit 0
+          fi
+          exit "$status"
 
-      - name: Upload DMG and SHA256SUMS-macos.txt
+      - name: Verify universal binary arches and ad-hoc signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_dir="src-tauri/target/universal-apple-darwin/release/bundle/macos"
+          shopt -s nullglob
+          apps=("$app_dir"/*.app)
+          if ((${#apps[@]} == 0)); then
+            echo "Missing .app under ${app_dir}"
+            find src-tauri/target -type d -name '*.app' -print || true
+            exit 1
+          fi
+          app="${apps[0]}"
+          # Product binary lives at Contents/MacOS/<productName>.
+          bin="$(find "$app/Contents/MacOS" -type f -perm -111 | head -n 1)"
+          echo "App: $app"
+          echo "Binary: $bin"
+          arches="$(lipo -archs "$bin")"
+          echo "lipo -archs: $arches"
+          echo "$arches" | grep -q 'x86_64'
+          echo "$arches" | grep -q 'arm64'
+          echo "codesign details:"
+          cs_out="$(codesign -dv --verbose=4 "$app" 2>&1 || true)"
+          printf '%s\n' "$cs_out"
+          # Ad-hoc signing shows Authority=adhoc, Signature=adhoc, or flags=...adhoc.
+          if printf '%s\n' "$cs_out" | grep -qiE 'Authority=adhoc|Signature=adhoc|flags=.*adhoc'; then
+            echo "ADHOC_SIGNING=ok"
+          else
+            # Report outcome without failing the job; APPLE_SIGNING_IDENTITY=- may be ignored.
+            echo "ADHOC_SIGNING=missing_or_unexpected"
+          fi
+
+      - name: Stage DMG and SHA256SUMS-macos.txt
+        id: stage
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p .temp/macos-release
 
           shopt -s nullglob
-          # Prefer universal output fall back to host-arch dmg if present
           dmg_files=(src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg)
           if ((${#dmg_files[@]} == 0)); then
-            dmg_files=(src-tauri/target/release/bundle/dmg/*.dmg)
-          fi
-          if ((${#dmg_files[@]} == 0)); then
-            echo "Missing .dmg under src-tauri/target/**/release/bundle/dmg"
+            echo "Missing universal .dmg under src-tauri/target/universal-apple-darwin/release/bundle/dmg"
             find src-tauri/target -type f \( -name '*.dmg' -o -name '*.app' \) -print || true
             exit 1
           fi
 
-          # Rename spaces to dots so asset names match GitHub Release storage and checksums
+          # Rename spaces to dots so asset names match GitHub Release storage and checksums.
           staged=()
           for file in "${dmg_files[@]}"; do
             base="$(basename "$file")"
@@ -116,15 +195,34 @@ jobs:
           sums_path=".temp/macos-release/SHA256SUMS-macos.txt"
           : > "$sums_path"
           for file in "${staged[@]}"; do
-            # Portable SHA-256 (macOS shasum) LF-only for Linux sha256sum -c
+            # Portable SHA-256 (macOS shasum); LF-only so Linux sha256sum -c works.
             hash="$(shasum -a 256 "$file" | awk '{print $1}')"
             printf '%s  %s\n' "$hash" "$(basename "$file")" >> "$sums_path"
           done
 
-          echo "Uploading to release ${RELEASE_TAG}"
           ls -la .temp/macos-release
           cat "$sums_path"
+          echo "sums_path=${sums_path}" >> "$GITHUB_OUTPUT"
 
-          # --clobber replaces same-named macOS assets only leaves Linux/Windows sums untouched
-          # Does not create tags edit release notes or touch Linux/Windows assets
+      - name: Upload release assets
+        if: env.IS_DRY_RUN != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          staged=(.temp/macos-release/*.dmg)
+          sums_path=".temp/macos-release/SHA256SUMS-macos.txt"
+          echo "Uploading to release ${RELEASE_TAG}"
+          # --clobber replaces same-named macOS assets only; leaves Linux / Windows sums untouched.
+          # Does not create tags, edit release notes, or touch Linux / Windows assets.
           gh release upload "${RELEASE_TAG}" "${staged[@]}" "$sums_path" --clobber
+
+      - name: Upload dry-run artifacts
+        if: env.IS_DRY_RUN == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: macos-dmg-dry-run
+          path: |
+            .temp/macos-release/*.dmg
+            .temp/macos-release/SHA256SUMS-macos.txt
+          if-no-files-found: error
