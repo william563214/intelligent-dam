@@ -9,7 +9,7 @@ use crate::ffmpeg;
 use crate::file_status;
 use crate::path_suppression::PathSuppression;
 use crate::path_template::{
-    self, move_file, render_output_path, rollback_move, unique_destination, TemplateContext,
+    self, destination_collides, move_file, render_output_path, rollback_move, TemplateContext,
 };
 use crate::scraper::{scrape_metadata, to_database_metadata};
 use crate::settings::{AppSettings, SettingsStore};
@@ -279,7 +279,7 @@ pub fn run_for_file(
         aborted: false,
     };
 
-    // Near-phash suspected duplicates must not auto-run scrape/move/preview
+    // Near-phash / path-collision must not auto-run scrape/move/preview
     if let Ok(status) = current_status(db, file_id) {
         if status == file_status::suspected_duplicate {
             eprintln!(
@@ -295,6 +295,27 @@ pub fn run_for_file(
                     step: "pipeline".to_string(),
                     status: "skipped".to_string(),
                     message: Some("skipped: suspected_duplicate (awaiting confirm/ignore)".to_string()),
+                    new_path: None,
+                },
+            );
+            return result;
+        }
+        if status == file_status::path_collision {
+            eprintln!(
+                "pipeline: soft-skip path_collision file_id {}",
+                file_id
+            );
+            let path = current_path(db, file_id).unwrap_or_default();
+            emit_progress(
+                app,
+                PipelineProgressEvent {
+                    file_id,
+                    path,
+                    step: "pipeline".to_string(),
+                    status: "skipped".to_string(),
+                    message: Some(
+                        "skipped: path_collision (awaiting suffix/skip/overwrite)".to_string(),
+                    ),
                     new_path: None,
                 },
             );
@@ -443,7 +464,7 @@ pub fn run_for_file(
             },
         );
         match step_move(db, file_id, &settings, suppressions) {
-            Ok(Some(new_path)) => {
+            Ok(MoveStepOutcome::Moved(new_path)) => {
                 let new_str = new_path.to_string_lossy().to_string();
                 result.moved_to = Some(new_path);
                 emit_progress(
@@ -458,7 +479,7 @@ pub fn run_for_file(
                     },
                 );
             }
-            Ok(None) => {
+            Ok(MoveStepOutcome::Unchanged) => {
                 emit_progress(
                     app,
                     PipelineProgressEvent {
@@ -468,6 +489,23 @@ pub fn run_for_file(
                         status: "skipped".to_string(),
                         message: Some("destination equals source".to_string()),
                         new_path: None,
+                    },
+                );
+            }
+            Ok(MoveStepOutcome::CollisionPending { desired }) => {
+                let desired_str = desired.to_string_lossy().to_string();
+                emit_progress(
+                    app,
+                    PipelineProgressEvent {
+                        file_id,
+                        path: initial_path.clone(),
+                        step: "move".to_string(),
+                        status: "skipped".to_string(),
+                        message: Some(format!(
+                            "path collision at {} (awaiting suffix/skip/overwrite)",
+                            desired_str
+                        )),
+                        new_path: Some(desired_str),
                     },
                 );
             }
@@ -704,14 +742,23 @@ fn step_scrape(
     }
 }
 
+/// Result of the template move step (#40 surfaces collisions instead of auto-suffix)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveStepOutcome {
+    Unchanged,
+    Moved(PathBuf),
+    CollisionPending { desired: PathBuf },
+}
+
 /// Render template move on disk then update Files.path
+/// On collision records PathCollisions and awaits UI (suffix / skip / overwrite)
 /// On DB update failure rolls the file back so DB never points at a wrong path
 fn step_move(
     db: &Arc<Mutex<Database>>,
     file_id: i64,
     settings: &AppSettings,
     suppressions: Option<&PathSuppression>,
-) -> Result<Option<PathBuf>> {
+) -> Result<MoveStepOutcome> {
     let template = settings.output_template.trim();
     if template.is_empty() {
         anyhow::bail!("output_template is empty");
@@ -749,29 +796,96 @@ fn step_move(
     };
 
     let desired = render_output_path(template, &ctx, &base_dir)?;
-    // If rendered path is the source itself skip before unique_destination
-    // (unique_destination would otherwise see the source as a collision)
+    // If rendered path is the source itself skip (no collision / no move)
     if path_template::paths_equal(&source, &desired) {
-        return Ok(None);
+        return Ok(MoveStepOutcome::Unchanged);
     }
-    let dest = unique_destination(&desired);
 
+    // #40: do not auto-suffix; pause for UI when destination already exists
+    if destination_collides(&source, &desired) {
+        let desired_str = desired
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Desired path is not valid UTF-8"))?
+            .to_string();
+        let occupant_id = {
+            let guard = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+            guard
+                .get_file_by_path(&desired_str)?
+                .map(|f| f.id)
+                .filter(|id| *id != file_id)
+        };
+        {
+            let guard = db
+                .lock()
+                .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+            guard
+                .mark_path_collision_atomic(file_id, &desired_str, &desired_str, occupant_id)
+                .map_err(|e| anyhow::anyhow!("Failed to mark path collision: {}", e))?;
+        }
+        return Ok(MoveStepOutcome::CollisionPending { desired });
+    }
+
+    finalize_move(db, file_id, &source, &desired, suppressions)?;
+    Ok(MoveStepOutcome::Moved(desired))
+}
+
+/// Perform filesystem move + Files.path update (shared by pipeline and collision resolve)
+pub fn finalize_move(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+    source: &Path,
+    dest: &Path,
+    suppressions: Option<&PathSuppression>,
+) -> Result<()> {
+    finalize_move_inner(db, file_id, source, dest, suppressions, false)
+}
+
+/// Overwrite destination then update Files.path
+pub fn finalize_move_overwrite(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+    source: &Path,
+    dest: &Path,
+    suppressions: Option<&PathSuppression>,
+) -> Result<()> {
+    finalize_move_inner(db, file_id, source, dest, suppressions, true)
+}
+
+fn finalize_move_inner(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+    source: &Path,
+    dest: &Path,
+    suppressions: Option<&PathSuppression>,
+    overwrite: bool,
+) -> Result<()> {
     // Suppress before the rename so recursive watch events are ignored
     if let Some(supp) = suppressions {
-        supp.suppress(&dest);
+        supp.suppress(dest);
     }
 
-    // Filesystem work outside the mutex
-    move_file(&source, &dest).with_context(|| {
-        format!(
-            "Failed to move {} → {}",
-            source.display(),
-            dest.display()
-        )
-    })?;
+    if overwrite {
+        path_template::move_file_overwrite(source, dest).with_context(|| {
+            format!(
+                "Failed to overwrite-move {} → {}",
+                source.display(),
+                dest.display()
+            )
+        })?;
+    } else {
+        move_file(source, dest).with_context(|| {
+            format!(
+                "Failed to move {} → {}",
+                source.display(),
+                dest.display()
+            )
+        })?;
+    }
 
     if let Some(supp) = suppressions {
-        supp.suppress(&dest);
+        supp.suppress(dest);
     }
 
     let new_path_str = dest
@@ -785,7 +899,7 @@ fn step_move(
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
         let file = guard.get_file_by_id(file_id)?;
-        if Path::new(&file.path) != source.as_path() {
+        if Path::new(&file.path) != source {
             Err(anyhow::anyhow!(
                 "Files.path changed during move (expected {} got {})",
                 source.display(),
@@ -803,7 +917,7 @@ fn step_move(
     };
 
     if let Err(e) = update_result {
-        if let Err(rb) = rollback_move(&dest, &source) {
+        if let Err(rb) = rollback_move(dest, source) {
             return Err(e).context(format!(
                 "DB path update failed and rollback also failed: {:#}",
                 rb
@@ -812,7 +926,7 @@ fn step_move(
         return Err(e).context("DB path update failed file rolled back to original location");
     }
 
-    Ok(Some(dest))
+    Ok(())
 }
 
 fn step_preview(db: &Arc<Mutex<Database>>, file_id: i64) -> Result<String> {
@@ -973,9 +1087,10 @@ mod tests {
             ..AppSettings::default()
         };
         let arc = Arc::new(Mutex::new(db));
-        let moved = step_move(&arc, file_id, &settings, None)
-            .expect("move ok")
-            .expect("some path");
+        let outcome = step_move(&arc, file_id, &settings, None).expect("move ok");
+        let MoveStepOutcome::Moved(moved) = outcome else {
+            panic!("expected Moved got {outcome:?}");
+        };
 
         assert!(moved.exists());
         assert!(!src.exists());
@@ -983,6 +1098,56 @@ mod tests {
         let file = guard.get_file_by_id(file_id).unwrap();
         assert_eq!(Path::new(&file.path), moved.as_path());
         assert!(file.path.contains("StudioA"));
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn step_move_records_path_collision_instead_of_auto_suffix() {
+        let dir = unique_temp_dir("collide_ui");
+        let src = dir.join("incoming.mp4");
+        let occupied = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+        fs::write(&src, b"new").unwrap();
+        fs::write(&occupied, b"old").unwrap();
+
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 7, None)
+            .expect("insert");
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+        let arc = Arc::new(Mutex::new(db));
+        let outcome = step_move(&arc, file_id, &settings, None).expect("collision ok");
+        match outcome {
+            MoveStepOutcome::CollisionPending { desired } => {
+                assert_eq!(desired, occupied);
+            }
+            other => panic!("expected CollisionPending got {other:?}"),
+        }
+        assert!(src.exists(), "source must stay until user resolves");
+        assert_eq!(fs::read(&occupied).unwrap(), b"old");
+        let guard = arc.lock().unwrap();
+        let file = guard.get_file_by_id(file_id).unwrap();
+        assert_eq!(file.status, file_status::path_collision);
+        assert!(guard
+            .get_pending_path_collision(file_id)
+            .unwrap()
+            .is_some());
         drop(guard);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1032,9 +1197,10 @@ mod tests {
             ..AppSettings::default()
         };
         let arc = Arc::new(Mutex::new(db));
-        let moved = step_move(&arc, file_id, &settings, None)
-            .expect("move with fallbacks")
-            .expect("dest");
+        let outcome = step_move(&arc, file_id, &settings, None).expect("move with fallbacks");
+        let MoveStepOutcome::Moved(moved) = outcome else {
+            panic!("expected Moved got {outcome:?}");
+        };
         assert!(moved
             .file_name()
             .unwrap()
@@ -1102,9 +1268,10 @@ mod tests {
         let suppressions = PathSuppression::new(std::time::Duration::from_secs(60));
         let arc = Arc::new(Mutex::new(db));
 
-        let moved = step_move(&arc, file_id, &settings, Some(&suppressions))
-            .expect("move")
-            .expect("dest under watch");
+        let outcome = step_move(&arc, file_id, &settings, Some(&suppressions)).expect("move");
+        let MoveStepOutcome::Moved(moved) = outcome else {
+            panic!("expected Moved got {outcome:?}");
+        };
         assert!(moved.starts_with(&watch));
         assert!(suppressions.is_suppressed(&moved));
 

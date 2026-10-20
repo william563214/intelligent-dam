@@ -42,6 +42,15 @@ pub struct SuspectedDuplicateInfo {
     pub distance: u32,
 }
 
+/// Pending template destination collision (#40)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathCollisionInfo {
+    pub desired_path: String,
+    pub existing_path: String,
+    pub occupant_file_id: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWithMetadata {
     // 保持巢狀 shape 與前端 FileWithMetadata.file / metadata / tags 對齊
@@ -51,6 +60,8 @@ pub struct FileWithMetadata {
     pub tags: Vec<Tag>,
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "suspectedDuplicate")]
     pub suspected_duplicate: Option<SuspectedDuplicateInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "pathCollision")]
+    pub path_collision: Option<PathCollisionInfo>,
 }
 
 /// Pending near-phash suspicion row (SuspectedDuplicates table).
@@ -59,6 +70,16 @@ pub struct SuspectedDuplicateRow {
     pub file_id: i64,
     pub keeper_id: i64,
     pub distance: u32,
+    pub resolution: String,
+}
+
+/// Pending path-collision row (PathCollisions table / #40).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathCollisionRow {
+    pub file_id: i64,
+    pub desired_path: String,
+    pub existing_path: String,
+    pub occupant_file_id: Option<i64>,
     pub resolution: String,
 }
 
@@ -137,7 +158,8 @@ pub struct Database {
 /// 3 = #34 Jobs 佇列持久化
 /// 4 = #38 SuspectedDuplicates（near-phash 疑似重複）
 /// 5 = #38 DuplicateTombstones + Files.organized_at（durable organized）
-const SCHEMA_USER_VERSION: i32 = 5;
+/// 6 = #40 PathCollisions（模板目的地碰撞）
+const SCHEMA_USER_VERSION: i32 = 6;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
 #[cfg(any(test, feature = "test-support"))]
@@ -374,6 +396,7 @@ impl Database {
             3 => self.migration_3_jobs_table(),
             4 => self.migration_4_suspected_duplicates(),
             5 => self.migration_5_duplicate_tombstones(),
+            6 => self.migration_6_path_collisions(),
             other => {
                 // 用 SqliteFailure 而非 InvalidParameterName
                 // 避免顯示 Invalid parameter name 前綴
@@ -422,6 +445,47 @@ impl Database {
                 if let Err(rb) = self.conn.execute("ROLLBACK", []) {
                     eprintln!(
                         "warn: ROLLBACK failed after SuspectedDuplicates migration error: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// #40 PathCollisions（模板目的地碰撞：加後綴 / 跳過 / 覆蓋）
+    fn migration_6_path_collisions(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS PathCollisions (
+                    file_id INTEGER PRIMARY KEY,
+                    desired_path TEXT NOT NULL,
+                    existing_path TEXT NOT NULL,
+                    occupant_file_id INTEGER,
+                    resolution TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (resolution IN ('pending', 'suffix', 'skip', 'overwrite')),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(file_id) REFERENCES Files(id),
+                    FOREIGN KEY(occupant_file_id) REFERENCES Files(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_path_collisions_resolution
+                    ON PathCollisions(resolution);
+                CREATE INDEX IF NOT EXISTS idx_path_collisions_desired
+                    ON PathCollisions(desired_path);
+                ",
+            )?;
+            self.set_user_version(6)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after PathCollisions migration error: {rb}"
                     );
                 }
                 Err(e)
@@ -1497,6 +1561,148 @@ impl Database {
         })
     }
 
+    /// Upsert pending path collision; refreshes paths while still pending.
+    pub fn upsert_path_collision(
+        &self,
+        file_id: i64,
+        desired_path: &str,
+        existing_path: &str,
+        occupant_file_id: Option<i64>,
+    ) -> SqliteResult<()> {
+        // Always re-open as pending: skip/suffix/overwrite may collide again later
+        self.conn.execute(
+            "INSERT INTO PathCollisions
+                (file_id, desired_path, existing_path, occupant_file_id, resolution)
+             VALUES (?1, ?2, ?3, ?4, 'pending')
+             ON CONFLICT(file_id) DO UPDATE SET
+               desired_path = excluded.desired_path,
+               existing_path = excluded.existing_path,
+               occupant_file_id = excluded.occupant_file_id,
+               resolution = 'pending'",
+            params![file_id, desired_path, existing_path, occupant_file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically record a template destination collision and set status.
+    pub fn mark_path_collision_atomic(
+        &self,
+        file_id: i64,
+        desired_path: &str,
+        existing_path: &str,
+        occupant_file_id: Option<i64>,
+    ) -> SqliteResult<()> {
+        let current = self.get_file_by_id(file_id)?.status;
+        if current == file_status::missing || current == file_status::suspected_duplicate {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "refusing path collision mark for status={current}"
+            )));
+        }
+
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.upsert_path_collision(
+                file_id,
+                desired_path,
+                existing_path,
+                occupant_file_id,
+            )?;
+            let resolution: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT resolution FROM PathCollisions WHERE file_id = ?1",
+                    params![file_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if resolution.as_deref() != Some("pending") {
+                self.conn.execute("COMMIT", [])?;
+                return Ok(());
+            }
+            let status: String = self.conn.query_row(
+                "SELECT status FROM Files WHERE id = ?1",
+                params![file_id],
+                |row| row.get(0),
+            )?;
+            if status != file_status::path_collision {
+                if !file_status::can_transition(&status, file_status::path_collision) {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "illegal status transition: {status} -> path_collision"
+                    )));
+                }
+                self.conn.execute(
+                    "UPDATE Files SET status = ?1 WHERE id = ?2",
+                    params![file_status::path_collision, file_id],
+                )?;
+            }
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after mark_path_collision: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub fn get_pending_path_collision(
+        &self,
+        file_id: i64,
+    ) -> SqliteResult<Option<PathCollisionRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, desired_path, existing_path, occupant_file_id, resolution
+             FROM PathCollisions
+             WHERE file_id = ?1 AND resolution = 'pending'",
+        )?;
+        let mut rows = stmt.query(params![file_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(PathCollisionRow {
+                file_id: row.get(0)?,
+                desired_path: row.get(1)?,
+                existing_path: row.get(2)?,
+                occupant_file_id: row.get(3)?,
+                resolution: row.get(4)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Mark path collision resolved and restore ready when appropriate.
+    pub fn resolve_path_collision(
+        &self,
+        file_id: i64,
+        resolution: &str,
+    ) -> SqliteResult<PathCollisionRow> {
+        if resolution != "suffix" && resolution != "skip" && resolution != "overwrite" {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid path-collision resolution: {resolution}"
+            )));
+        }
+        let pending = self
+            .get_pending_path_collision(file_id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+
+        self.conn.execute(
+            "UPDATE PathCollisions SET resolution = ?1 WHERE file_id = ?2",
+            params![resolution, file_id],
+        )?;
+
+        let status = self.get_file_by_id(file_id)?.status;
+        if status == file_status::path_collision {
+            self.update_file_status(file_id, file_status::ready)?;
+        }
+
+        Ok(PathCollisionRow {
+            resolution: resolution.to_string(),
+            ..pending
+        })
+    }
+
     /// Permanent tombstone so confirmed duplicates are not re-ingested after PathSuppress TTL.
     /// Stores `size` so a later different file at the same path is not silently blocked.
     pub fn insert_duplicate_tombstone(
@@ -1966,8 +2172,9 @@ impl Database {
         // 列表時輕量核對磁碟路徑 缺檔 → missing 復現 → ready
         self.reconcile_missing_files()?;
 
-        // One query for all pending suspicions (avoids N+1 on SuspectedDuplicates)
+        // One query for all pending suspicions / collisions (avoids N+1)
         let suspected_map = self.load_pending_suspected_map()?;
+        let collision_map = self.load_pending_path_collision_map()?;
 
         let mut stmt = self.conn.prepare(
             "SELECT id, path, size, created_at, phash, status FROM Files ORDER BY created_at DESC",
@@ -1990,11 +2197,13 @@ impl Database {
             let metadata = self.get_metadata(file.id)?;
             let tags = self.get_file_tags(file.id)?;
             let suspected_duplicate = suspected_map.get(&file.id).cloned();
+            let path_collision = collision_map.get(&file.id).cloned();
             result.push(FileWithMetadata {
                 file,
                 metadata,
                 tags,
                 suspected_duplicate,
+                path_collision,
             });
         }
         Ok(result)
@@ -2016,6 +2225,32 @@ impl Database {
                     keeper_id: row.get(1)?,
                     distance: row.get::<_, i64>(2)? as u32,
                     keeper_path: row.get(3)?,
+                },
+            ))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (file_id, info) = row?;
+            map.insert(file_id, info);
+        }
+        Ok(map)
+    }
+
+    fn load_pending_path_collision_map(
+        &self,
+    ) -> SqliteResult<std::collections::HashMap<i64, PathCollisionInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, desired_path, existing_path, occupant_file_id
+             FROM PathCollisions
+             WHERE resolution = 'pending'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                PathCollisionInfo {
+                    desired_path: row.get(1)?,
+                    existing_path: row.get(2)?,
+                    occupant_file_id: row.get(3)?,
                 },
             ))
         })?;
@@ -2244,13 +2479,19 @@ impl Database {
         Ok(n)
     }
 
-    /// File ids eligible for one-click / batch organize (not missing / suspected)
+    /// File ids eligible for one-click / batch organize (not missing / suspected / collision)
     pub fn list_organizable_file_ids(&self) -> SqliteResult<Vec<i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM Files WHERE status != ?1 AND status != ?2 ORDER BY id ASC",
+            "SELECT id FROM Files
+             WHERE status != ?1 AND status != ?2 AND status != ?3
+             ORDER BY id ASC",
         )?;
         let rows = stmt.query_map(
-            params![file_status::missing, file_status::suspected_duplicate],
+            params![
+                file_status::missing,
+                file_status::suspected_duplicate,
+                file_status::path_collision
+            ],
             |row| row.get(0),
         )?;
         let mut out = Vec::new();
@@ -4123,6 +4364,7 @@ mod tests {
             metadata: None,
             tags: Vec::new(),
             suspected_duplicate: None,
+            path_collision: None,
         };
         let value = serde_json::to_value(&payload).expect("serialize");
         assert!(value.get("file").is_some(), "expected nested file object");
@@ -4475,7 +4717,7 @@ mod tests {
         }
 
         let db = Database::new(path.to_str().expect("utf8")).expect("open repair");
-        assert_eq!(db.get_user_version().expect("uv"), 5);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         assert!(
             files_has_column(&db, "organized_at"),
             "ensure_v5_columns must ADD organized_at on already-v5 DBs"
@@ -4797,7 +5039,7 @@ mod tests {
     fn fresh_db_creates_jobs_and_suspected_tables_at_current_version() {
         let db = open_memory_db();
         assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
-        assert_eq!(SCHEMA_USER_VERSION, 5);
+        assert_eq!(SCHEMA_USER_VERSION, 6);
         assert!(db.jobs_table_exists().expect("Jobs exists"));
         assert!(db
             .suspected_duplicates_table_exists()
@@ -5032,7 +5274,7 @@ mod tests {
             assert!(cols.iter().any(|c| c == "keeper_phash"));
         }
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 5);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         let mut stmt = db
             .conn
             .prepare("PRAGMA table_info(DuplicateTombstones)")
@@ -5068,7 +5310,7 @@ mod tests {
             assert_eq!(n, 0, "v4 fixture must lack DuplicateTombstones");
         }
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 5);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         assert!(
             db.conn
                 .query_row(
@@ -5078,6 +5320,17 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .expect("tombstones")
+                > 0
+        );
+        assert!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'PathCollisions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("path collisions")
                 > 0
         );
         db.insert_duplicate_tombstone("/tmp/tomb.mp4", 42, Some("aabb"), Some(1))

@@ -4,7 +4,8 @@ export type FileStatus =
   | "ready"
   | "scrape_failed"
   | "missing"
-  | "suspected_duplicate";
+  | "suspected_duplicate"
+  | "path_collision";
 
 export const file_status = {
   processing: "processing",
@@ -12,6 +13,7 @@ export const file_status = {
   scrape_failed: "scrape_failed",
   missing: "missing",
   suspected_duplicate: "suspected_duplicate",
+  path_collision: "path_collision",
 } as const;
 
 const status_labels: Record<string, string> = {
@@ -20,6 +22,7 @@ const status_labels: Record<string, string> = {
   scrape_failed: "刮削失敗",
   missing: "檔案缺失",
   suspected_duplicate: "疑似重複",
+  path_collision: "路徑碰撞",
 };
 
 const status_class_names: Record<string, string> = {
@@ -28,6 +31,7 @@ const status_class_names: Record<string, string> = {
   scrape_failed: "bg-red-100 text-red-800",
   missing: "bg-gray-200 text-gray-700",
   suspected_duplicate: "bg-orange-100 text-orange-900",
+  path_collision: "bg-yellow-100 text-yellow-900",
 };
 
 export function status_label(status: string): string {

@@ -17,15 +17,22 @@ interface VideoCardProps {
     fileId: number,
     action: "confirm" | "ignore"
   ) => Promise<void>;
+  onResolvePathCollision?: (
+    fileId: number,
+    action: "suffix" | "skip" | "overwrite",
+    desiredPath: string
+  ) => Promise<void>;
   resolveBusy?: boolean;
 }
 
 export default function VideoCard({
   fileWithMetadata,
   onResolveSuspected,
+  onResolvePathCollision,
   resolveBusy = false,
 }: VideoCardProps) {
-  const { file, metadata, tags, suspectedDuplicate } = fileWithMetadata;
+  const { file, metadata, tags, suspectedDuplicate, pathCollision } =
+    fileWithMetadata;
   const media_ref = useRef<HTMLDivElement>(null);
   const [is_hovering, set_is_hovering] = useState(false);
   const [cover_url, set_cover_url] = useState<string | null>(null);
@@ -256,6 +263,72 @@ export default function VideoCard({
                   className="px-2 py-1 text-xs bg-gray-100 text-gray-800 rounded hover:bg-gray-200 disabled:opacity-50"
                 >
                   忽略
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+        {file.status === "path_collision" && pathCollision && (
+          <div className="mt-3 pt-3 border-t border-yellow-100">
+            <p className="text-xs text-yellow-900 mb-2">
+              目的地已存在
+              {pathCollision.occupantFileId != null
+                ? `（媒體庫 #${pathCollision.occupantFileId}）`
+                : ""}
+              ：
+              <span
+                className="block truncate"
+                title={pathCollision.desiredPath}
+              >
+                {pathCollision.desiredPath.split(/[/\\]/).pop()}
+              </span>
+            </p>
+            {onResolvePathCollision && (
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={resolveBusy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void onResolvePathCollision(
+                      file.id,
+                      "suffix",
+                      pathCollision.desiredPath
+                    );
+                  }}
+                  className="px-2 py-1 text-xs bg-yellow-600 text-white rounded hover:bg-yellow-700 disabled:opacity-50"
+                >
+                  加後綴
+                </button>
+                <button
+                  type="button"
+                  disabled={resolveBusy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void onResolvePathCollision(
+                      file.id,
+                      "skip",
+                      pathCollision.desiredPath
+                    );
+                  }}
+                  className="px-2 py-1 text-xs bg-gray-100 text-gray-800 rounded hover:bg-gray-200 disabled:opacity-50"
+                >
+                  跳過
+                </button>
+                <button
+                  type="button"
+                  disabled={resolveBusy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void onResolvePathCollision(
+                      file.id,
+                      "overwrite",
+                      pathCollision.desiredPath
+                    );
+                  }}
+                  className="px-2 py-1 text-xs bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50"
+                >
+                  覆蓋
                 </button>
               </div>
             )}
