@@ -211,11 +211,11 @@ impl Database {
 
     /// Normalize existing Files / PathCollisions / DuplicateTombstones path strings.
     ///
-    /// Cheap SQL probe then definitive `normalize_db_path(path) != path` — no write
-    /// lock when clean (important for large libraries). All three tables update in
-    /// one `BEGIN IMMEDIATE`. If normalizing a Files or tombstone path would violate
-    /// UNIQUE leave the row unchanged and write an ErrorLog entry (no auto-merge);
-    /// skip if the same category+path is already logged.
+    /// `needs_path_separator_repair` confirms with `normalize_db_path` via plain reads
+    /// before any write lock (important for large libraries). All three tables update
+    /// in one `BEGIN IMMEDIATE`. If normalizing a Files or tombstone path would
+    /// violate UNIQUE leave the row unchanged and write an ErrorLog entry (no
+    /// auto-merge); skip if the same category+path is already logged.
     fn repair_mixed_separator_paths(&self) -> SqliteResult<()> {
         if !self.needs_path_separator_repair()? {
             return Ok(());
@@ -241,75 +241,117 @@ impl Database {
 
     /// True when any stored path differs from `normalize_db_path`.
     ///
-    /// Fast SQL probe first: if obvious dirty shapes exist (trailing seps / Windows
-    /// `\\?\` / mixed `/`), return true without scanning every row — helps large
-    /// dirty libraries. If the cheap probe is clean, fall back to definitive
-    /// `normalize != path` (covers macOS NFC and subtle Windows drive-letter cases).
-    /// Read-only — no write lock.
+    /// Cheap SQL lists *candidates* only; each hit is confirmed with
+    /// `normalize_db_path(p) != p` as a plain read. Never returns true (and thus
+    /// never leads to `BEGIN IMMEDIATE`) on an unconfirmed SQL hit. If no candidate
+    /// confirms dirty, falls back to a full definitive scan (macOS NFC, subtle
+    /// Windows drive-letter cases, etc.). Read-only — no write lock.
     fn needs_path_separator_repair(&self) -> SqliteResult<bool> {
-        if self.cheap_path_repair_probe()? {
+        if self.any_confirmed_cheap_candidate()? {
             return Ok(true);
         }
         self.any_path_table_needs_normalize()
     }
 
-    /// SQL shapes that almost always need repair. True → known dirty; False → still
-    /// verify with normalize (cannot prove clean alone — e.g. macOS NFC).
-    /// Uses `char(92)` for `\` to avoid Rust/SQL string escaping pitfalls.
-    fn cheap_path_repair_probe(&self) -> SqliteResult<bool> {
-        // Trailing separator (not a lone root `/`)
-        if self.select_exists(
-            "SELECT EXISTS(
-                SELECT 1 FROM Files
-                WHERE (substr(path, -1) = '/' AND path != '/')
-                   OR substr(path, -1) = char(92)
-            )",
-        )? {
+    /// Confirm cheap-probe candidate rows with `normalize_db_path` (plain reads).
+    fn any_confirmed_cheap_candidate(&self) -> SqliteResult<bool> {
+        if self.path_rows_need_normalize(&self.cheap_files_candidate_sql())? {
             return Ok(true);
         }
-        #[cfg(windows)]
-        {
-            if self.select_exists(
-                "SELECT EXISTS(
-                    SELECT 1 FROM Files
-                    WHERE instr(path, '/') > 0
-                       OR path LIKE char(92) || char(92) || '?%'
-                       OR path LIKE char(92) || char(92) || '.%'
-                       OR (
-                            length(path) >= 2
-                            AND substr(path, 2, 1) = ':'
-                            AND substr(path, 1, 1) GLOB '[a-z]'
-                       )
-                )",
-            )? {
-                return Ok(true);
-            }
-        }
         if self.table_exists("PathCollisions")?
-            && self.select_exists(
-                "SELECT EXISTS(
-                    SELECT 1 FROM PathCollisions
-                    WHERE (substr(desired_path, -1) = '/' AND desired_path != '/')
-                       OR substr(desired_path, -1) = char(92)
-                       OR (substr(existing_path, -1) = '/' AND existing_path != '/')
-                       OR substr(existing_path, -1) = char(92)
-                )",
-            )?
+            && self.path_rows_need_normalize(&self.cheap_path_collisions_candidate_sql())?
         {
             return Ok(true);
         }
         if self.table_exists("DuplicateTombstones")?
-            && self.select_exists(
-                "SELECT EXISTS(
-                    SELECT 1 FROM DuplicateTombstones
-                    WHERE (substr(path, -1) = '/' AND path != '/')
-                       OR substr(path, -1) = char(92)
-                )",
-            )?
+            && self.path_rows_need_normalize(&self.cheap_tombstones_candidate_sql())?
         {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    /// SQL predicate for paths that *might* need repair (candidates only).
+    ///
+    /// Tightened (#63 S-1): exclude roots (`/`, `X:\`, volume root); trailing `\`
+    /// only on Windows; never treat `\\?\Volume{…}` or `\\.\PhysicalDrive…` as
+    /// dirty just for their prefix. Uses `char(92)` for `\`.
+    fn cheap_path_candidate_predicate(column: &str) -> String {
+        // Trailing `/` except lone root `/`
+        #[cfg(not(windows))]
+        {
+            format!("(substr({column}, -1) = '/' AND {column} != '/')")
+        }
+        #[cfg(windows)]
+        {
+            let mut pred = format!("(substr({column}, -1) = '/' AND {column} != '/')");
+            // `\\?\Volume` prefix (10 chars) — kept by normalize, not a dirty signal
+            let volume_prefix = format!(
+                "lower(substr({column}, 1, 10)) = lower(char(92) || char(92) || '?' || char(92) || 'Volume')"
+            );
+            // Volume root `\\?\Volume{…}\` — `}` followed only by trailing `\`
+            let volume_root = format!(
+                "({volume_prefix}
+                  AND instr({column}, '}}') > 0
+                  AND substr({column}, instr({column}, '}}')) = '}}' || char(92))"
+            );
+            // Drive root `X:\`
+            let drive_root = format!(
+                "(length({column}) = 3 AND substr({column}, 2, 1) = ':')"
+            );
+            // Trailing `\` except drive / volume roots
+            pred.push_str(&format!(
+                " OR (
+                    substr({column}, -1) = char(92)
+                    AND NOT {drive_root}
+                    AND NOT {volume_root}
+                )"
+            ));
+            // Mixed `/`; non-Volume `\\?\`; drive-form `\\.\X:`; lowercase drive
+            pred.push_str(&format!(
+                " OR instr({column}, '/') > 0
+                  OR (
+                        {column} LIKE char(92) || char(92) || '?%'
+                        AND NOT ({volume_prefix})
+                     )
+                  OR (
+                        {column} LIKE char(92) || char(92) || '.%'
+                        AND length({column}) >= 6
+                        AND substr({column}, 5, 1) GLOB '[A-Za-z]'
+                        AND substr({column}, 6, 1) = ':'
+                     )
+                  OR (
+                        length({column}) >= 2
+                        AND substr({column}, 2, 1) = ':'
+                        AND substr({column}, 1, 1) GLOB '[a-z]'
+                     )"
+            ));
+            pred
+        }
+    }
+
+    fn cheap_files_candidate_sql(&self) -> String {
+        format!(
+            "SELECT path FROM Files WHERE {}",
+            Self::cheap_path_candidate_predicate("path")
+        )
+    }
+
+    fn cheap_path_collisions_candidate_sql(&self) -> String {
+        let d = Self::cheap_path_candidate_predicate("desired_path");
+        let e = Self::cheap_path_candidate_predicate("existing_path");
+        format!(
+            "SELECT desired_path FROM PathCollisions WHERE {d}
+             UNION ALL
+             SELECT existing_path FROM PathCollisions WHERE {e}"
+        )
+    }
+
+    fn cheap_tombstones_candidate_sql(&self) -> String {
+        format!(
+            "SELECT path FROM DuplicateTombstones WHERE {}",
+            Self::cheap_path_candidate_predicate("path")
+        )
     }
 
     fn any_path_table_needs_normalize(&self) -> SqliteResult<bool> {
@@ -6550,6 +6592,72 @@ mod tests {
         );
         assert!(db.list_error_logs(5).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #63 S-1: clean Windows Volume path must not trip needs_path_separator_repair
+    #[cfg(windows)]
+    #[test]
+    fn needs_repair_false_for_windows_volume_path() {
+        let db = open_memory_db();
+        let volume = r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\lib\x.mp4";
+        assert_eq!(
+            normalize_db_path(volume),
+            volume,
+            "precondition: Volume path already normalized"
+        );
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
+                params![volume],
+            )
+            .unwrap();
+        assert!(
+            !db.needs_path_separator_repair().unwrap(),
+            "Volume path must not request repair"
+        );
+    }
+
+    /// #63 S-1: Windows drive root `C:\` must not trip needs_path_separator_repair
+    #[cfg(windows)]
+    #[test]
+    fn needs_repair_false_for_windows_drive_root() {
+        let db = open_memory_db();
+        let root = r"C:\";
+        assert_eq!(normalize_db_path(root), root);
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
+                params![root],
+            )
+            .unwrap();
+        assert!(
+            !db.needs_path_separator_repair().unwrap(),
+            "drive root must not request repair"
+        );
+    }
+
+    /// #63 S-1: Linux filename ending in `\` is a real name — not a trailing-sep dirty signal
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn needs_repair_false_for_linux_filename_ending_with_backslash() {
+        let db = open_memory_db();
+        // Unusual but legal on ext4; must not be treated as a Windows trailing sep
+        let path = "/lib/ends-with-backslash\\";
+        assert_eq!(
+            normalize_db_path(path),
+            path,
+            "precondition: Linux keeps trailing backslash codepoint"
+        );
+        db.conn
+            .execute(
+                "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
+                params![path],
+            )
+            .unwrap();
+        assert!(
+            !db.needs_path_separator_repair().unwrap(),
+            "Linux path ending in '\\' must not request repair"
+        );
     }
 }
 
