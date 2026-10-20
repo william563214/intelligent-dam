@@ -5765,5 +5765,76 @@ mod tests {
             .len();
         assert_eq!(left, 2);
     }
+
+    /// #61 proof: native Path::join occupant must match rendered desired path.
+    /// Fails on Windows before render/normalize fix.
+    #[test]
+    fn find_file_occupying_path_matches_native_join_and_rendered() {
+        let dir = std::env::temp_dir().join(format!(
+            "idam_occ_native_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let occupied = dir.join("StudioA").join("clip.mp4");
+        std::fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+        std::fs::write(&occupied, b"x").unwrap();
+
+        let db = open_memory_db();
+        let occupant = db
+            .insert_file(occupied.to_str().unwrap(), 1, None)
+            .expect("occ");
+        let mover = db
+            .insert_file(dir.join("incoming.mp4").to_str().unwrap(), 2, None)
+            .expect("mover");
+
+        let rendered = crate::path_template::render_output_path(
+            "{{studio}}/{{filename}}",
+            &crate::path_template::TemplateContext {
+                studio: "StudioA".to_string(),
+                date: "d".to_string(),
+                title: "t".to_string(),
+                number: "n".to_string(),
+                filename: "clip.mp4".to_string(),
+                ext: "mp4".to_string(),
+                actor: String::new(),
+            },
+            &dir,
+        )
+        .expect("render");
+
+        assert_eq!(rendered, occupied);
+        #[cfg(windows)]
+        {
+            let s = rendered.to_string_lossy();
+            assert!(!s.contains('/'), "rendered must be native: {s}");
+        }
+
+        let found = db
+            .find_file_occupying_path(rendered.to_str().unwrap(), mover)
+            .expect("query")
+            .expect("occupant");
+        assert_eq!(found.id, occupant);
+        assert_eq!(PathBuf::from(&found.path), occupied);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Disabled on this proof branch — repair ships with the fix (cfg(any())).
+    #[cfg(any())]
+    #[test]
+    fn repair_mixed_separators_updates_when_safe() {
+        panic!("disabled on proof branch");
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn repair_mixed_separators_normalizes_and_logs_unique_conflict() {
+        panic!("disabled on proof branch");
+    }
 }
 

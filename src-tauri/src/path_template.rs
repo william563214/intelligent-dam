@@ -1349,4 +1349,42 @@ mod tests {
         .unwrap();
         assert_eq!(dest, PathBuf::from("/library/StudioX/2024_Sam....mp4"));
     }
+
+    /// #61 proof: render must not emit `/` on Windows (fails before PathBuf::push fix).
+    /// `assert_eq!(dest, base.join(..))` alone is insufficient — Path compares per-component.
+    #[cfg(windows)]
+    #[test]
+    fn render_output_path_uses_native_separators_on_windows() {
+        let ctx = TemplateContext {
+            studio: "StudioA".to_string(),
+            date: "2024-06-01".to_string(),
+            title: "Demo".to_string(),
+            number: "ABC-1".to_string(),
+            filename: "ABC-1.mp4".to_string(),
+            ext: "mp4".to_string(),
+            actor: String::new(),
+        };
+        let base = PathBuf::from(r"C:\lib");
+        let dest = render_output_path("{{studio}}/{{date}}_{{title}}.{{ext}}", &ctx, &base)
+            .expect("render");
+        let s = dest.to_string_lossy();
+        assert!(
+            !s.contains('/'),
+            "Windows rendered path must not contain '/': {s}"
+        );
+        assert_eq!(dest, base.join("StudioA").join("2024-06-01_Demo.mp4"));
+    }
+
+    /// Repair tests live with the fix; disabled on this proof branch (cfg(any())).
+    #[cfg(any())]
+    #[test]
+    fn repair_mixed_separators_updates_when_safe() {
+        panic!("disabled on proof branch");
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn repair_mixed_separators_normalizes_and_logs_unique_conflict() {
+        panic!("disabled on proof branch");
+    }
 }

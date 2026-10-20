@@ -1129,6 +1129,94 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #61 / #58 proof: occupant via native Path::join must be found after render.
+    /// Fails on Windows before separator normalize (occupant_file_id is None).
+    #[test]
+    fn step_move_collision_finds_occupant_inserted_with_native_path() {
+        let dir = unique_temp_dir("collide_native_occ");
+        let src = dir.join("incoming.mp4");
+        let occupied = dir.join("StudioA").join("2024-06-01_Demo.mp4");
+        fs::create_dir_all(occupied.parent().unwrap()).unwrap();
+        fs::write(&src, b"new").unwrap();
+        fs::write(&occupied, b"old").unwrap();
+
+        let db = open_db();
+        let occupant_id = db
+            .insert_file(occupied.to_str().unwrap(), 3, None)
+            .expect("occupant");
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 7, None)
+            .expect("mover");
+        assert_ne!(occupant_id, file_id);
+        db.update_metadata(&Metadata {
+            file_id,
+            title: Some("Demo".to_string()),
+            studio: Some("StudioA".to_string()),
+            release_date: Some("2024-06-01".to_string()),
+            summary: None,
+            cover_image: None,
+            sprite_sheet_path: None,
+            source_type: Some("test".to_string()),
+        })
+        .unwrap();
+
+        let settings = AppSettings {
+            output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
+            ..AppSettings::default()
+        };
+
+        #[cfg(windows)]
+        {
+            let rendered = render_output_path(
+                &settings.output_template,
+                &TemplateContext::from_metadata(
+                    &src,
+                    Some("StudioA"),
+                    Some("2024-06-01"),
+                    Some("Demo"),
+                    None,
+                ),
+                src.parent().unwrap(),
+            )
+            .expect("render");
+            let rendered_s = rendered.to_string_lossy();
+            assert!(
+                !rendered_s.contains('/'),
+                "precondition for #61: rendered path has no '/': {rendered_s}"
+            );
+            assert_eq!(rendered, occupied);
+        }
+
+        let arc = Arc::new(Mutex::new(db));
+        let outcome = step_move(&arc, file_id, &settings, None).expect("collision ok");
+        match outcome {
+            MoveStepOutcome::CollisionPending { desired } => {
+                assert_eq!(desired, occupied);
+            }
+            other => panic!("expected CollisionPending got {other:?}"),
+        }
+
+        let guard = arc.lock().unwrap();
+        let pending = guard
+            .get_pending_path_collision(file_id)
+            .unwrap()
+            .expect("pending collision");
+        assert_eq!(
+            pending.occupant_file_id,
+            Some(occupant_id),
+            "occupant inserted via native Path::join must be found (#58/#61)"
+        );
+        assert_eq!(
+            guard
+                .find_file_occupying_path(occupied.to_str().unwrap(), file_id)
+                .unwrap()
+                .map(|f| f.id),
+            Some(occupant_id)
+        );
+        drop(guard);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn step_move_leaves_db_unchanged_when_source_missing() {
         let db = open_db();
