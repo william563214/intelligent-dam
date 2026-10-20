@@ -1,4 +1,4 @@
-# CI: cargo test/clippy + frontend typecheck/vitest on Linux and Windows
+# CI: cargo test/clippy + frontend typecheck/vitest on Linux, Windows, and macOS
 # Does not create tags or releases
 name: CI
 
@@ -101,6 +101,7 @@ jobs:
   test-macos:
     name: test (macos-latest)
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

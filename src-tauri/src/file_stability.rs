@@ -16,9 +16,11 @@
 //!      missed ingest). Zero disables degrade.
 //!
 //! # Platform / filesystem notes
-//! - **Unix**: advisory `flock` (or equivalent). Downloaders that hold an
-//!   exclusive lock delay ingest until they release it. Size+mtime still
-//!   catches writers that never lock.
+//! - **Unix / macOS**: advisory `flock` (or equivalent). Downloaders that hold
+//!   an exclusive lock delay ingest until they release it. Size+mtime still
+//!   catches writers that never lock. There is no Windows-style share-mode
+//!   fallback: a writer that stalls longer than the stability window without
+//!   holding a lock is treated as complete (follow-up issue material).
 //! - **Windows**: many copy tools do not take an advisory lock; size+mtime
 //!   plus the FILE_SHARE_READ open probe are the primary signals.
 //! - **mtime granularity**: FAT and some SMB mounts update mtime in 2s (or
@@ -450,7 +452,7 @@ fn try_windows_share_read(path: &Path) -> LockProbe {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -493,10 +495,13 @@ mod tests {
             let mut file = File::create(&path_for_writer).unwrap();
             for chunk in 0..8u8 {
                 file.write_all(&[chunk; 64]).unwrap();
-                // sync_all so size is visible to pollers (macOS CI was racing on flush)
+                // Persist before sleep so a crash mid-test does not leave a
+                // partial buffer; size is already visible via metadata() after write
                 file.sync_all().unwrap();
                 // Grow faster than the stable window (4 * 40ms) so mid-write
-                // samples cannot look stable under scheduler jitter
+                // samples cannot look stable under scheduler jitter.
+                // macOS has no share-mode lock fallback: a stall longer than that
+                // window (without holding flock) is treated as complete.
                 thread::sleep(Duration::from_millis(15));
             }
             *done_flag.lock().unwrap() = true;
@@ -531,9 +536,23 @@ mod tests {
 
         let bumper = thread::spawn(move || {
             // Keep size fixed but bump mtime so the gate must not declare stable.
-            // Rewrite same bytes (more reliable than set_modified on macOS APFS).
+            // Open write-only (no truncate): rewrite the same payload at offset 0.
+            // Do not use fs::write — it truncates to 0 first so the poll can see a
+            // size change and the test would pass for the wrong reason.
             while !*stop_flag.lock().unwrap() {
-                fs::write(&path_for_bumper, payload).unwrap();
+                let mut file = File::options()
+                    .write(true)
+                    .open(&path_for_bumper)
+                    .expect("open for mtime bump");
+                file.seek(SeekFrom::Start(0)).expect("seek start");
+                file.write_all(payload).expect("rewrite payload");
+                file.sync_all().expect("sync after rewrite");
+                drop(file);
+                assert_eq!(
+                    fs::metadata(&path_for_bumper).unwrap().len(),
+                    payload.len() as u64,
+                    "bumper must not change size"
+                );
                 thread::sleep(Duration::from_millis(20));
             }
         });
