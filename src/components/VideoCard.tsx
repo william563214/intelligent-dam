@@ -13,10 +13,19 @@ import {
 
 interface VideoCardProps {
   fileWithMetadata: FileWithMetadata;
+  onResolveSuspected?: (
+    fileId: number,
+    action: "confirm" | "ignore"
+  ) => Promise<void>;
+  resolveBusy?: boolean;
 }
 
-export default function VideoCard({ fileWithMetadata }: VideoCardProps) {
-  const { file, metadata, tags } = fileWithMetadata;
+export default function VideoCard({
+  fileWithMetadata,
+  onResolveSuspected,
+  resolveBusy = false,
+}: VideoCardProps) {
+  const { file, metadata, tags, suspectedDuplicate } = fileWithMetadata;
   const media_ref = useRef<HTMLDivElement>(null);
   const [is_hovering, set_is_hovering] = useState(false);
   const [cover_url, set_cover_url] = useState<string | null>(null);
@@ -213,6 +222,45 @@ export default function VideoCard({ fileWithMetadata }: VideoCardProps) {
           </div>
         )}
         <p className="text-xs text-gray-500">{format_file_size(file.size)}</p>
+        {file.status === "suspected_duplicate" && suspectedDuplicate && (
+          <div className="mt-3 pt-3 border-t border-orange-100">
+            <p className="text-xs text-orange-900 mb-2">
+              {suspectedDuplicate.distance === 0
+                ? `與 #${suspectedDuplicate.keeperId} 完全相同（exact 降級為疑似）`
+                : `疑似重複（Hamming ${suspectedDuplicate.distance}）`}
+              {" "}相對：
+              <span className="block truncate" title={suspectedDuplicate.keeperPath}>
+                {suspectedDuplicate.keeperPath.split(/[/\\]/).pop()}
+              </span>
+            </p>
+            {onResolveSuspected && (
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  disabled={resolveBusy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void onResolveSuspected(file.id, "confirm");
+                  }}
+                  className="px-2 py-1 text-xs bg-orange-600 text-white rounded hover:bg-orange-700 disabled:opacity-50"
+                >
+                  確認重複
+                </button>
+                <button
+                  type="button"
+                  disabled={resolveBusy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void onResolveSuspected(file.id, "ignore");
+                  }}
+                  className="px-2 py-1 text-xs bg-gray-100 text-gray-800 rounded hover:bg-gray-200 disabled:opacity-50"
+                >
+                  忽略
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

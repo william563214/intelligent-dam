@@ -1348,6 +1348,29 @@ fn execute_job(
 
     match &job.kind {
         JobKind::Pipeline { file_id, options } => {
+            // Soft-skip before requiring AppHandle: exact-dedup may have deleted the
+            // row, or near-phash flagged suspected_duplicate, while this job was queued.
+            // Must be Success (not Failed+retry) so the queue does not thrash.
+            if let Ok(guard) = db.lock() {
+                match guard.get_file_by_id(*file_id) {
+                    Err(_) => {
+                        eprintln!(
+                            "task_queue: soft-skip pipeline file_id {} (row gone; exact dedup)",
+                            file_id
+                        );
+                        return ExecOutcome::Success;
+                    }
+                    Ok(file) if crate::file_status::blocks_auto_pipeline(&file.status) => {
+                        eprintln!(
+                            "task_queue: soft-skip pipeline file_id {} status={}",
+                            file_id, file.status
+                        );
+                        return ExecOutcome::Success;
+                    }
+                    Ok(_) => {}
+                }
+            }
+
             // Re-soften from DB on every run (including retry) so scrape_failed /
             // already-moved / already-previewed rows do not re-run the full chain
             let effective = {
@@ -1426,15 +1449,38 @@ fn execute_job(
                 path: path.clone(),
             };
             let results = scanner::compute_phash_jobs(vec![phash_job]);
+            let max_distance = match app {
+                Some(handle) => crate::pipeline::load_settings(handle)
+                    .effective_near_phash_max_distance(),
+                None => crate::phash::resolve_near_phash_max_distance(None),
+            };
             match db.lock() {
-                Ok(guard) => match scanner::write_phashes(&guard, &results, Some(suppressions)) {
+                Ok(guard) => match scanner::write_phashes(
+                    &guard,
+                    &results,
+                    Some(suppressions),
+                    max_distance,
+                ) {
                     Ok(outcomes) => {
                         let skipped = outcomes.iter().any(|(_, o)| {
-                            matches!(o, scanner::PhashApplyOutcome::SkippedDuplicate { .. })
+                            matches!(
+                                o,
+                                scanner::PhashApplyOutcome::SkippedDuplicate { .. }
+                                    | scanner::PhashApplyOutcome::Tombstoned { .. }
+                            )
                         });
                         if skipped {
                             eprintln!(
-                                "task_queue: phash job for file {} skipped as near-duplicate (path suppressed)",
+                                "task_queue: phash job for file {} skipped as exact-duplicate/tombstone (path suppressed)",
+                                file_id
+                            );
+                        }
+                        let suspected = outcomes.iter().any(|(_, o)| {
+                            matches!(o, scanner::PhashApplyOutcome::SuspectedDuplicate { .. })
+                        });
+                        if suspected {
+                            eprintln!(
+                                "task_queue: phash job for file {} marked suspected_duplicate (no auto-handle)",
                                 file_id
                             );
                         }

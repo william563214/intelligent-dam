@@ -3,13 +3,15 @@ export type FileStatus =
   | "processing"
   | "ready"
   | "scrape_failed"
-  | "missing";
+  | "missing"
+  | "suspected_duplicate";
 
 export const file_status = {
   processing: "processing",
   ready: "ready",
   scrape_failed: "scrape_failed",
   missing: "missing",
+  suspected_duplicate: "suspected_duplicate",
 } as const;
 
 const status_labels: Record<string, string> = {
@@ -17,6 +19,7 @@ const status_labels: Record<string, string> = {
   ready: "就緒",
   scrape_failed: "刮削失敗",
   missing: "檔案缺失",
+  suspected_duplicate: "疑似重複",
 };
 
 const status_class_names: Record<string, string> = {
@@ -24,6 +27,7 @@ const status_class_names: Record<string, string> = {
   ready: "bg-emerald-100 text-emerald-800",
   scrape_failed: "bg-red-100 text-red-800",
   missing: "bg-gray-200 text-gray-700",
+  suspected_duplicate: "bg-orange-100 text-orange-900",
 };
 
 export function status_label(status: string): string {

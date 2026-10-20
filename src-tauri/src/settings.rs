@@ -23,6 +23,15 @@ fn default_output_template() -> String {
     "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string()
 }
 
+fn default_near_phash_max_distance_setting() -> u32 {
+    crate::phash::default_near_phash_max_distance
+}
+
+/// Clamp persisted near-phash threshold to a sane Hamming range.
+pub fn clamp_near_phash_max_distance(value: u32) -> u32 {
+    crate::phash::clamp_near_phash_max_distance(value)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -34,6 +43,10 @@ pub struct AppSettings {
     pub stashdb_url: String,
     #[serde(default = "default_output_template")]
     pub output_template: String,
+    /// Max Hamming distance for near-phash suspected matches (default 4).
+    /// Env `IDAM_NEAR_PHASH_MAX_DISTANCE` overrides at resolve time.
+    #[serde(default = "default_near_phash_max_distance_setting")]
+    pub near_phash_max_distance: u32,
 }
 
 impl Default for AppSettings {
@@ -43,7 +56,21 @@ impl Default for AppSettings {
             avdc_path: String::new(),
             stashdb_url: default_stashdb_url(),
             output_template: default_output_template(),
+            near_phash_max_distance: default_near_phash_max_distance_setting(),
         }
+    }
+}
+
+impl AppSettings {
+    /// Effective near-phash threshold (env wins over this setting).
+    pub fn effective_near_phash_max_distance(&self) -> u32 {
+        crate::phash::resolve_near_phash_max_distance(Some(self.near_phash_max_distance))
+    }
+
+    /// Normalize fields before persist.
+    pub fn normalize_for_save(&mut self) {
+        self.near_phash_max_distance =
+            clamp_near_phash_max_distance(self.near_phash_max_distance);
     }
 }
 
@@ -122,8 +149,11 @@ impl SettingsStore {
             })?;
         }
 
+        let mut normalized = settings.clone();
+        normalized.normalize_for_save();
+
         let content =
-            serde_json::to_string_pretty(settings).context("Failed to serialize settings")?;
+            serde_json::to_string_pretty(&normalized).context("Failed to serialize settings")?;
         let temp_path = self.temp_path();
 
         if let Err(write_err) = fs::write(&temp_path, &content) {
@@ -193,9 +223,11 @@ mod tests {
         settings.avdc_path = "/opt/avdc.py".to_string();
         settings.stashdb_url = "https://example.test".to_string();
         settings.output_template = "{{title}}.mp4".to_string();
+        settings.near_phash_max_distance = 3;
         store.save(&settings).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded, settings);
+        assert_eq!(loaded.near_phash_max_distance, 3);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -249,6 +281,35 @@ mod tests {
         let store = SettingsStore::new(&dir);
         fs::write(dir.join(settings_filename), "[]").unwrap();
         assert!(store.load().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_legacy_json_without_near_phash_uses_default() {
+        let dir = unique_temp_dir("legacy_phash");
+        let store = SettingsStore::new(&dir);
+        fs::write(
+            dir.join(settings_filename),
+            r#"{"scanDirectories":[],"avdcPath":"","stashdbUrl":"https://stashdb.org","outputTemplate":"{{ext}}"}"#,
+        )
+        .unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.near_phash_max_distance,
+            crate::phash::default_near_phash_max_distance
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_clamps_near_phash_max_distance() {
+        let dir = unique_temp_dir("clamp_phash");
+        let store = SettingsStore::new(&dir);
+        let mut settings = AppSettings::default();
+        settings.near_phash_max_distance = 99;
+        store.save(&settings).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.near_phash_max_distance, 32);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -5,6 +5,10 @@ import {
   organizeEligibleFiles,
 } from "../api";
 import type { FileWithMetadata } from "../types";
+import {
+  handle_resolve_suspected,
+  resolve_success_message,
+} from "../utils/resolveSuspectedDuplicate";
 import VideoCard from "./VideoCard";
 
 export default function FileBrowser() {
@@ -14,6 +18,7 @@ export default function FileBrowser() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchMessage, setBatchMessage] = useState<string | null>(null);
+  const [resolveBusyId, setResolveBusyId] = useState<number | null>(null);
 
   useEffect(() => {
     loadFiles();
@@ -83,6 +88,29 @@ export default function FileBrowser() {
     } finally {
       setBatchBusy(false);
     }
+  };
+
+  const handleResolveSuspected = async (
+    fileId: number,
+    action: "confirm" | "ignore"
+  ) => {
+    setResolveBusyId(fileId);
+    setBatchMessage(null);
+    const result = await handle_resolve_suspected(fileId, action);
+    if (!result.ok) {
+      if (result.error !== "已取消確認") {
+        setBatchMessage(`疑似重複處理失敗: ${result.error}`);
+      }
+      setResolveBusyId(null);
+      return;
+    }
+    await loadFiles();
+    const enqueued =
+      result.outcome.kind === "ignored"
+        ? result.outcome.pipelineEnqueued
+        : false;
+    setBatchMessage(resolve_success_message(action, fileId, enqueued));
+    setResolveBusyId(null);
   };
 
   const handleOneClickOrganize = async () => {
@@ -232,7 +260,11 @@ export default function FileBrowser() {
                   />
                   選取
                 </label>
-                <VideoCard fileWithMetadata={item} />
+                <VideoCard
+                  fileWithMetadata={item}
+                  onResolveSuspected={handleResolveSuspected}
+                  resolveBusy={resolveBusyId === item.file.id}
+                />
               </div>
             );
           })}
