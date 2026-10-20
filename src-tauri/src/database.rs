@@ -3010,7 +3010,11 @@ mod tests {
     }
 
     fn ensure_temp_tests_dir() -> PathBuf {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.temp/tests");
+        // Join components so Windows does not keep literal `/` in the path string
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join(".temp")
+            .join("tests");
         std::fs::create_dir_all(&dir).expect("mkdir .temp/tests");
         dir
     }
@@ -5398,7 +5402,8 @@ mod tests {
             .suspected_duplicates_table_exists()
             .expect("SuspectedDuplicates"));
         let file = db.get_file_by_id(1).expect("preserve file");
-        assert_eq!(file.path, "/tmp/v2-upgrade.mp4");
+        // Open-time repair normalizes separators (Windows: /tmp → \tmp)
+        assert_eq!(file.path, normalize_db_path("/tmp/v2-upgrade.mp4"));
 
         let id = db
             .insert_job(&NewJobRow {
@@ -5463,7 +5468,7 @@ mod tests {
             .suspected_duplicates_table_exists()
             .expect("SuspectedDuplicates"));
         let file = db.get_file_by_id(1).expect("preserve file");
-        assert_eq!(file.path, "/tmp/v3-upgrade.mp4");
+        assert_eq!(file.path, normalize_db_path("/tmp/v3-upgrade.mp4"));
 
         let keeper = db
             .insert_file("/tmp/v3-keeper.mp4", 2, Some("0000000000000000".into()))
@@ -5601,7 +5606,7 @@ mod tests {
         assert!(cols.iter().any(|c| c == "size"), "v5 must ADD COLUMN size");
         let list = db.list_duplicate_tombstones().expect("list");
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].path, "/tmp/legacy-tomb.mp4");
+        assert_eq!(list[0].path, normalize_db_path("/tmp/legacy-tomb.mp4"));
         assert_eq!(list[0].size, None);
         let _ = std::fs::remove_file(&path);
     }
@@ -5932,8 +5937,9 @@ mod tests {
     /// #61: native Path::join occupant must be found via rendered desired path
     #[test]
     fn find_file_occupying_path_matches_native_join_and_rendered() {
-        let dir = ensure_temp_tests_dir().join(format!(
-            "occ-native-{}",
+        let dir = std::env::temp_dir().join(format!(
+            "idam_occ_native_{}_{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -5969,6 +5975,7 @@ mod tests {
         )
         .expect("render");
 
+        assert_eq!(rendered, occupied);
         #[cfg(windows)]
         {
             let s = rendered.to_string_lossy();
