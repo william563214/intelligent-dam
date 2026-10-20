@@ -25,10 +25,17 @@ export interface Tag {
   category: string | null;
 }
 
+export interface SuspectedDuplicateInfo {
+  keeperId: number;
+  keeperPath: string;
+  distance: number;
+}
+
 export interface FileWithMetadata {
   file: FileRecord;
   metadata: Metadata | null;
   tags: Tag[];
+  suspectedDuplicate?: SuspectedDuplicateInfo | null;
 }
 
 export interface ScanResult {
@@ -48,6 +55,31 @@ export interface AppSettings {
   avdcPath: string;
   stashdbUrl: string;
   outputTemplate: string;
+  /** Max Hamming distance for near-phash suspected matches (default 4) */
+  nearPhashMaxDistance: number;
+}
+
+/** get_settings_command response (flatten AppSettings + env override metadata) */
+export interface SettingsResponse extends AppSettings {
+  nearPhashEnvOverride: number | null;
+  effectiveNearPhashMaxDistance: number;
+}
+
+export type ResolveSuspectedOutcome =
+  | { kind: "confirmed"; fileId: number }
+  | {
+      kind: "ignored";
+      file: FileWithMetadata;
+      pipelineEnqueued: boolean;
+    };
+
+export interface DuplicateTombstone {
+  id: number;
+  path: string;
+  size: number | null;
+  phash: string | null;
+  keeperId: number | null;
+  createdAt: string;
 }
 
 export interface WatcherStatus {

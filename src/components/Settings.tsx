@@ -17,24 +17,57 @@ import {
 import type {
   AppSettings,
   ConnectivityReport,
+  DuplicateTombstone,
   PipelineProgressEvent,
   TaskQueueProgressEvent,
   TaskQueueStatus,
   WatcherFileEvent,
   WatcherStatus,
 } from "../types";
+import {
+  refresh_tombstone_list,
+  remove_tombstone_and_refresh,
+} from "../utils/tombstoneSettings";
 
 const default_settings: AppSettings = {
   scanDirectories: [],
   avdcPath: "",
   stashdbUrl: "https://stashdb.org",
   outputTemplate: "{{studio}}/{{date}}_{{title}}.{{ext}}",
+  nearPhashMaxDistance: 4,
 };
 
 const legacy_settings_key = "intelligent_dam_settings";
 
+function settings_from_response(loaded: {
+  scanDirectories: string[];
+  avdcPath: string;
+  stashdbUrl: string;
+  outputTemplate: string;
+  nearPhashMaxDistance: number;
+  nearPhashEnvOverride?: number | null;
+  effectiveNearPhashMaxDistance?: number;
+}): AppSettings {
+  return {
+    scanDirectories: loaded.scanDirectories,
+    avdcPath: loaded.avdcPath,
+    stashdbUrl: loaded.stashdbUrl,
+    outputTemplate: loaded.outputTemplate,
+    nearPhashMaxDistance: loaded.nearPhashMaxDistance,
+  };
+}
+
 export default function Settings() {
   const [settings, setSettings] = useState<AppSettings>(default_settings);
+  const [nearPhashDraft, setNearPhashDraft] = useState(
+    String(default_settings.nearPhashMaxDistance)
+  );
+  const [nearPhashEnvOverride, setNearPhashEnvOverride] = useState<
+    number | null
+  >(null);
+  const [effectiveNearPhash, setEffectiveNearPhash] = useState(
+    default_settings.nearPhashMaxDistance
+  );
   const [newDirectory, setNewDirectory] = useState("");
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<string | null>(null);
@@ -54,13 +87,44 @@ export default function Settings() {
     null
   );
   const [connectivityBusy, setConnectivityBusy] = useState(false);
+  const [tombstones, setTombstones] = useState<DuplicateTombstone[]>([]);
+  const [tombstoneBusyId, setTombstoneBusyId] = useState<number | null>(null);
+  const [tombstoneMessage, setTombstoneMessage] = useState<string | null>(null);
 
   useEffect(() => {
     loadSettings();
     checkFFmpeg();
     refreshWatcherStatus();
     refreshQueueStatus();
+    void refreshTombstones();
   }, []);
+
+  const refreshTombstones = async () => {
+    try {
+      setTombstones(await refresh_tombstone_list());
+    } catch (e) {
+      console.error("Failed to list tombstones:", e);
+    }
+  };
+
+  const handleRemoveTombstone = async (id: number) => {
+    try {
+      setTombstoneBusyId(id);
+      setTombstoneMessage(null);
+      const result = await remove_tombstone_and_refresh(id);
+      setTombstones(result.tombstones);
+      if (!result.ok) {
+        if (result.error !== "已取消") {
+          setTombstoneMessage(result.error);
+          alert(result.error);
+        }
+        return;
+      }
+      setTombstoneMessage(null);
+    } finally {
+      setTombstoneBusyId(null);
+    }
+  };
 
   useEffect(() => {
     let unlistenFile: (() => void) | undefined;
@@ -181,8 +245,19 @@ export default function Settings() {
       setLoading(true);
       setLoadError(null);
       const loaded = await getSettings();
-      const resolved = await migrateLegacySettings(loaded);
-      setSettings({ ...default_settings, ...resolved });
+      setNearPhashEnvOverride(
+        loaded.nearPhashEnvOverride === undefined
+          ? null
+          : loaded.nearPhashEnvOverride
+      );
+      setEffectiveNearPhash(
+        loaded.effectiveNearPhashMaxDistance ?? loaded.nearPhashMaxDistance
+      );
+      const base = settings_from_response(loaded);
+      const resolved = await migrateLegacySettings(base);
+      const next = { ...default_settings, ...resolved };
+      setSettings(next);
+      setNearPhashDraft(String(next.nearPhashMaxDistance));
     } catch (e) {
       console.error("Failed to load settings:", e);
       const message =
@@ -711,6 +786,107 @@ export default function Settings() {
             相對路徑以來源檔所在目錄為基準；搬回監控樹內時會抑制 notify
             重入並略過已刮削檔。建議設定絕對圖書館根目錄以免與下載目錄重疊。
           </p>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            Near-phash 疑似重複閾值（Hamming）
+          </label>
+          <input
+            type="number"
+            min={0}
+            max={32}
+            value={nearPhashDraft}
+            onChange={(e) => {
+              const raw = e.target.value;
+              setNearPhashDraft(raw);
+              if (raw.trim() === "") {
+                return;
+              }
+              const n = Number(raw);
+              if (!Number.isFinite(n)) {
+                return;
+              }
+              const clamped = Math.min(32, Math.max(0, Math.trunc(n)));
+              setSettings({ ...settings, nearPhashMaxDistance: clamped });
+            }}
+            onBlur={() => {
+              if (nearPhashDraft.trim() === "") {
+                setNearPhashDraft(String(settings.nearPhashMaxDistance));
+                return;
+              }
+              const n = Number(nearPhashDraft);
+              if (!Number.isFinite(n)) {
+                setNearPhashDraft(String(settings.nearPhashMaxDistance));
+                return;
+              }
+              const clamped = Math.min(32, Math.max(0, Math.trunc(n)));
+              setNearPhashDraft(String(clamped));
+              setSettings({ ...settings, nearPhashMaxDistance: clamped });
+            }}
+            className="w-32 px-3 py-2 border border-gray-300 rounded-md"
+          />
+          <p className="mt-1 text-xs text-gray-500">
+            預設 4。距離 0（完全相同 phash）仍自動略過；1～閾值標為「疑似重複」
+            不自動處理，需在瀏覽器確認或忽略。清空輸入不會變成 0，失焦後還原。
+            環境變數 IDAM_NEAR_PHASH_MAX_DISTANCE 可覆寫（上限 32）。
+          </p>
+          {nearPhashEnvOverride !== null && (
+            <p className="mt-1 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+              目前由環境變數覆寫：有效閾值 = {effectiveNearPhash}
+              （env={nearPhashEnvOverride}；Settings 儲存值仍為{" "}
+              {settings.nearPhashMaxDistance}）
+            </p>
+          )}
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-2">
+            已確認重複墓碑（可移除）
+          </label>
+          <p className="mb-2 text-xs text-gray-500">
+            確認重複後會依路徑＋大小（與 phash）永久略過再匯入。同路徑但大小不同
+            會自動清除墓碑。可在此手動移除。
+          </p>
+          {tombstoneMessage && (
+            <p className="mb-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
+              {tombstoneMessage}
+            </p>
+          )}
+          {tombstones.length === 0 ? (
+            <p className="text-sm text-gray-400">目前沒有墓碑</p>
+          ) : (
+            <ul className="space-y-2 max-h-48 overflow-y-auto border border-gray-200 rounded-md p-2">
+              {tombstones.map((t) => (
+                <li
+                  key={t.id}
+                  className="flex items-start justify-between gap-2 text-sm"
+                >
+                  <div className="min-w-0 break-all">
+                    <div className="font-mono text-xs">{t.path}</div>
+                    <div className="text-xs text-gray-500">
+                      size={t.size ?? "—"} · phash={t.phash ?? "—"}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handleRemoveTombstone(t.id)}
+                    disabled={tombstoneBusyId === t.id}
+                    className="shrink-0 px-2 py-1 text-xs text-red-700 border border-red-300 rounded hover:bg-red-50 disabled:opacity-50"
+                  >
+                    {tombstoneBusyId === t.id ? "…" : "移除"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <button
+            type="button"
+            onClick={() => void refreshTombstones()}
+            className="mt-2 text-xs text-teal-700 underline"
+          >
+            重新整理墓碑列表
+          </button>
         </div>
 
         <div>

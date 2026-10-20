@@ -132,6 +132,7 @@ pub async fn scan_directory(
     path: String,
     db: &Arc<Mutex<Database>>,
     queue: &TaskQueue,
+    settings: &AppSettings,
 ) -> Result<ScanResult, String> {
     // Directory walk off the async runtime; no DB lock held.
     let scanned = tokio::task::spawn_blocking(move || scanner::scan_directory(path))
@@ -139,7 +140,7 @@ pub async fn scan_directory(
         .map_err(|e| format!("Scan task join failed: {}", e))?
         .map_err(|e| format!("Scan failed: {}", e))?;
 
-    finish_scan_import(db, queue, scanned).await
+    finish_scan_import(db, queue, scanned, settings).await
 }
 
 /// Scan multiple directories and ingest. Empty `paths` is an error.
@@ -147,6 +148,7 @@ pub async fn scan_multiple_directories(
     paths: Vec<String>,
     db: &Arc<Mutex<Database>>,
     queue: &TaskQueue,
+    settings: &AppSettings,
 ) -> Result<ScanResult, String> {
     if paths.is_empty() {
         return Err("No directories provided".to_string());
@@ -156,23 +158,26 @@ pub async fn scan_multiple_directories(
         .await
         .map_err(|e| format!("Scan task join failed: {}", e))?;
 
-    finish_scan_import(db, queue, scanned).await
+    finish_scan_import(db, queue, scanned, settings).await
 }
 
 async fn finish_scan_import(
     db: &Arc<Mutex<Database>>,
     queue: &TaskQueue,
     scanned: Vec<scanner::ScannedFile>,
+    settings: &AppSettings,
 ) -> Result<ScanResult, String> {
     let suppressions = queue.path_suppressions().ok();
     let supp_ref = suppressions.as_deref();
+
+    let max_distance = settings.effective_near_phash_max_distance();
 
     // Short lock: insert rows (null phash ok; COALESCE keeps existing).
     let (imported, jobs) = {
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::import_files_pending_phash(&db, &scanned, supp_ref)
+        scanner::import_files_pending_phash(&db, &scanned, supp_ref, max_distance)
             .map_err(|e| format!("Import failed: {}", e))?
     };
 
@@ -185,7 +190,7 @@ async fn finish_scan_import(
         let db = db
             .lock()
             .map_err(|e| format!("Database lock error: {}", e))?;
-        scanner::write_phashes(&db, &results, supp_ref)
+        scanner::write_phashes(&db, &results, supp_ref, max_distance)
             .map_err(|e| format!("Failed to write phash: {}", e))?;
     }
 
@@ -217,6 +222,141 @@ pub fn get_all_files(db: &Arc<Mutex<Database>>) -> Result<Vec<FileWithMetadata>,
         .map_err(|e| format!("Failed to get files: {}", e))
 }
 
+/// Outcome of confirming or ignoring a near-phash suspicion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ResolveSuspectedOutcome {
+    /// DB record removed; disk file left in place; permanent tombstone written.
+    Confirmed { file_id: i64 },
+    /// Suspicion cleared; file restored to ready (pipeline may be enqueued).
+    Ignored {
+        file: Box<FileWithMetadata>,
+        pipeline_enqueued: bool,
+    },
+}
+
+/// Confirm or ignore a near-phash suspected duplicate.
+///
+/// - `confirm`: atomic tombstone + resolve + delete; PathSuppress only after COMMIT
+/// - `ignore`: mark ignored, set ready; optionally enqueue pipeline when args provided
+pub fn resolve_suspected_duplicate_with_enqueue(
+    db: &Arc<Mutex<Database>>,
+    queue: &Arc<TaskQueue>,
+    file_id: i64,
+    action: &str,
+    app: Option<&AppHandle>,
+    settings: Option<&AppSettings>,
+    pipeline: Option<PipelineOptions>,
+) -> Result<ResolveSuspectedOutcome, String> {
+    let action = action.trim().to_lowercase();
+    if action != "confirm" && action != "ignore" {
+        return Err(format!(
+            "invalid action '{action}' (expected confirm or ignore)"
+        ));
+    }
+
+    let suppressions = queue.path_suppressions().ok();
+
+    if action == "confirm" {
+        let orphan_path = {
+            let guard = db
+                .lock()
+                .map_err(|e| format!("Database lock error: {}", e))?;
+            guard
+                .confirm_suspected_duplicate(file_id)
+                .map_err(|e| format!("Failed to confirm duplicate: {}", e))?
+        };
+        // PathSuppress only after COMMIT succeeded
+        if let Some(supp) = suppressions {
+            supp.suppress(std::path::Path::new(&orphan_path));
+        }
+        return Ok(ResolveSuspectedOutcome::Confirmed { file_id });
+    }
+
+    // ignore
+    {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        let file = guard
+            .get_file_by_id(file_id)
+            .map_err(|e| format!("File not found: {}", e))?;
+        if file.status != file_status::suspected_duplicate {
+            return Err(format!(
+                "file {} is not suspected_duplicate (status={})",
+                file_id, file.status
+            ));
+        }
+        if guard
+            .get_pending_suspected_duplicate(file_id)
+            .map_err(|e| format!("Failed to read suspicion: {}", e))?
+            .is_none()
+        {
+            return Err(format!("no pending suspicion for file {file_id}"));
+        }
+        guard
+            .resolve_suspected_duplicate(file_id, "ignored")
+            .map_err(|e| format!("Failed to resolve suspicion: {}", e))?;
+    }
+
+    let mut pipeline_enqueued = false;
+    if let (Some(settings), Some(opts)) = (settings, pipeline) {
+        if !opts.is_noop() {
+            match enqueue_pipeline_jobs(app, db, queue, settings, vec![file_id], opts) {
+                Ok(result) => {
+                    pipeline_enqueued = result.enqueued > 0;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "resolve_suspected: ignore enqueue pipeline failed for {}: {}",
+                        file_id, e
+                    );
+                }
+            }
+        }
+    }
+
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    let files = guard
+        .get_files_with_metadata()
+        .map_err(|e| format!("Failed to reload files: {}", e))?;
+    let file = files
+        .into_iter()
+        .find(|f| f.file.id == file_id)
+        .ok_or_else(|| format!("file {} missing after ignore", file_id))?;
+    Ok(ResolveSuspectedOutcome::Ignored {
+        file: Box::new(file),
+        pipeline_enqueued,
+    })
+}
+
+/// List confirmed-duplicate tombstones (Settings UI).
+pub fn list_duplicate_tombstones(
+    db: &Arc<Mutex<Database>>,
+) -> Result<Vec<crate::database::DuplicateTombstone>, String> {
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    guard
+        .list_duplicate_tombstones()
+        .map_err(|e| format!("Failed to list tombstones: {}", e))
+}
+
+/// Remove one tombstone by id (Settings UI).
+pub fn remove_duplicate_tombstone(
+    db: &Arc<Mutex<Database>>,
+    id: i64,
+) -> Result<bool, String> {
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    guard
+        .remove_duplicate_tombstone(id)
+        .map_err(|e| format!("Failed to remove tombstone: {}", e))
+}
+
 /// Load settings from the store (defaults when missing).
 pub fn get_settings(settings_store: &Mutex<SettingsStore>) -> Result<AppSettings, String> {
     let store = settings_store
@@ -236,6 +376,7 @@ pub fn save_settings(
     if !settings.avdc_path.trim().is_empty() {
         settings.avdc_path = canonicalize_user_path(&settings.avdc_path);
     }
+    settings.normalize_for_save();
 
     {
         let store = settings_store
@@ -341,8 +482,10 @@ pub async fn scan_directory_command(
     path: String,
     db: State<'_, Arc<Mutex<Database>>>,
     queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<ScanResult, String> {
-    scan_directory(path, &db, &queue).await
+    let settings = get_settings(&settings_store)?;
+    scan_directory(path, &db, &queue, &settings).await
 }
 
 #[tauri::command]
@@ -350,8 +493,10 @@ pub async fn scan_multiple_directories_command(
     paths: Vec<String>,
     db: State<'_, Arc<Mutex<Database>>>,
     queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
 ) -> Result<ScanResult, String> {
-    scan_multiple_directories(paths, &db, &queue).await
+    let settings = get_settings(&settings_store)?;
+    scan_multiple_directories(paths, &db, &queue, &settings).await
 }
 
 #[tauri::command]
@@ -362,10 +507,64 @@ pub async fn get_all_files_command(
 }
 
 #[tauri::command]
+pub async fn resolve_suspected_duplicate_command(
+    file_id: i64,
+    action: String,
+    db: State<'_, Arc<Mutex<Database>>>,
+    queue: State<'_, Arc<TaskQueue>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
+    app: AppHandle,
+) -> Result<ResolveSuspectedOutcome, String> {
+    let settings = get_settings(&settings_store).unwrap_or_default();
+    let base = PipelineOptions::from_env();
+    resolve_suspected_duplicate_with_enqueue(
+        &db,
+        &queue,
+        file_id,
+        &action,
+        Some(&app),
+        Some(&settings),
+        Some(base),
+    )
+}
+
+#[tauri::command]
+pub fn list_duplicate_tombstones_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Vec<crate::database::DuplicateTombstone>, String> {
+    list_duplicate_tombstones(&db)
+}
+
+#[tauri::command]
+pub fn remove_duplicate_tombstone_command(
+    id: i64,
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<bool, String> {
+    remove_duplicate_tombstone(&db, id)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsResponse {
+    #[serde(flatten)]
+    pub settings: AppSettings,
+    /// Present when `IDAM_NEAR_PHASH_MAX_DISTANCE` is set and valid.
+    pub near_phash_env_override: Option<u32>,
+    pub effective_near_phash_max_distance: u32,
+}
+
+#[tauri::command]
 pub fn get_settings_command(
     settings_store: State<'_, Mutex<SettingsStore>>,
-) -> Result<AppSettings, String> {
-    get_settings(&settings_store)
+) -> Result<SettingsResponse, String> {
+    let settings = get_settings(&settings_store)?;
+    let env_override = crate::phash::parse_env_near_phash_max_distance();
+    let effective = settings.effective_near_phash_max_distance();
+    Ok(SettingsResponse {
+        settings,
+        near_phash_env_override: env_override,
+        effective_near_phash_max_distance: effective,
+    })
 }
 
 #[tauri::command]
@@ -861,7 +1060,7 @@ pub fn enqueue_pipeline_jobs(
                 .map_err(|e| format!("Database lock error: {}", e))?;
             match guard.get_file_by_id(file_id) {
                 Ok(file) => {
-                    if file.status == file_status::missing {
+                    if file_status::blocks_auto_pipeline(&file.status) {
                         skipped += 1;
                         continue;
                     }

@@ -1,6 +1,6 @@
 use crate::file_status;
 use crate::phash;
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -35,12 +35,54 @@ pub struct Tag {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuspectedDuplicateInfo {
+    pub keeper_id: i64,
+    pub keeper_path: String,
+    pub distance: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileWithMetadata {
     // 保持巢狀 shape 與前端 FileWithMetadata.file / metadata / tags 對齊
     // 勿使用 flatten 否則 invoke JSON 會少掉 file 物件
     pub file: FileRecord,
     pub metadata: Option<Metadata>,
     pub tags: Vec<Tag>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "suspectedDuplicate")]
+    pub suspected_duplicate: Option<SuspectedDuplicateInfo>,
+}
+
+/// Pending near-phash suspicion row (SuspectedDuplicates table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SuspectedDuplicateRow {
+    pub file_id: i64,
+    pub keeper_id: i64,
+    pub distance: u32,
+    pub resolution: String,
+}
+
+/// Confirmed-duplicate tombstone (DuplicateTombstones table).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DuplicateTombstone {
+    pub id: i64,
+    pub path: String,
+    pub size: Option<i64>,
+    pub phash: Option<String>,
+    pub keeper_id: Option<i64>,
+    pub created_at: String,
+}
+
+/// Result of checking a path against DuplicateTombstones at import time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathTombstoneAction {
+    /// Same path + same size — skip re-ingest.
+    Block,
+    /// Same path but different size — tombstone removed; proceed as new file.
+    Cleared,
+    /// No tombstone for this path.
+    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +135,9 @@ pub struct Database {
 /// 1 = v0.1.0 baseline（含 #20 Tags / #28 FK 硬化）
 /// 2 = #45 NULL-category 唯一索引
 /// 3 = #34 Jobs 佇列持久化
-const SCHEMA_USER_VERSION: i32 = 3;
+/// 4 = #38 SuspectedDuplicates（near-phash 疑似重複）
+/// 5 = #38 DuplicateTombstones + Files.organized_at（durable organized）
+const SCHEMA_USER_VERSION: i32 = 5;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
 #[cfg(any(test, feature = "test-support"))]
@@ -131,6 +175,59 @@ impl Database {
         }
 
         self.apply_pending_migrations(version)?;
+        // Dev DBs that reached user_version=5 before organized_at landed still need repair.
+        let version_after = self.get_user_version()?;
+        if version_after >= 5 {
+            self.ensure_v5_columns()?;
+        }
+        Ok(())
+    }
+
+    /// Idempotent v5 column repair: `Files.organized_at` (+ backfill).
+    ///
+    /// Mid-flight PR commits stamped `user_version=5` without this column; opening those
+    /// DBs must ALTER+backfill or scrape/move/dedup break. Shared by migration_5 and
+    /// post-migration init so there is one code path.
+    fn ensure_v5_columns(&self) -> SqliteResult<()> {
+        let has_organized_at: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(Files)")?;
+            let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for c in cols {
+                if c? == "organized_at" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_organized_at {
+            self.conn.execute(
+                "ALTER TABLE Files ADD COLUMN organized_at DATETIME",
+                [],
+            )?;
+        }
+        // Backfill semantics unchanged (#54 tracks rule changes separately).
+        self.conn.execute_batch(
+            "
+            UPDATE Files SET organized_at = CURRENT_TIMESTAMP
+            WHERE organized_at IS NULL
+              AND (
+                id IN (SELECT file_id FROM Metadata)
+                OR id IN (SELECT file_id FROM FileTags)
+                OR id IN (
+                    SELECT CAST(
+                        CASE WHEN json_valid(payload)
+                             THEN json_extract(payload, '$.file_id')
+                             ELSE NULL END
+                        AS INTEGER
+                    )
+                    FROM Jobs
+                    WHERE type = 'pipeline' AND status = 'succeeded'
+                )
+              );
+            ",
+        )?;
         Ok(())
     }
 
@@ -275,6 +372,8 @@ impl Database {
         match target {
             2 => self.migration_2_tags_nullsafe_unique(),
             3 => self.migration_3_jobs_table(),
+            4 => self.migration_4_suspected_duplicates(),
+            5 => self.migration_5_duplicate_tombstones(),
             other => {
                 // 用 SqliteFailure 而非 InvalidParameterName
                 // 避免顯示 Invalid parameter name 前綴
@@ -285,6 +384,122 @@ impl Database {
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
                     Some(msg),
                 ))
+            }
+        }
+    }
+
+    /// #38 SuspectedDuplicates（near-phash 疑似重複確認）
+    fn migration_4_suspected_duplicates(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS SuspectedDuplicates (
+                    file_id INTEGER PRIMARY KEY,
+                    keeper_id INTEGER NOT NULL,
+                    distance INTEGER NOT NULL
+                        CHECK (distance BETWEEN 0 AND 64),
+                    resolution TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (resolution IN ('pending', 'confirmed', 'ignored')),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(file_id) REFERENCES Files(id),
+                    FOREIGN KEY(keeper_id) REFERENCES Files(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_suspected_duplicates_keeper
+                    ON SuspectedDuplicates(keeper_id);
+                CREATE INDEX IF NOT EXISTS idx_suspected_duplicates_resolution
+                    ON SuspectedDuplicates(resolution);
+                ",
+            )?;
+            self.set_user_version(4)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after SuspectedDuplicates migration error: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// #38 DuplicateTombstones + Files.organized_at（確認重複墓碑；durable organized）
+    fn migration_5_duplicate_tombstones(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.conn.execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS DuplicateTombstones (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path TEXT NOT NULL UNIQUE,
+                    size INTEGER,
+                    phash TEXT,
+                    keeper_id INTEGER,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE INDEX IF NOT EXISTS idx_duplicate_tombstones_phash
+                    ON DuplicateTombstones(phash);
+                ",
+            )?;
+            // Dev DBs that already created DuplicateTombstones under a premature v4
+            // may lack `size` — add it if missing.
+            let has_size: bool = {
+                let mut stmt = self.conn.prepare("PRAGMA table_info(DuplicateTombstones)")?;
+                let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                let mut found = false;
+                for c in cols {
+                    if c? == "size" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_size {
+                self.conn
+                    .execute("ALTER TABLE DuplicateTombstones ADD COLUMN size INTEGER", [])?;
+            }
+            // Drop unused keeper_phash if a premature v4 schema introduced it
+            let has_keeper_phash: bool = {
+                let mut stmt = self.conn.prepare("PRAGMA table_info(DuplicateTombstones)")?;
+                let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                let mut found = false;
+                for c in cols {
+                    if c? == "keeper_phash" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if has_keeper_phash {
+                // SQLite < 3.35 cannot DROP COLUMN; leave column unused if present.
+                eprintln!(
+                    "warn: DuplicateTombstones.keeper_phash present (legacy); unused by app"
+                );
+            }
+            // Durable organized marker — survives Jobs terminal prune (max 200).
+            self.ensure_v5_columns()?;
+            self.set_user_version(5)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after DuplicateTombstones migration error: {rb}"
+                    );
+                }
+                Err(e)
             }
         }
     }
@@ -937,7 +1152,9 @@ impl Database {
     }
 
     /// Find another Files row whose phash is within `max_distance` of `phash_hex`.
-    /// Prefers the smallest id (oldest keeper) among matches.
+    /// Considers any `id != exclude_file_id` (order-independent with multi-worker phash).
+    /// Skips candidates already suspected-of this file (prevents reverse re-flag).
+    /// Caller may only auto-act on the just-phashed `exclude_file_id` (never on the match).
     pub fn find_near_phash_duplicate(
         &self,
         exclude_file_id: i64,
@@ -968,6 +1185,10 @@ impl Database {
         let mut best: Option<(FileRecord, u32)> = None;
         for row in rows {
             let file = row?;
+            // Skip rows already suspected-of this file (reverse link)
+            if self.is_suspected_of(file.id, exclude_file_id)? {
+                continue;
+            }
             let Some(ref hex) = file.phash else {
                 continue;
             };
@@ -991,8 +1212,520 @@ impl Database {
         Ok(best)
     }
 
-    /// Remove a provisional Files row and its Metadata / FileTags (phash skip).
+    /// Organized = Files.organized_at set, or Metadata / FileTags still present.
+    ///
+    /// `organized_at` is the durable signal (survives Jobs prune). Metadata/FileTags
+    /// remain as live signals for rows organized before the column existed.
+    pub fn is_organized_file(&self, file_id: i64) -> SqliteResult<bool> {
+        if self.file_has_organized_at(file_id)? {
+            return Ok(true);
+        }
+        if self.has_metadata_row(file_id)? {
+            return Ok(true);
+        }
+        if self.has_file_tags(file_id)? {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn file_has_organized_at(&self, file_id: i64) -> SqliteResult<bool> {
+        let v: Option<String> = self.conn.query_row(
+            "SELECT organized_at FROM Files WHERE id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(v.filter(|s| !s.trim().is_empty()).is_some())
+    }
+
+    /// Persist organized marker (scrape/move success). Idempotent.
+    pub fn mark_file_organized(&self, file_id: i64) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE Files SET organized_at = COALESCE(organized_at, CURRENT_TIMESTAMP)
+             WHERE id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_file_tags(&self, file_id: i64) -> SqliteResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM FileTags WHERE file_id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    fn count_pipeline_jobs_with_file_id(
+        &self,
+        file_id: i64,
+        statuses: &str,
+    ) -> SqliteResult<i64> {
+        if !self.table_exists("Jobs")? {
+            return Ok(0);
+        }
+        // Exact match via json_extract — do not use instr('"file_id":1') (matches 12, 123…).
+        // json_valid guards so one corrupt payload cannot break all dedup lookups.
+        self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM Jobs
+                 WHERE type = 'pipeline'
+                   AND status IN ({statuses})
+                   AND json_valid(payload)
+                   AND CAST(json_extract(payload, '$.file_id') AS INTEGER) = ?1"
+            ),
+            params![file_id],
+            |row| row.get(0),
+        )
+    }
+
+    /// Pipeline job currently executing (`status='running'`).
+    ///
+    /// Own `queued` pipeline does **not** count — watcher enqueues pipeline before
+    /// phash completes, so treating queued as busy would invert #38 victims.
+    pub fn has_running_pipeline_job(&self, file_id: i64) -> SqliteResult<bool> {
+        Ok(self.count_pipeline_jobs_with_file_id(file_id, "'running'")? > 0)
+    }
+
+    /// THE RULE: auto delete/flag may only target this just-phashed row when it is
+    /// not organized and does not have a running pipeline job.
+    pub fn may_auto_act_on_self(&self, file_id: i64) -> SqliteResult<bool> {
+        if self.is_organized_file(file_id)? {
+            return Ok(false);
+        }
+        if self.has_running_pipeline_job(file_id)? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// True when `file_id` has any SuspectedDuplicates row pointing at `keeper_id`.
+    pub fn is_suspected_of(&self, file_id: i64, keeper_id: i64) -> SqliteResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM SuspectedDuplicates
+             WHERE file_id = ?1 AND keeper_id = ?2",
+            params![file_id, keeper_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// True when this (file_id, keeper_id) pair was already ignored.
+    pub fn is_ignored_suspected_pair(
+        &self,
+        file_id: i64,
+        keeper_id: i64,
+    ) -> SqliteResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM SuspectedDuplicates
+             WHERE file_id = ?1 AND keeper_id = ?2 AND resolution = 'ignored'",
+            params![file_id, keeper_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Upsert pending suspicion; never resets ignored/confirmed back to pending.
+    pub fn upsert_suspected_duplicate(
+        &self,
+        file_id: i64,
+        keeper_id: i64,
+        distance: u32,
+    ) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT INTO SuspectedDuplicates (file_id, keeper_id, distance, resolution)
+             VALUES (?1, ?2, ?3, 'pending')
+             ON CONFLICT(file_id) DO UPDATE SET
+               keeper_id = excluded.keeper_id,
+               distance = excluded.distance,
+               resolution = 'pending'
+             WHERE SuspectedDuplicates.resolution = 'pending'",
+            params![file_id, keeper_id, distance as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically write phash (optional), upsert pending suspicion, set status.
+    ///
+    /// Decision: `scrape_failed` / `missing` are **not** transitioned to
+    /// `suspected_duplicate` (keep failure / missing semantics). Near-phash
+    /// marking is skipped for those statuses (caller should treat as Distinct).
+    pub fn mark_suspected_duplicate_atomic(
+        &self,
+        file_id: i64,
+        keeper_id: i64,
+        distance: u32,
+        phash_hex: Option<&str>,
+    ) -> SqliteResult<()> {
+        let current = self.get_file_by_id(file_id)?.status;
+        if current == file_status::scrape_failed || current == file_status::missing {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "refusing suspected mark for status={current}"
+            )));
+        }
+        if self.is_ignored_suspected_pair(file_id, keeper_id)? {
+            return Ok(());
+        }
+
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            if let Some(hash) = phash_hex {
+                self.conn.execute(
+                    "UPDATE Files SET phash = ?1 WHERE id = ?2",
+                    params![hash, file_id],
+                )?;
+            }
+            self.upsert_suspected_duplicate(file_id, keeper_id, distance)?;
+            // If row is ignored/confirmed, upsert did not reset it — do not flip status
+            let resolution: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT resolution FROM SuspectedDuplicates WHERE file_id = ?1",
+                    params![file_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if resolution.as_deref() != Some("pending") {
+                self.conn.execute("COMMIT", [])?;
+                return Ok(());
+            }
+            let status: String = self.conn.query_row(
+                "SELECT status FROM Files WHERE id = ?1",
+                params![file_id],
+                |row| row.get(0),
+            )?;
+            if status != file_status::suspected_duplicate {
+                if !file_status::can_transition(&status, file_status::suspected_duplicate) {
+                    return Err(rusqlite::Error::InvalidParameterName(format!(
+                        "illegal status transition: {status} -> suspected_duplicate"
+                    )));
+                }
+                self.conn.execute(
+                    "UPDATE Files SET status = ?1 WHERE id = ?2",
+                    params![file_status::suspected_duplicate, file_id],
+                )?;
+            }
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after mark_suspected: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Pending suspicion for a file, if any.
+    pub fn get_pending_suspected_duplicate(
+        &self,
+        file_id: i64,
+    ) -> SqliteResult<Option<SuspectedDuplicateRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, keeper_id, distance, resolution FROM SuspectedDuplicates
+             WHERE file_id = ?1 AND resolution = 'pending'",
+        )?;
+        let mut rows = stmt.query(params![file_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(SuspectedDuplicateRow {
+                file_id: row.get(0)?,
+                keeper_id: row.get(1)?,
+                distance: row.get::<_, i64>(2)? as u32,
+                resolution: row.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Any SuspectedDuplicates row for file_id (any resolution).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn get_suspected_duplicate_row(
+        &self,
+        file_id: i64,
+    ) -> SqliteResult<Option<SuspectedDuplicateRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, keeper_id, distance, resolution FROM SuspectedDuplicates
+             WHERE file_id = ?1",
+        )?;
+        let mut rows = stmt.query(params![file_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(SuspectedDuplicateRow {
+                file_id: row.get(0)?,
+                keeper_id: row.get(1)?,
+                distance: row.get::<_, i64>(2)? as u32,
+                resolution: row.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Mark suspicion resolved and clear Files.status when ignoring.
+    pub fn resolve_suspected_duplicate(
+        &self,
+        file_id: i64,
+        resolution: &str,
+    ) -> SqliteResult<SuspectedDuplicateRow> {
+        if resolution != "confirmed" && resolution != "ignored" {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "invalid suspected-duplicate resolution: {resolution}"
+            )));
+        }
+        let pending = self
+            .get_pending_suspected_duplicate(file_id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+
+        self.conn.execute(
+            "UPDATE SuspectedDuplicates SET resolution = ?1 WHERE file_id = ?2",
+            params![resolution, file_id],
+        )?;
+
+        if resolution == "ignored" {
+            let status = self.get_file_by_id(file_id)?.status;
+            if status == file_status::suspected_duplicate {
+                self.update_file_status(file_id, file_status::ready)?;
+            }
+        }
+
+        Ok(SuspectedDuplicateRow {
+            resolution: resolution.to_string(),
+            ..pending
+        })
+    }
+
+    /// Permanent tombstone so confirmed duplicates are not re-ingested after PathSuppress TTL.
+    /// Stores `size` so a later different file at the same path is not silently blocked.
+    pub fn insert_duplicate_tombstone(
+        &self,
+        path: &str,
+        size: u64,
+        phash: Option<&str>,
+        keeper_id: Option<i64>,
+    ) -> SqliteResult<()> {
+        self.insert_duplicate_tombstone_inner(path, size, phash, keeper_id)
+    }
+
+    fn insert_duplicate_tombstone_inner(
+        &self,
+        path: &str,
+        size: u64,
+        phash: Option<&str>,
+        keeper_id: Option<i64>,
+    ) -> SqliteResult<()> {
+        self.conn.execute(
+            "INSERT INTO DuplicateTombstones (path, size, phash, keeper_id)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+               size = excluded.size,
+               phash = COALESCE(excluded.phash, DuplicateTombstones.phash),
+               keeper_id = COALESCE(excluded.keeper_id, DuplicateTombstones.keeper_id)",
+            params![path, size as i64, phash, keeper_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_duplicate_tombstone_by_path(
+        &self,
+        path: &str,
+    ) -> SqliteResult<Option<DuplicateTombstone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, phash, keeper_id, created_at
+             FROM DuplicateTombstones WHERE path = ?1",
+        )?;
+        let mut rows = stmt.query(params![path])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(DuplicateTombstone {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get(2)?,
+                phash: row.get(3)?,
+                keeper_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    /// Path tombstone gate for import: same size → block; different size → clear tombstone.
+    pub fn check_path_tombstone(
+        &self,
+        path: &str,
+        size: u64,
+    ) -> SqliteResult<PathTombstoneAction> {
+        let Some(ts) = self.get_duplicate_tombstone_by_path(path)? else {
+            return Ok(PathTombstoneAction::None);
+        };
+        match ts.size {
+            Some(stored) if stored as u64 != size => {
+                self.remove_duplicate_tombstone(ts.id)?;
+                Ok(PathTombstoneAction::Cleared)
+            }
+            _ => Ok(PathTombstoneAction::Block),
+        }
+    }
+
+    pub fn get_duplicate_tombstone_by_phash(
+        &self,
+        phash_hex: &str,
+    ) -> SqliteResult<Option<DuplicateTombstone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, phash, keeper_id, created_at
+             FROM DuplicateTombstones
+             WHERE phash IS NOT NULL AND lower(phash) = lower(?1)
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![phash_hex])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(DuplicateTombstone {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get(2)?,
+                phash: row.get(3)?,
+                keeper_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_duplicate_tombstones(&self) -> SqliteResult<Vec<DuplicateTombstone>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, size, phash, keeper_id, created_at
+             FROM DuplicateTombstones ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DuplicateTombstone {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                size: row.get(2)?,
+                phash: row.get(3)?,
+                keeper_id: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn remove_duplicate_tombstone(&self, id: i64) -> SqliteResult<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM DuplicateTombstones WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn has_metadata_row(&self, file_id: i64) -> SqliteResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM Metadata WHERE file_id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Confirm suspected duplicate atomically: tombstone + resolve + delete in one tx.
+    /// Returns orphan path for PathSuppress **after** COMMIT.
+    pub fn confirm_suspected_duplicate(&self, file_id: i64) -> SqliteResult<String> {
+        self.confirm_suspected_duplicate_impl(file_id, false)
+    }
+
+    /// Test hook: fail after resolve (before delete) to verify ROLLBACK recoverability.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn confirm_suspected_duplicate_fail_after_resolve(
+        &self,
+        file_id: i64,
+    ) -> SqliteResult<String> {
+        self.confirm_suspected_duplicate_impl(file_id, true)
+    }
+
+    fn confirm_suspected_duplicate_impl(
+        &self,
+        file_id: i64,
+        fail_after_resolve: bool,
+    ) -> SqliteResult<String> {
+        let file = self.get_file_by_id(file_id)?;
+        if file.status != file_status::suspected_duplicate {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "file {file_id} is not suspected_duplicate"
+            )));
+        }
+        let pending = self
+            .get_pending_suspected_duplicate(file_id)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<String> {
+            self.insert_duplicate_tombstone(
+                &file.path,
+                file.size,
+                file.phash.as_deref(),
+                Some(pending.keeper_id),
+            )?;
+            self.conn.execute(
+                "UPDATE SuspectedDuplicates SET resolution = 'confirmed' WHERE file_id = ?1",
+                params![file_id],
+            )?;
+            if fail_after_resolve {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                    Some("injected confirm failure after resolve".into()),
+                ));
+            }
+            self.delete_file_record_inner(file_id)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(file.path.clone())
+        })();
+
+        match tx_result {
+            Ok(path) => Ok(path),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after confirm_suspected: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Remove a Files row and children; restore pending orphans that pointed at it as keeper.
     pub fn delete_file_record(&self, file_id: i64) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.delete_file_record_inner(file_id)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after delete_file_record: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Delete file row + children. Caller must hold an open transaction when nesting.
+    fn delete_file_record_inner(&self, file_id: i64) -> SqliteResult<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id FROM SuspectedDuplicates
+             WHERE keeper_id = ?1 AND resolution = 'pending'",
+        )?;
+        let orphan_ids: Vec<i64> = stmt
+            .query_map(params![file_id], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        drop(stmt);
+
+        self.conn.execute(
+            "DELETE FROM SuspectedDuplicates WHERE file_id = ?1 OR keeper_id = ?1",
+            params![file_id],
+        )?;
         self.conn.execute(
             "DELETE FROM FileTags WHERE file_id = ?1",
             params![file_id],
@@ -1003,6 +1736,28 @@ impl Database {
         )?;
         self.conn
             .execute("DELETE FROM Files WHERE id = ?1", params![file_id])?;
+
+        for orphan_id in orphan_ids {
+            let status: String = self.conn.query_row(
+                "SELECT status FROM Files WHERE id = ?1",
+                params![orphan_id],
+                |row| row.get(0),
+            )?;
+            if status == file_status::suspected_duplicate {
+                if !file_status::can_transition(
+                    file_status::suspected_duplicate,
+                    file_status::ready,
+                ) {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "illegal status transition restoring orphan".into(),
+                    ));
+                }
+                self.conn.execute(
+                    "UPDATE Files SET status = ?1 WHERE id = ?2",
+                    params![file_status::ready, orphan_id],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -1211,6 +1966,9 @@ impl Database {
         // 列表時輕量核對磁碟路徑 缺檔 → missing 復現 → ready
         self.reconcile_missing_files()?;
 
+        // One query for all pending suspicions (avoids N+1 on SuspectedDuplicates)
+        let suspected_map = self.load_pending_suspected_map()?;
+
         let mut stmt = self.conn.prepare(
             "SELECT id, path, size, created_at, phash, status FROM Files ORDER BY created_at DESC",
         )?;
@@ -1231,14 +1989,42 @@ impl Database {
             let file = file?;
             let metadata = self.get_metadata(file.id)?;
             let tags = self.get_file_tags(file.id)?;
-
+            let suspected_duplicate = suspected_map.get(&file.id).cloned();
             result.push(FileWithMetadata {
                 file,
                 metadata,
                 tags,
+                suspected_duplicate,
             });
         }
         Ok(result)
+    }
+
+    fn load_pending_suspected_map(
+        &self,
+    ) -> SqliteResult<std::collections::HashMap<i64, SuspectedDuplicateInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.file_id, s.keeper_id, s.distance, k.path
+             FROM SuspectedDuplicates s
+             INNER JOIN Files k ON k.id = s.keeper_id
+             WHERE s.resolution = 'pending'",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SuspectedDuplicateInfo {
+                    keeper_id: row.get(1)?,
+                    distance: row.get::<_, i64>(2)? as u32,
+                    keeper_path: row.get(3)?,
+                },
+            ))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (file_id, info) = row?;
+            map.insert(file_id, info);
+        }
+        Ok(map)
     }
 
     /// Persist a scrape / ffmpeg / move failure for the error log UI
@@ -1406,6 +2192,11 @@ impl Database {
         self.table_exists("Jobs")
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn suspected_duplicates_table_exists(&self) -> SqliteResult<bool> {
+        self.table_exists("SuspectedDuplicates")
+    }
+
     fn map_job_row(row: &rusqlite::Row<'_>) -> SqliteResult<JobRow> {
         let retryable_i: i64 = row.get(7)?;
         Ok(JobRow {
@@ -1453,12 +2244,15 @@ impl Database {
         Ok(n)
     }
 
-    /// File ids eligible for one-click / batch organize (not missing)
+    /// File ids eligible for one-click / batch organize (not missing / suspected)
     pub fn list_organizable_file_ids(&self) -> SqliteResult<Vec<i64>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM Files WHERE status != ?1 ORDER BY id ASC",
+            "SELECT id FROM Files WHERE status != ?1 AND status != ?2 ORDER BY id ASC",
         )?;
-        let rows = stmt.query_map(params![file_status::missing], |row| row.get(0))?;
+        let rows = stmt.query_map(
+            params![file_status::missing, file_status::suspected_duplicate],
+            |row| row.get(0),
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -1532,7 +2326,7 @@ impl Database {
         Ok(())
     }
 
-    /// 刮削成功後在同一交易寫入 metadata tags 與 status
+    /// 刮削成功後在同一交易寫入 metadata tags、status 與 organized_at
     pub fn persist_scrape_success(
         &self,
         metadata: &Metadata,
@@ -1545,6 +2339,7 @@ impl Database {
             self.update_metadata(metadata)?;
             self.apply_scraped_tags(metadata.file_id, tags, actors)?;
             self.update_file_status(metadata.file_id, status)?;
+            self.mark_file_organized(metadata.file_id)?;
             self.get_file_tags(metadata.file_id)
         })();
         match outcome {
@@ -1746,6 +2541,76 @@ mod tests {
             params![tag_id],
         )
         .expect("insert filetag");
+    }
+
+    /// Schema v3 形狀 DB（有 Jobs 無 SuspectedDuplicates）
+    fn write_v3_shaped_file_db(path: &Path) {
+        let conn = Connection::open(path).expect("open raw db");
+        conn.execute_batch(
+            "
+            CREATE TABLE Files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phash TEXT,
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE Metadata (
+                file_id INTEGER PRIMARY KEY,
+                title TEXT,
+                studio TEXT,
+                release_date TEXT,
+                summary TEXT,
+                cover_image TEXT,
+                sprite_sheet_path TEXT,
+                source_type TEXT,
+                FOREIGN KEY(file_id) REFERENCES Files(id)
+            );
+            CREATE TABLE Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
+            );
+            CREATE UNIQUE INDEX idx_tags_name_ifnull_category
+                ON Tags (name, IFNULL(category, ''));
+            CREATE TABLE FileTags (
+                file_id INTEGER,
+                tag_id INTEGER,
+                confidence FLOAT DEFAULT 1.0,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            );
+            CREATE TABLE ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
+            );
+            CREATE TABLE Jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL CHECK (
+                    status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+                ),
+                type TEXT NOT NULL CHECK (type IN ('pipeline', 'phash')),
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                error TEXT,
+                retryable INTEGER NOT NULL DEFAULT 1 CHECK (retryable IN (0, 1)),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO Files (id, path, size) VALUES (1, '/tmp/v3-upgrade.mp4', 10);
+            PRAGMA user_version = 3;
+            ",
+        )
+        .expect("seed v3 shaped db");
     }
 
     /// Schema v2 形狀 DB（有 nullsafe Tags 索引 無 Jobs 表）
@@ -3257,6 +4122,7 @@ mod tests {
             },
             metadata: None,
             tags: Vec::new(),
+            suspected_duplicate: None,
         };
         let value = serde_json::to_value(&payload).expect("serialize");
         assert!(value.get("file").is_some(), "expected nested file object");
@@ -3482,6 +4348,162 @@ mod tests {
             "fresh db should have nullsafe unique index"
         );
         assert_eq!(foreign_keys_enabled(&db), 1);
+    }
+
+    /// Mid-PR v5 DBs (364c6cb / 22dd37f / 01eb0f8) stamped user_version=5 without
+    /// Files.organized_at — opening through Database::new must repair.
+    fn write_v5_without_organized_at(path: &Path) {
+        let conn = Connection::open(path).expect("open raw db");
+        conn.execute_batch(
+            "
+            CREATE TABLE Files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phash TEXT,
+                status TEXT DEFAULT 'ready'
+            );
+            CREATE TABLE Metadata (
+                file_id INTEGER PRIMARY KEY,
+                title TEXT,
+                studio TEXT,
+                release_date TEXT,
+                summary TEXT,
+                cover_image TEXT,
+                sprite_sheet_path TEXT,
+                source_type TEXT,
+                FOREIGN KEY(file_id) REFERENCES Files(id)
+            );
+            CREATE TABLE Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT,
+                UNIQUE(name, category)
+            );
+            CREATE UNIQUE INDEX idx_tags_name_ifnull_category
+                ON Tags (name, IFNULL(category, ''));
+            CREATE TABLE FileTags (
+                file_id INTEGER,
+                tag_id INTEGER,
+                confidence FLOAT DEFAULT 1.0,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            );
+            CREATE TABLE ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
+            );
+            CREATE TABLE Jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL CHECK (
+                    status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+                ),
+                type TEXT NOT NULL CHECK (type IN ('pipeline', 'phash')),
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                error TEXT,
+                retryable INTEGER NOT NULL DEFAULT 1 CHECK (retryable IN (0, 1)),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE SuspectedDuplicates (
+                file_id INTEGER PRIMARY KEY,
+                keeper_id INTEGER NOT NULL,
+                distance INTEGER NOT NULL CHECK (distance BETWEEN 0 AND 64),
+                resolution TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (resolution IN ('pending', 'confirmed', 'ignored')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(keeper_id) REFERENCES Files(id)
+            );
+            CREATE TABLE DuplicateTombstones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                phash TEXT,
+                keeper_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO Files (id, path, size) VALUES (1, '/tmp/v5-no-org.mp4', 10);
+            PRAGMA user_version = 5;
+            ",
+        )
+        .expect("seed v5 without organized_at");
+    }
+
+    fn files_has_column(db: &Database, name: &str) -> bool {
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA table_info(Files)")
+            .expect("table_info");
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("cols");
+        for c in cols {
+            if c.expect("col") == name {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn v5_without_organized_at_is_repaired_on_open() {
+        let path = temp_db_path("v5-no-organized-at");
+        write_v5_without_organized_at(&path);
+        assert_eq!(raw_user_version(&path), 5);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let mut stmt = conn.prepare("PRAGMA table_info(Files)").expect("info");
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get(1))
+                .expect("map")
+                .map(|r| r.expect("row"))
+                .collect();
+            assert!(
+                !cols.iter().any(|c| c == "organized_at"),
+                "precondition: column must be absent"
+            );
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("open repair");
+        assert_eq!(db.get_user_version().expect("uv"), 5);
+        assert!(
+            files_has_column(&db, "organized_at"),
+            "ensure_v5_columns must ADD organized_at on already-v5 DBs"
+        );
+
+        let tags = db
+            .persist_scrape_success(
+                &Metadata {
+                    file_id: 1,
+                    title: Some("repaired".into()),
+                    studio: None,
+                    release_date: None,
+                    summary: None,
+                    cover_image: None,
+                    sprite_sheet_path: None,
+                    source_type: Some("test".into()),
+                },
+                &["TagA".to_string()],
+                &[],
+                file_status::ready,
+            )
+            .expect("persist_scrape_success must succeed after repair");
+        assert_eq!(tags.len(), 1);
+        assert!(
+            db.is_organized_file(1).expect("organized"),
+            "scrape success marks organized_at"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -3772,11 +4794,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_creates_jobs_table_at_v3() {
+    fn fresh_db_creates_jobs_and_suspected_tables_at_current_version() {
         let db = open_memory_db();
         assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
-        assert_eq!(SCHEMA_USER_VERSION, 3);
+        assert_eq!(SCHEMA_USER_VERSION, 5);
         assert!(db.jobs_table_exists().expect("Jobs exists"));
+        assert!(db
+            .suspected_duplicates_table_exists()
+            .expect("SuspectedDuplicates exists"));
         let sql: String = db
             .conn
             .query_row(
@@ -3791,8 +4816,8 @@ mod tests {
     }
 
     #[test]
-    fn v2_db_upgrades_to_v3_with_jobs_table() {
-        let path = temp_db_path("v2-to-v3-jobs");
+    fn v2_db_upgrades_to_current_with_jobs_and_suspected_tables() {
+        let path = temp_db_path("v2-to-v4-jobs");
         write_v2_shaped_file_db(&path);
         assert_eq!(raw_user_version(&path), 2);
         {
@@ -3808,8 +4833,14 @@ mod tests {
         }
 
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 3);
+        assert_eq!(
+            db.get_user_version().expect("uv"),
+            SCHEMA_USER_VERSION
+        );
         assert!(db.jobs_table_exists().expect("Jobs"));
+        assert!(db
+            .suspected_duplicates_table_exists()
+            .expect("SuspectedDuplicates"));
         let file = db.get_file_by_id(1).expect("preserve file");
         assert_eq!(file.path, "/tmp/v2-upgrade.mp4");
 
@@ -3831,15 +4862,265 @@ mod tests {
     }
 
     #[test]
-    fn jobs_migration_is_idempotent_on_reopen() {
-        let path = temp_db_path("jobs-idempotent");
+    fn jobs_and_suspected_migration_is_idempotent_on_reopen() {
+        let path = temp_db_path("jobs-suspected-idempotent");
         write_v2_shaped_file_db(&path);
         let first = Database::new(path.to_str().expect("utf8")).expect("first");
-        assert_eq!(first.get_user_version().expect("v"), 3);
+        assert_eq!(
+            first.get_user_version().expect("v"),
+            SCHEMA_USER_VERSION
+        );
         drop(first);
         let second = Database::new(path.to_str().expect("utf8")).expect("second");
-        assert_eq!(second.get_user_version().expect("v"), 3);
+        assert_eq!(
+            second.get_user_version().expect("v"),
+            SCHEMA_USER_VERSION
+        );
         assert!(second.jobs_table_exists().expect("Jobs"));
+        assert!(second
+            .suspected_duplicates_table_exists()
+            .expect("SuspectedDuplicates"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v3_db_upgrades_to_current_with_suspected_and_tombstones() {
+        let path = temp_db_path("v3-to-current-suspected");
+        write_v3_shaped_file_db(&path);
+        assert_eq!(raw_user_version(&path), 3);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'SuspectedDuplicates'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(n, 0, "v3 fixture must not have SuspectedDuplicates");
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
+        assert!(db
+            .suspected_duplicates_table_exists()
+            .expect("SuspectedDuplicates"));
+        let file = db.get_file_by_id(1).expect("preserve file");
+        assert_eq!(file.path, "/tmp/v3-upgrade.mp4");
+
+        let keeper = db
+            .insert_file("/tmp/v3-keeper.mp4", 2, Some("0000000000000000".into()))
+            .expect("keeper");
+        let candidate = db
+            .insert_file("/tmp/v3-candidate.mp4", 3, Some("0000000000000003".into()))
+            .expect("candidate");
+        db.upsert_suspected_duplicate(candidate, keeper, 2)
+            .expect("upsert suspicion");
+        let row = db
+            .get_pending_suspected_duplicate(candidate)
+            .expect("get")
+            .expect("pending");
+        assert_eq!(row.keeper_id, keeper);
+        assert_eq!(row.distance, 2);
+
+        let sql: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'SuspectedDuplicates'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sql");
+        assert!(
+            sql.contains("distance BETWEEN 0 AND 64"),
+            "distance CHECK missing: {sql}"
+        );
+        assert!(db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'DuplicateTombstones'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("tombstones")
+            > 0);
+
+        let far = db
+            .insert_file("/tmp/v3-far.mp4", 4, None)
+            .expect("far");
+        let err = db
+            .conn
+            .execute(
+                "INSERT INTO SuspectedDuplicates (file_id, keeper_id, distance, resolution)
+                 VALUES (?1, ?2, 99, 'pending')",
+                params![far, keeper],
+            )
+            .expect_err("distance 99 must fail CHECK");
+        assert!(
+            err.to_string().to_lowercase().contains("check")
+                || err.to_string().contains("constraint"),
+            "err={err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn write_v4_without_tombstones(path: &Path) {
+        write_v3_shaped_file_db(path);
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "
+            CREATE TABLE SuspectedDuplicates (
+                file_id INTEGER PRIMARY KEY,
+                keeper_id INTEGER NOT NULL,
+                distance INTEGER NOT NULL
+                    CHECK (distance BETWEEN 0 AND 64),
+                resolution TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (resolution IN ('pending', 'confirmed', 'ignored')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(keeper_id) REFERENCES Files(id)
+            );
+            PRAGMA user_version = 4;
+            ",
+        )
+        .expect("v4 without tombstones");
+    }
+
+    fn write_v4_tombstones_without_size(path: &Path) {
+        // Schema as on 7e72e54: DuplicateTombstones inside v4, no `size` column
+        // (and with legacy keeper_phash).
+        write_v4_without_tombstones(path);
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "
+            CREATE TABLE DuplicateTombstones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                phash TEXT,
+                keeper_id INTEGER,
+                keeper_phash TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX idx_duplicate_tombstones_phash ON DuplicateTombstones(phash);
+            INSERT INTO DuplicateTombstones (path, phash, keeper_id, keeper_phash)
+            VALUES ('/tmp/legacy-tomb.mp4', 'abcd', 1, 'keeperhash');
+            PRAGMA user_version = 4;
+            ",
+        )
+        .expect("v4 premature tombstones");
+    }
+
+    #[test]
+    fn v4_premature_tombstones_without_size_alters_on_v5() {
+        let path = temp_db_path("v4-tomb-no-size-to-v5");
+        write_v4_tombstones_without_size(&path);
+        assert_eq!(raw_user_version(&path), 4);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(DuplicateTombstones)")
+                .expect("info");
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get(1))
+                .expect("rows")
+                .collect::<Result<_, _>>()
+                .expect("cols");
+            assert!(!cols.iter().any(|c| c == "size"), "fixture must lack size");
+            assert!(cols.iter().any(|c| c == "keeper_phash"));
+        }
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), 5);
+        let mut stmt = db
+            .conn
+            .prepare("PRAGMA table_info(DuplicateTombstones)")
+            .expect("info");
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get(1))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("cols");
+        assert!(cols.iter().any(|c| c == "size"), "v5 must ADD COLUMN size");
+        let list = db.list_duplicate_tombstones().expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].path, "/tmp/legacy-tomb.mp4");
+        assert_eq!(list[0].size, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v4_db_without_tombstones_upgrades_to_v5() {
+        let path = temp_db_path("v4-to-v5-tombstones");
+        write_v4_without_tombstones(&path);
+        assert_eq!(raw_user_version(&path), 4);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'DuplicateTombstones'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(n, 0, "v4 fixture must lack DuplicateTombstones");
+        }
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), 5);
+        assert!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'DuplicateTombstones'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("tombstones")
+                > 0
+        );
+        db.insert_duplicate_tombstone("/tmp/tomb.mp4", 42, Some("aabb"), Some(1))
+            .expect("insert tombstone");
+        let list = db.list_duplicate_tombstones().expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].size, Some(42));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_5_failure_rolls_back_user_version() {
+        // Real failure mode: CREATE VIEW DuplicateTombstones poisons the name so
+        // CREATE TABLE IF NOT EXISTS is a no-op, then CREATE INDEX fails with
+        // "views may not be indexed" / similar — assert message mentions index|view.
+        let path = temp_db_path("v4-mig5-rollback");
+        write_v4_without_tombstones(&path);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute_batch("CREATE VIEW DuplicateTombstones AS SELECT 1 AS id;")
+                .expect("poison view");
+        }
+        match Database::new(path.to_str().expect("utf8")) {
+            Ok(_) => panic!("mig should fail when DuplicateTombstones name is a view"),
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("index") || msg.contains("view"),
+                    "expected index/view error, got {msg}"
+                );
+            }
+        }
+        assert_eq!(raw_user_version(&path), 4, "failed mig must not bump version");
+        let conn = Connection::open(&path).expect("reopen");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'DuplicateTombstones'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 0, "failed mig must not leave DuplicateTombstones table");
         let _ = std::fs::remove_file(&path);
     }
 

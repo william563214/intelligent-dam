@@ -7,6 +7,7 @@ describe("fileStatus", () => {
     expect(status_label("ready")).toBe("就緒");
     expect(status_label("scrape_failed")).toBe("刮削失敗");
     expect(status_label("missing")).toBe("檔案缺失");
+    expect(status_label("suspected_duplicate")).toBe("疑似重複");
   });
 
   it("falls back for unknown status", () => {
@@ -18,5 +19,6 @@ describe("fileStatus", () => {
     expect(status_badge_class("scrape_failed")).toContain("red");
     expect(status_badge_class("missing")).toContain("gray");
     expect(status_badge_class("processing")).toContain("amber");
+    expect(status_badge_class("suspected_duplicate")).toContain("orange");
   });
 });

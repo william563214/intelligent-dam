@@ -279,14 +279,37 @@ pub fn run_for_file(
         aborted: false,
     };
 
+    // Near-phash suspected duplicates must not auto-run scrape/move/preview
+    if let Ok(status) = current_status(db, file_id) {
+        if status == file_status::suspected_duplicate {
+            eprintln!(
+                "pipeline: soft-skip suspected_duplicate file_id {}",
+                file_id
+            );
+            let path = current_path(db, file_id).unwrap_or_default();
+            emit_progress(
+                app,
+                PipelineProgressEvent {
+                    file_id,
+                    path,
+                    step: "pipeline".to_string(),
+                    status: "skipped".to_string(),
+                    message: Some("skipped: suspected_duplicate (awaiting confirm/ignore)".to_string()),
+                    new_path: None,
+                },
+            );
+            return result;
+        }
+    }
+
     let initial_path = match current_path(db, file_id) {
         Ok(p) => p,
         Err(e) => {
-            // Phash near-dedup may have removed the provisional row before pipeline runs
+            // Exact phash dedup may have removed the provisional row before pipeline runs
             let msg = e.to_string();
             if msg.contains("not found") || msg.contains("QueryReturnedNoRows") {
                 eprintln!(
-                    "pipeline: soft-skip missing file_id {} (likely phash dedup): {}",
+                    "pipeline: soft-skip missing file_id {} (likely exact phash dedup): {}",
                     file_id, msg
                 );
                 emit_progress(
@@ -296,7 +319,7 @@ pub fn run_for_file(
                         path: String::new(),
                         step: "pipeline".to_string(),
                         status: "skipped".to_string(),
-                        message: Some("skipped: file removed (phash near-duplicate)".to_string()),
+                        message: Some("skipped: file removed (exact phash duplicate)".to_string()),
                         new_path: None,
                     },
                 );
@@ -771,7 +794,11 @@ fn step_move(
         } else {
             guard
                 .update_file_path(file_id, &new_path_str)
-                .map_err(|e| anyhow::anyhow!("Failed to update Files.path: {}", e))
+                .map_err(|e| anyhow::anyhow!("Failed to update Files.path: {}", e))?;
+            // Move success = organized (durable; survives Jobs prune)
+            guard
+                .mark_file_organized(file_id)
+                .map_err(|e| anyhow::anyhow!("Failed to mark organized_at: {}", e))
         }
     };
 
