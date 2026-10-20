@@ -469,8 +469,7 @@ fn normalize_db_path_windows(path: &str) -> String {
     }
 
     // Collapse repeated `\` while preserving a UNC prefix `\\`
-    if s.starts_with("\\\\") {
-        let rest = &s[2..];
+    if let Some(rest) = s.strip_prefix("\\\\") {
         format!("\\\\{}", collapse_separator(rest, '\\'))
     } else {
         collapse_separator(&s, '\\')
