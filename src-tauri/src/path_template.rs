@@ -535,6 +535,13 @@ pub fn move_file_overwrite_via_copy(
     move_file_overwrite_inner(source, dest, true)
 }
 
+fn bak_path_hint(backup: Option<&Path>) -> String {
+    match backup {
+        Some(p) => p.display().to_string(),
+        None => "(no bak)".to_string(),
+    }
+}
+
 /// Restore files after a failed DB commit following overwrite
 pub fn restore_overwrite_files(
     source: &Path,
@@ -543,13 +550,14 @@ pub fn restore_overwrite_files(
 ) -> Result<()> {
     // Prefer moving dest (new content) back to source when source is gone
     if !source.exists() && dest.exists() && !is_same_file_identity(source, dest) {
-        if let Err(e) = fs::rename(dest, source) {
+        if let Err(rename_err) = fs::rename(dest, source) {
             // Cross-volume fallback
-            fs::copy(dest, source).with_context(|| {
-                format!(
-                    "Failed to restore source from dest (rename {e}; copy failed)"
-                )
-            })?;
+            if let Err(copy_err) = fs::copy(dest, source) {
+                anyhow::bail!(
+                    "Failed to restore source from dest (rename {rename_err}; copy failed: {copy_err}); occupant backup at {}",
+                    bak_path_hint(backup)
+                );
+            }
             let _ = fs::remove_file(dest);
         }
     }
@@ -560,9 +568,10 @@ pub fn restore_overwrite_files(
             }
             fs::rename(bak, dest).with_context(|| {
                 format!(
-                    "Failed to restore backup {} → {}",
+                    "Failed to restore backup {} → {} (occupant backup at {})",
                     bak.display(),
-                    dest.display()
+                    dest.display(),
+                    bak.display()
                 )
             })?;
         }
@@ -656,16 +665,13 @@ fn move_file_overwrite_inner(
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    if overwrite_fault::should_fail_after_backup() {
-        if let Err(rb) = restore_overwrite_after_fs_error(source, dest, backup.as_deref()) {
-            return Err(anyhow::anyhow!(
-                "injected overwrite failure after backup; restore also failed: {rb:#}"
-            ));
-        }
-        anyhow::bail!("injected overwrite failure after backup");
-    }
+    let inject_move_fail = overwrite_fault::should_fail_after_backup();
+    #[cfg(not(any(test, feature = "test-support")))]
+    let inject_move_fail = false;
 
-    let move_result = if force_copy {
+    let move_result = if inject_move_fail {
+        Err(anyhow::anyhow!("injected overwrite failure after backup"))
+    } else if force_copy {
         copy_sync_rename_then_remove(source, dest)
     } else {
         match fs::rename(source, dest) {
@@ -675,8 +681,20 @@ fn move_file_overwrite_inner(
     };
 
     if let Err(e) = move_result {
-        let _ = restore_overwrite_after_fs_error(source, dest, backup.as_deref());
-        return Err(e);
+        match restore_overwrite_after_fs_error(source, dest, backup.as_deref()) {
+            Ok(()) => return Err(e),
+            Err(rb) => {
+                // Combined error like the injected-fail path: include bak so callers
+                // (commands) can surface it and write ErrorLog
+                let bak_hint = bak_path_hint(backup.as_deref());
+                let message = format!(
+                    "overwrite failed and restore also failed; occupant may remain at {bak_hint}"
+                );
+                let detail = format!("{rb:#}");
+                eprintln!("path_template: {message}; restore: {detail}");
+                return Err(e).context(format!("{message}; restore: {detail}"));
+            }
+        }
     }
 
     Ok(OverwriteMoveResult {
@@ -690,6 +708,13 @@ fn restore_overwrite_after_fs_error(
     dest: &Path,
     backup: Option<&Path>,
 ) -> Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    if overwrite_fault::should_fail_restore() {
+        anyhow::bail!(
+            "injected restore failure; occupant backup at {}",
+            bak_path_hint(backup)
+        );
+    }
     // Clean partial dest / temp leftovers then put backup back
     if dest.exists() {
         let _ = fs::remove_file(dest);
@@ -698,9 +723,10 @@ fn restore_overwrite_after_fs_error(
         if bak.exists() {
             fs::rename(bak, dest).with_context(|| {
                 format!(
-                    "Failed to restore backup {} → {}",
+                    "Failed to restore backup {} → {} (occupant backup at {})",
                     bak.display(),
-                    dest.display()
+                    dest.display(),
+                    bak.display()
                 )
             })?;
         }
@@ -818,18 +844,36 @@ pub mod overwrite_fault {
     thread_local! {
         #[allow(non_upper_case_globals)]
         static fail_after_backup: Cell<bool> = const { Cell::new(false) };
+        #[allow(non_upper_case_globals)]
+        static fail_restore: Cell<bool> = const { Cell::new(false) };
     }
 
     pub fn arm_fail_after_backup() {
         fail_after_backup.with(|f| f.set(true));
     }
 
+    pub fn arm_fail_restore() {
+        fail_restore.with(|f| f.set(true));
+    }
+
     pub fn clear() {
         fail_after_backup.with(|f| f.set(false));
+        fail_restore.with(|f| f.set(false));
     }
 
     pub fn should_fail_after_backup() -> bool {
         fail_after_backup.with(|f| {
+            if f.get() {
+                f.set(false);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn should_fail_restore() -> bool {
+        fail_restore.with(|f| {
             if f.get() {
                 f.set(false);
                 true
@@ -1194,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn move_file_overwrite_same_file_identity_is_case_only() {
+    fn move_file_overwrite_same_file_identity_skips_backup() {
         let dir = unique_temp_dir("ovw_same");
         let src = dir.join("clip.mp4");
         let link = dir.join("clip-link.mp4");
@@ -1204,9 +1248,77 @@ mod tests {
         let outcome = move_file_overwrite(&src, &link).expect("same-file overwrite");
         assert!(outcome.case_only);
         assert!(outcome.backup.is_none());
-        assert!(link.exists() || src.exists());
-        let path = if link.exists() { &link } else { &src };
-        assert_eq!(fs::read(path).unwrap(), b"same-bytes");
+        // Dest must keep the bytes no bak leftover (hard-link rename is not case-fold)
+        assert!(link.exists(), "dest path must remain after same-identity rename");
+        assert_eq!(fs::read(&link).unwrap(), b"same-bytes");
+        assert!(
+            !dir.join("clip.mp4.idam-bak").exists()
+                && !dir.join("clip-link.mp4.idam-bak").exists(),
+            "same-identity path must not create .idam-bak"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Real case-fold overwrite on case-insensitive volumes (Windows CI / macOS default)
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn move_file_overwrite_case_only_clip_to_clip_preserves_content() {
+        let dir = unique_temp_dir("ovw_case");
+        let src = dir.join("clip.mp4");
+        let dest = dir.join("Clip.mp4");
+        fs::write(&src, b"case-bytes").unwrap();
+        assert!(
+            is_same_file_identity(&src, &dest),
+            "expected case-insensitive FS so clip.mp4 and Clip.mp4 are one file"
+        );
+        let outcome = move_file_overwrite(&src, &dest).expect("case-only overwrite");
+        assert!(outcome.case_only);
+        assert!(outcome.backup.is_none());
+        assert!(dest.exists(), "Clip.mp4 must exist after case-only rename");
+        assert_eq!(fs::read(&dest).unwrap(), b"case-bytes");
+        assert!(
+            !dir.join("clip.mp4.idam-bak").exists()
+                && !dir.join("Clip.mp4.idam-bak").exists(),
+            "case-only rename must not leave .idam-bak"
+        );
+        let leftover_bak = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".idam-bak")
+            });
+        assert!(!leftover_bak, "no .idam-bak residue in directory");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_file_overwrite_restore_failure_includes_bak_path() {
+        let dir = unique_temp_dir("ovw_rb_fail");
+        let src = dir.join("new.mp4");
+        let dest = dir.join("old.mp4");
+        fs::write(&src, b"new-bytes").unwrap();
+        fs::write(&dest, b"old-bytes").unwrap();
+        overwrite_fault::arm_fail_after_backup();
+        overwrite_fault::arm_fail_restore();
+        let err = move_file_overwrite(&src, &dest).expect_err("injected double fail");
+        overwrite_fault::clear();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("idam-bak") || msg.contains("occupant"),
+            "combined error must mention bak path: {msg}"
+        );
+        assert!(
+            msg.contains("restore"),
+            "combined error must mention restore failure: {msg}"
+        );
+        let bak = dir.join("old.mp4.idam-bak");
+        assert!(
+            bak.exists(),
+            "occupant must remain in .idam-bak when restore is injected to fail"
+        );
+        assert_eq!(fs::read(&bak).unwrap(), b"old-bytes");
         let _ = fs::remove_dir_all(&dir);
     }
 

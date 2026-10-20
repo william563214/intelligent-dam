@@ -473,8 +473,29 @@ pub fn resolve_path_collision(
                 supp.suppress(&desired);
             }
             // Filesystem first (backup occupant); no DB writes until commit
-            let outcome = path_template::move_file_overwrite(&source, &desired)
-                .map_err(|e| format!("Failed to overwrite move: {e:#}"))?;
+            let outcome = match path_template::move_file_overwrite(&source, &desired) {
+                Ok(o) => o,
+                Err(e) => {
+                    let detail = format!("{e:#}");
+                    let message = format!("Failed to overwrite move: {detail}");
+                    // Occupant may sit in .idam-bak — surface bak path + ErrorLog
+                    if detail.contains("restore also failed") {
+                        let path_for_log = desired.to_str().or_else(|| source.to_str());
+                        if let Ok(guard) = db.lock() {
+                            if let Err(log_err) = guard.insert_error_log(
+                                "path_collision",
+                                Some(file_id),
+                                path_for_log,
+                                &message,
+                                Some(&detail),
+                            ) {
+                                eprintln!("commands: failed to write ErrorLog: {log_err}");
+                            }
+                        }
+                    }
+                    return Err(message);
+                }
+            };
             if let Some(supp) = suppressions.as_ref() {
                 supp.suppress(&desired);
             }
@@ -497,9 +518,32 @@ pub fn resolve_path_collision(
                     &desired,
                     outcome.backup.as_deref(),
                 ) {
-                    return Err(format!(
-                        "Failed to commit overwrite ({e}); file restore also failed: {rb:#}"
-                    ));
+                    let bak_hint = outcome
+                        .backup
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(no bak)".to_string());
+                    let message = format!(
+                        "overwrite commit failed and restore also failed; occupant may remain at {bak_hint}"
+                    );
+                    let detail = format!("{rb:#}");
+                    if let Ok(guard) = db.lock() {
+                        let path_for_log = outcome
+                            .backup
+                            .as_ref()
+                            .and_then(|p| p.to_str())
+                            .or_else(|| desired.to_str());
+                        if let Err(log_err) = guard.insert_error_log(
+                            "path_collision",
+                            Some(file_id),
+                            path_for_log,
+                            &message,
+                            Some(&detail),
+                        ) {
+                            eprintln!("commands: failed to write ErrorLog: {log_err}");
+                        }
+                    }
+                    return Err(format!("{message}; commit: {e}; restore: {detail}"));
                 }
                 return Err(format!("Failed to commit overwrite: {e}"));
             }
