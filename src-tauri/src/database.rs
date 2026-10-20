@@ -1994,9 +1994,12 @@ impl Database {
         expected_old_path: &str,
         new_path: &str,
     ) -> SqliteResult<()> {
+        // #61: all path comparisons go through normalize_db_path (same as overwrite)
+        let expected_old_path = normalize_db_path(expected_old_path);
+        let new_path = normalize_db_path(new_path);
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
-            if let Some(occupant) = self.find_file_occupying_path(new_path, file_id)? {
+            if let Some(occupant) = self.find_file_occupying_path(&new_path, file_id)? {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "destination path owned by another Files row id={} path={}",
                     occupant.id, occupant.path
@@ -2004,7 +2007,7 @@ impl Database {
             }
 
             let current = self.get_file_by_id(file_id)?;
-            if current.path != expected_old_path {
+            if normalize_db_path(&current.path) != expected_old_path {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "Files.path changed during move heal (expected {expected_old_path} got {})",
                     current.path

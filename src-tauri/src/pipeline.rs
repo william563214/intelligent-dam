@@ -1834,6 +1834,7 @@ mod tests {
         let file_id = db
             .insert_file(src.to_str().unwrap(), payload.len() as u64, None)
             .expect("insert");
+        let old_path = db.get_file_by_id(file_id).unwrap().path;
         db.update_metadata(&Metadata {
             file_id,
             title: Some("Demo".to_string()),
@@ -1850,29 +1851,16 @@ mod tests {
             output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
             ..AppSettings::default()
         };
-        // Must use the same PathBuf string step_move renders (Windows / vs \)
-        let desired = render_output_path(
-            &settings.output_template,
-            &TemplateContext::from_metadata(
-                &src,
-                Some("StudioA"),
-                Some("2024-06-01"),
-                Some("Demo"),
-                None,
-            ),
-            src.parent().unwrap(),
-        )
-        .expect("render");
+        // Native OS separators (#61 / revert 2705a3d rendered-path workaround)
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
         fs::create_dir_all(desired.parent().unwrap()).unwrap();
         fs::rename(&src, &desired).unwrap();
 
-        let desired_str = desired.to_str().unwrap().to_string();
         let occupant = db
-            .insert_file(&desired_str, payload.len() as u64, None)
+            .insert_file(desired.to_str().unwrap(), payload.len() as u64, None)
             .expect("occupant");
         assert_ne!(occupant, file_id);
 
-        let old_path = src.to_str().unwrap().to_string();
         let arc = Arc::new(Mutex::new(db));
         let err = step_move(&arc, file_id, &settings, None).expect_err("occupant");
         assert!(
@@ -1920,18 +1908,8 @@ mod tests {
             output_template: "{{studio}}/{{date}}_{{title}}.{{ext}}".to_string(),
             ..AppSettings::default()
         };
-        let desired = render_output_path(
-            &settings.output_template,
-            &TemplateContext::from_metadata(
-                &src,
-                Some("StudioA"),
-                Some("2024-06-01"),
-                Some("Demo"),
-                None,
-            ),
-            src.parent().unwrap(),
-        )
-        .expect("render");
+        // Native OS separators — same as #61 collision occupant tests
+        let desired = dir.join("StudioA").join("2024-06-01_Demo.mp4");
         fs::create_dir_all(desired.parent().unwrap()).unwrap();
         fs::rename(&src, &desired).unwrap();
 
