@@ -203,17 +203,22 @@ impl Database {
         if version_after >= 5 {
             self.ensure_v5_columns()?;
         }
-        // #61: idempotent repair of mixed path separators (no schema bump)
-        self.repair_mixed_separator_paths()?;
+        // #61: Windows-only idempotent repair of legacy path strings (no schema bump)
+        #[cfg(windows)]
+        {
+            self.repair_mixed_separator_paths()?;
+        }
         Ok(())
     }
 
     /// Normalize existing Files / PathCollisions / DuplicateTombstones path strings.
     ///
-    /// Cheap `EXISTS(path LIKE '%/%')` probe first — no write lock when clean.
-    /// All three tables update in one `BEGIN IMMEDIATE`. If normalizing a Files or
-    /// tombstone path would violate UNIQUE leave the row unchanged and write an
-    /// ErrorLog entry (no auto-merge); skip if the same category+path is already logged.
+    /// Windows only. Read-only probe (`normalize_db_path(path) != path`) first — no
+    /// write lock when clean. All three tables update in one `BEGIN IMMEDIATE`.
+    /// If normalizing a Files or tombstone path would violate UNIQUE leave the row
+    /// unchanged and write an ErrorLog entry (no auto-merge); skip if the same
+    /// category+path is already logged.
+    #[cfg(windows)]
     fn repair_mixed_separator_paths(&self) -> SqliteResult<()> {
         if !self.needs_path_separator_repair()? {
             return Ok(());
@@ -237,31 +242,48 @@ impl Database {
         }
     }
 
-    /// True when any stored path still contains `/` (mixed-separator legacy rows).
+    /// True when any stored path differs from `normalize_db_path` (covers `/`,
+    /// `\\?\`, lowercase drive, and duplicate `\`). Read-only — no write lock.
+    #[cfg(windows)]
     fn needs_path_separator_repair(&self) -> SqliteResult<bool> {
-        if self.select_exists("SELECT EXISTS(SELECT 1 FROM Files WHERE path LIKE '%/%')")? {
+        // Prefer normalize(path) != path over fragile LIKE escaping: covers every
+        // shape the SQL probes would list (forward slash, verbatim, lowercase
+        // drive, doubled `\`) without false positives on clean native paths.
+        if self.path_rows_need_normalize("SELECT path FROM Files")? {
             return Ok(true);
         }
         if self.table_exists("PathCollisions")?
-            && self.select_exists(
-                "SELECT EXISTS(
-                    SELECT 1 FROM PathCollisions
-                    WHERE desired_path LIKE '%/%' OR existing_path LIKE '%/%'
-                )",
+            && self.path_rows_need_normalize(
+                "SELECT desired_path FROM PathCollisions
+                 UNION ALL
+                 SELECT existing_path FROM PathCollisions",
             )?
         {
             return Ok(true);
         }
         if self.table_exists("DuplicateTombstones")?
-            && self.select_exists(
-                "SELECT EXISTS(SELECT 1 FROM DuplicateTombstones WHERE path LIKE '%/%')",
-            )?
+            && self.path_rows_need_normalize("SELECT path FROM DuplicateTombstones")?
         {
             return Ok(true);
         }
         Ok(false)
     }
 
+    /// Definitive probe: any row where normalize changes the stored string.
+    #[cfg(windows)]
+    fn path_rows_need_normalize(&self, sql: &str) -> SqliteResult<bool> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let path: String = row.get(0)?;
+            if normalize_db_path(&path) != path {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(windows)]
     fn has_path_normalize_error_log(&self, path: &str) -> SqliteResult<bool> {
         self.select_exists_params(
             "SELECT EXISTS(
@@ -272,6 +294,7 @@ impl Database {
         )
     }
 
+    #[cfg(windows)]
     fn select_exists_params(
         &self,
         sql: &str,
@@ -281,6 +304,7 @@ impl Database {
         Ok(flag != 0)
     }
 
+    #[cfg(windows)]
     fn repair_files_path_separators(&self) -> SqliteResult<()> {
         let mut stmt = self
             .conn
@@ -324,6 +348,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(windows)]
     fn repair_path_collisions_separators(&self) -> SqliteResult<()> {
         if !self.table_exists("PathCollisions")? {
             return Ok(());
@@ -356,6 +381,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(windows)]
     fn repair_tombstone_path_separators(&self) -> SqliteResult<()> {
         if !self.table_exists("DuplicateTombstones")? {
             return Ok(());
@@ -6140,6 +6166,41 @@ mod tests {
         let row = db.get_file_by_path(native).unwrap().unwrap();
         assert_eq!(row.path, r"C:\lib\StudioA\clip.mp4");
         assert_eq!(row.size, 20);
+    }
+
+    /// Open-time repair must fix lowercase drive; later upsert must hit same row.
+    #[cfg(windows)]
+    #[test]
+    fn open_repairs_lowercase_drive_then_upsert_hits_same_row() {
+        let path = temp_db_path("lowercase-drive-repair");
+        let _ = std::fs::remove_file(&path);
+        {
+            let db = Database::new(path.to_str().expect("utf8")).expect("create");
+            db.conn
+                .execute(
+                    "INSERT INTO Files (path, size, status) VALUES (?1, 1, 'ready')",
+                    params![r"c:\lib\x.mp4"],
+                )
+                .expect("seed lowercase drive");
+            let stored: String = db
+                .conn
+                .query_row("SELECT path FROM Files LIMIT 1", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(stored, r"c:\lib\x.mp4", "precondition: raw SQL keeps lowercase");
+        }
+        let db = Database::new(path.to_str().expect("utf8")).expect("reopen");
+        let row = db
+            .get_file_by_path(r"C:\lib\x.mp4")
+            .expect("get")
+            .expect("row after repair");
+        assert_eq!(row.path, r"C:\lib\x.mp4");
+        let (id2, is_new) = db
+            .upsert_file(r"C:\lib\x.mp4", 9, None)
+            .expect("upsert");
+        assert!(!is_new, "upsert after repair must hit the same row");
+        assert_eq!(id2, row.id);
+        assert_eq!(db.count_files().unwrap(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(windows)]
