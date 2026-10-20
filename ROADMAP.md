@@ -127,6 +127,7 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 #### #34 / #40 後續
 
 - [x] **50. 搬檔中途當機後補寫 DB 路徑** — Issue [#50](https://github.com/william563214/intelligent-dam/issues/50)：來源不在、目的地在且可確認同一檔時 heal `Files.path`（schema 維持 v6；與 #59 的 `.idam-bak`／`.idam-tmp-*` 殘檔互不混淆）
+- [x] **59. #58 follow-ups** — Issue [#59](https://github.com/william563214/intelligent-dam/issues/59)：grapheme truncate、段長 255 bytes、skip 不重進碰撞、suffix 查 DB、去掉 API 冗餘 `existing_path`、occupant 覆寫 ErrorLog、startup 掃描 sidecars、hardlink occupant、N4 覆寫 crash 重啟完成 commit（NOCASE／NFD／尾端分隔／Volume 前綴見 [#63](https://github.com/william563214/intelligent-dam/issues/63)）
 
 
 ### Deferred / Later（第三階段 / Issue #13 — 明確延後，現階段不要開工）

@@ -126,6 +126,46 @@ pub fn run() {
 
             // Arc so Watcher ingest worker can share the same mutex
             let db = Arc::new(Mutex::new(db));
+
+            // #59 S2: scan leftover sidecars off the UI thread (large / network roots)
+            // Only `scan_directories` are walked absolute-template output roots are
+            // not covered (see PR notes). Dedup ErrorLog by category+path+message.
+            {
+                let settings = settings_store.load().unwrap_or_default();
+                let roots = settings.scan_directories.clone();
+                let db_scan = Arc::clone(&db);
+                std::thread::spawn(move || {
+                    let leftovers = path_template::scan_idam_transient_leftovers(&roots);
+                    let Ok(guard) = db_scan.lock() else {
+                        eprintln!("warn: startup sidecar scan could not lock database");
+                        return;
+                    };
+                    for leftover in leftovers {
+                        let path_str = leftover.to_string_lossy().to_string();
+                        let message = "leftover idam sidecar found on startup";
+                        match guard.has_error_log_entry("startup", Some(&path_str), message) {
+                            Ok(true) => continue,
+                            Ok(false) => {}
+                            Err(e) => {
+                                eprintln!("warn: ErrorLog dedupe check failed: {e}");
+                                continue;
+                            }
+                        }
+                        if let Err(log_err) = guard.insert_error_log(
+                            "startup",
+                            None,
+                            Some(&path_str),
+                            message,
+                            Some("scan for .idam-bak / .idam-tmp-* after crash mid-overwrite"),
+                        ) {
+                            eprintln!("warn: ErrorLog for leftover sidecar: {log_err}");
+                        } else {
+                            eprintln!("warn: leftover idam sidecar: {path_str}");
+                        }
+                    }
+                });
+            }
+
             let queue = Arc::new(TaskQueue::new());
             // #34 recover running→queued once after DB init, then resume if work remains
             match queue.bind_database(Arc::clone(&db)) {
