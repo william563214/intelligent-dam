@@ -14,9 +14,11 @@ use regex::Regex;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 use walkdir::WalkDir;
+
+#[cfg(target_os = "macos")]
+use unicode_normalization::UnicodeNormalization;
 
 #[allow(non_upper_case_globals)]
 const unknown_studio: &str = "Unknown";
@@ -542,14 +544,15 @@ pub fn render_output_path(
 ///
 /// Chosen rules (#63) documented for callers and the PR:
 ///
-/// 1. **NFC** — apply Unicode NFC. macOS often stores NFD on disk; SQLite compares
-///    by code points, so NFD/NFC variants of the same path must become one string.
+/// 1. **NFC (macOS only)** — APFS/HFS+ often expose NFD; apply Unicode NFC so the
+///    stored string matches what macOS APIs typically return after normalization.
+///    Linux (ext4) and Windows (NTFS) compare bytes: keep original codepoints so an
+///    on-disk NFD name is not rewritten to a non-existent path. Cross-platform NFC
+///    matching is deferred to a v7 lookup-key column alongside #66.
 /// 2. **Trailing separators** — strip trailing `/` or `\` except roots (`/`, `C:\`,
-///    UNC share root `\\server\share`, volume root `\\?\Volume{…}\`).
+///    volume root `\\?\Volume{…}\`). UNC share roots may drop the trailing sep.
 /// 3. **Case** — do **not** ASCII-fold path components for storage. `Files.path` UNIQUE
 ///    is case-sensitive; Win/macOS occupancy uses `COLLATE NOCASE` (ASCII A–Z only).
-///    That matches SQLite's fold and covers typical ASCII Windows paths; full Windows
-///    Unicode case-insensitivity is intentionally not mirrored in stored strings.
 ///    Drive letters are still uppercased on Windows (`c:\` → `C:\`).
 /// 4. **Windows prefixes** — see [`normalize_windows_extended_prefix`].
 /// 5. **Windows separators** — `/` → `\`, collapse repeated `\`, keep UNC `\\` prefix.
@@ -569,14 +572,18 @@ pub fn normalize_db_path(path: &str) -> String {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn apply_nfc(s: &str) -> String {
     s.nfc().collect()
 }
 
 #[cfg(not(windows))]
 fn normalize_db_path_unix(path: &str) -> String {
-    let nfc = apply_nfc(path);
-    let collapsed = collapse_separator(&nfc, '/');
+    #[cfg(target_os = "macos")]
+    let owned = apply_nfc(path);
+    #[cfg(target_os = "macos")]
+    let path = owned.as_str();
+    let collapsed = collapse_separator(path, '/');
     strip_trailing_separators(&collapsed, '/')
 }
 
@@ -599,8 +606,8 @@ fn normalize_db_path_windows(path: &str) -> String {
     } else {
         collapse_separator(&s, '\\')
     };
-    let trimmed = strip_trailing_separators(&collapsed, '\\');
-    apply_nfc(&trimmed)
+    // No NFC on Windows — NTFS compares bytes; rewriting NFD would orphan rows
+    strip_trailing_separators(&collapsed, '\\')
 }
 
 /// Windows `\\?\` / `\\.\` (also `/` forms):
@@ -2044,23 +2051,35 @@ mod tests {
         );
     }
 
-    /// #63: NFC so macOS NFD names compare equal when stored
+    /// #63: NFC only on macOS; Linux/Windows keep original codepoints
     #[test]
-    fn normalize_db_path_applies_nfc() {
+    fn normalize_db_path_nfc_macos_only_preserves_elsewhere() {
         // é as e + combining acute (NFD) vs precomposed (NFC)
         let nfd = "cafe\u{0301}";
         let nfc = "caf\u{e9}";
         assert_ne!(nfd, nfc, "precondition: NFD != NFC as Rust strings");
         #[cfg(windows)]
-        let (input, expect) = (
-            format!(r"C:\lib\{nfd}\x.mp4"),
-            format!(r"C:\lib\{nfc}\x.mp4"),
-        );
+        let input = format!(r"C:\lib\{nfd}\x.mp4");
         #[cfg(not(windows))]
-        let (input, expect) = (format!("/lib/{nfd}/x.mp4"), format!("/lib/{nfc}/x.mp4"));
-        assert_eq!(normalize_db_path(&input), expect);
-        // Idempotent
-        assert_eq!(normalize_db_path(&expect), expect);
+        let input = format!("/lib/{nfd}/x.mp4");
+        let out = normalize_db_path(&input);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(out, format!("/lib/{nfc}/x.mp4"));
+            assert_eq!(normalize_db_path(&out), out, "NFC idempotent");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(
+                out.contains(nfd),
+                "non-macOS must keep NFD codepoints got {out}"
+            );
+            assert!(
+                !out.contains(nfc) || nfd == nfc,
+                "non-macOS must not NFC-fold got {out}"
+            );
+            assert_eq!(out, normalize_db_path(&out));
+        }
     }
 
     /// #63: reserved device escape puts `_` before the FIRST dot
