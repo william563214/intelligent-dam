@@ -1239,7 +1239,10 @@ mod tests {
         );
         let guard = arc.lock().unwrap();
         let file = guard.get_file_by_id(file_id).unwrap();
-        assert_eq!(file.path, "/tmp/idam-missing-pipeline-xyz.mp4");
+        assert_eq!(
+            file.path,
+            path_template::normalize_db_path("/tmp/idam-missing-pipeline-xyz.mp4")
+        );
         assert_eq!(file.status, file_status::missing);
     }
 
