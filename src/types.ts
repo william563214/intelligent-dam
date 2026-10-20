@@ -33,7 +33,6 @@ export interface SuspectedDuplicateInfo {
 
 export interface PathCollisionInfo {
   desiredPath: string;
-  existingPath: string;
   occupantFileId?: number | null;
 }
 
