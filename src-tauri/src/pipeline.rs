@@ -1015,8 +1015,9 @@ fn heal_move_after_crash(
     Ok(MoveStepOutcome::Moved(desired.to_path_buf()))
 }
 
-/// S3: when pending recorded a source fs id on the same volume, dest must match it
-fn pending_fs_id_allows_commit(
+/// S3: when pending recorded a source fs id on the same volume, dest must match it.
+/// Unreadable / missing dest id → refuse (do not silently skip).
+pub(crate) fn pending_fs_id_allows_commit(
     row: &crate::database::PendingMoveRow,
     dest: &Path,
 ) -> std::result::Result<(), String> {
@@ -2531,6 +2532,47 @@ mod tests {
         let arc = Arc::new(Mutex::new(db));
         let n = recover_pending_moves(&arc).expect("recover");
         assert_eq!(n, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_move_recovery_refuses_size_mismatch() {
+        // B1 deterministic: recover_pending_moves must refuse when dest size ≠ DB size.
+        // (Unlocked growing_file alone does not prove this recovery path.)
+        let dir = unique_temp_dir("pending_size_refuse");
+        let src = dir.join("incoming.mp4");
+        let dest = dir.join("StudioA").join("Demo.mp4");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&src, b"recorded").unwrap(); // 8 bytes in DB
+        fs::write(&dest, b"DIFFERENT-SIZE-PAYLOAD").unwrap();
+        let dest_id = path_template::read_fs_file_id(&dest).unwrap().expect("dest id");
+        let db = open_db();
+        let file_id = db
+            .insert_file(src.to_str().unwrap(), 8, None)
+            .expect("insert");
+        fs::remove_file(&src).unwrap();
+        db.set_pending_move_to(file_id, dest.to_str().unwrap(), Some(dest_id))
+            .expect("pending");
+        let arc = Arc::new(Mutex::new(db));
+        let n = recover_pending_moves(&arc).expect("recover");
+        assert_eq!(n, 0, "must not commit when size mismatches");
+        let guard = arc.lock().unwrap();
+        assert!(
+            guard.get_pending_move_to(file_id).unwrap().is_some(),
+            "pending kept on size refuse"
+        );
+        assert_eq!(
+            Path::new(&guard.get_file_by_id(file_id).unwrap().path),
+            src.as_path(),
+            "path unchanged on refuse"
+        );
+        assert!(
+            guard.list_error_logs(20).unwrap().iter().any(|e| {
+                e.message.contains("size/phash") || e.message.contains("keeping pending")
+            }),
+            "ErrorLog on size mismatch refuse"
+        );
+        drop(guard);
         let _ = fs::remove_dir_all(&dir);
     }
 
