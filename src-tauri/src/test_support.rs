@@ -3,12 +3,17 @@
 //! Gated behind the `test-support` cargo feature (enabled in CI test/clippy).
 
 pub use crate::commands::{
-    add_file_tag, clear_error_logs, clear_file_tags, enqueue_pipeline_jobs, get_all_files,
-    get_error_logs, get_file_tags, get_or_create_tag, get_settings, insert_error_log,
-    list_duplicate_tombstones, preview_output_template, remove_duplicate_tombstone,
+    add_file_tag, clear_error_logs, clear_file_tags, enqueue_pipeline_jobs, execute_batch_organize,
+    get_all_files, get_error_logs, get_file_tags, get_last_undoable_organize_batch,
+    get_or_create_tag, get_settings, insert_error_log, list_duplicate_tombstones,
+    preview_batch_organize, preview_output_template, remove_duplicate_tombstone,
     resolve_path_collision, resolve_suspected_duplicate_with_enqueue, save_settings,
-    scan_directory, scan_multiple_directories, EnqueueResult, PipelineOptionsInput,
-    PreviewTemplateResult, ResolvePathCollisionOutcome, ResolveSuspectedOutcome, ScanResult,
+    scan_directory, scan_multiple_directories, undo_last_organize_batch, EnqueueResult,
+    PipelineOptionsInput, PreviewTemplateResult, ResolvePathCollisionOutcome,
+    ResolveSuspectedOutcome, ScanResult,
+};
+pub use crate::batch_organize::{
+    OrganizeExecuteResult, OrganizePreviewItem, OrganizePreviewResult, OrganizeUndoResult,
 };
 
 /// Convenience wrapper without pipeline enqueue (integration tests).
@@ -22,7 +27,8 @@ pub fn resolve_suspected_duplicate(
 }
 pub use crate::database::{
     current_schema_user_version, path_collision_tx_fault, Database, DuplicateTombstone,
-    ErrorLogEntry, FileWithMetadata, JobRow, Metadata, NewJobRow, PathTombstoneAction, Tag,
+    ErrorLogEntry, FileWithMetadata, JobRow, Metadata, NewJobRow, OrganizeBatch,
+    OrganizeBatchItem, PathTombstoneAction, Tag,
 };
 pub use crate::file_stability::StabilityOptions;
 pub use crate::path_template::{

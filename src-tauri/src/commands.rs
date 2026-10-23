@@ -1690,6 +1690,79 @@ pub fn enqueue_pipeline_jobs(
     })
 }
 
+/// #73: read-only batch organize preview (no filesystem / path DB writes)
+pub fn preview_batch_organize(
+    db: &Arc<Mutex<Database>>,
+    settings: &AppSettings,
+    file_ids: Option<Vec<i64>>,
+) -> Result<crate::batch_organize::OrganizePreviewResult, String> {
+    crate::batch_organize::preview_batch_organize(db, settings, file_ids)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn preview_batch_organize_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
+    file_ids: Option<Vec<i64>>,
+) -> Result<crate::batch_organize::OrganizePreviewResult, String> {
+    let settings = get_settings(&settings_store)?;
+    preview_batch_organize(&db, &settings, file_ids)
+}
+
+/// #73: confirm preview and execute moves into a schema v8 batch log
+pub fn execute_batch_organize(
+    db: &Arc<Mutex<Database>>,
+    settings: &AppSettings,
+    file_ids: Vec<i64>,
+) -> Result<crate::batch_organize::OrganizeExecuteResult, String> {
+    crate::batch_organize::execute_batch_organize(db, settings, file_ids, None)
+        .map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn execute_batch_organize_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+    settings_store: State<'_, Mutex<SettingsStore>>,
+    file_ids: Vec<i64>,
+) -> Result<crate::batch_organize::OrganizeExecuteResult, String> {
+    let settings = get_settings(&settings_store)?;
+    execute_batch_organize(&db, &settings, file_ids)
+}
+
+/// #73: one-click undo of the latest batch that still has moved items
+pub fn undo_last_organize_batch(
+    db: &Arc<Mutex<Database>>,
+) -> Result<crate::batch_organize::OrganizeUndoResult, String> {
+    crate::batch_organize::undo_last_organize_batch(db, None).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+pub fn undo_last_organize_batch_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<crate::batch_organize::OrganizeUndoResult, String> {
+    undo_last_organize_batch(&db)
+}
+
+/// #73: latest undoable batch summary for UI enable/disable
+pub fn get_last_undoable_organize_batch(
+    db: &Arc<Mutex<Database>>,
+) -> Result<Option<crate::database::OrganizeBatch>, String> {
+    let guard = db
+        .lock()
+        .map_err(|e| format!("Database lock error: {}", e))?;
+    guard
+        .latest_undoable_organize_batch()
+        .map_err(|e| format!("Failed to load undoable batch: {}", e))
+}
+
+#[tauri::command]
+pub fn get_last_undoable_organize_batch_command(
+    db: State<'_, Arc<Mutex<Database>>>,
+) -> Result<Option<crate::database::OrganizeBatch>, String> {
+    get_last_undoable_organize_batch(&db)
+}
+
 #[cfg(test)]
 mod path_tests {
     use super::{canonicalize_user_path, normalize_scan_directories};

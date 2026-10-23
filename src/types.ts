@@ -168,6 +168,61 @@ export interface EnqueueResult {
   skipped: number;
 }
 
+/** #73 batch organize preview row */
+export interface OrganizePreviewItem {
+  fileId: number;
+  srcPath: string;
+  dstPath: string;
+  size: number;
+  phash: string | null;
+  /** move | noop | collision | missing | blocked | error */
+  outcome: string;
+  detail: string | null;
+  occupantFileId: number | null;
+}
+
+export interface OrganizePreviewResult {
+  items: OrganizePreviewItem[];
+  moveCount: number;
+  skipCount: number;
+}
+
+export interface OrganizeBatchItem {
+  id: number;
+  batchId: number;
+  fileId: number;
+  srcPath: string;
+  dstPath: string;
+  size: number;
+  phash: string | null;
+  status: string;
+  collision: string | null;
+  error: string | null;
+}
+
+export interface OrganizeBatch {
+  id: number;
+  createdAt: string;
+  status: string;
+  note: string | null;
+}
+
+export interface OrganizeExecuteResult {
+  batchId: number;
+  moved: number;
+  skipped: number;
+  failed: number;
+  items: OrganizeBatchItem[];
+}
+
+export interface OrganizeUndoResult {
+  batchId: number;
+  undone: number;
+  refused: number;
+  batch: OrganizeBatch;
+  items: OrganizeBatchItem[];
+}
+
 export interface ConnectivityCheck {
   ok: boolean;
   message: string;
