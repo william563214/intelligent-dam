@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Intelligent Digital Asset Management System"
 authors = ["liaoweizhe"]
 edition = "2021"
+license = "MIT"
 # 依賴樹最高 rust-version 來自 pest / icu_*（1.83）；rfd 關閉預設特徵後不再拉取 edition 2024 的 wayland-protocols
 rust-version = "1.83"
 
