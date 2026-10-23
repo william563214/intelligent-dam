@@ -16,8 +16,9 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 | **第二階段** 自動化與刮削 ✅ | **Automation core**（items #6–#11）✅ | Watcher、穩定度檢測、pipeline、Handlebars、佇列、去重 |
 | （README／SPEC 未單列） | **UX polish**（#12）✅ | 一鍵整理、批次、錯誤日誌、Settings 選擇器／連線測試 |
 | （發行） | **v0.1.0** ✅ | tag `v0.1.0` @ `6d19ef9`（[#29](https://github.com/william563214/intelligent-dam/pull/29) merge commit）；Linux + Windows 安裝包已上架（見下方） |
-| （README／SPEC 未單列） | **v0.2**（Issues #31–#40） | CI、DB／佇列硬化、整合測試、Watcher／Windows／phash 強化、macOS workflow、Handlebars／碰撞 UI |
-| **第三階段** AI 整合 | **Deferred / Later**（#13） | ONNX / CLIP、語意搜尋、即時轉碼 — **現階段不要開工** |
+| （README／SPEC 未單列） | **v0.2**（Issues #31–#40、#73–#77） | CI、DB／佇列硬化、整合測試、Watcher／Windows／phash 強化、macOS workflow、Handlebars／碰撞 UI |
+| （peach 概念） | **Phase 4**（Issues #78–#87） | 追更／想要清單、番號規則、口味分析、播放牆、字幕、跨站關注、瀏覽器加入、MCP／CLI、遙測、人臉偵測 |
+| **第三階段** AI 整合 | **Deferred / Later**（#13） | ONNX / CLIP、語意搜尋 — **現階段不要開工**（即時轉碼已改列「明確不做」） |
 
 ---
 
@@ -34,7 +35,7 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
   - **Linux**：`.deb`／`.rpm`／`.AppImage`（校驗：`SHA256SUMS`）
   - **Windows**：MSI／NSIS（經 PR [#30](https://github.com/william563214/intelligent-dam/pull/30) `release-windows.yml` 上傳至既有 Release；**未簽章**，安裝時可能觸發 SmartScreen；校驗：`SHA256SUMS-windows.txt`）
   - **macOS**：`release-macos.yml`（Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)）**workflow 已就緒，待首次發佈**（universal `.dmg` + `SHA256SUMS-macos.txt`）。**未簽章／未公證**；若系統擋下 App，請至 **系統設定 → 隱私權與安全性 → 強制打開**，或執行 `xattr -dr com.apple.quarantine "/Applications/Intelligent DAM.app"`（macOS 15+ 右鍵「打開」已無效）
-- **明確延後（第三階段 / #13）**：ONNX / CLIP、語意搜尋、即時轉碼。
+- **明確延後（第三階段 / #13）**：ONNX / CLIP、語意搜尋（即時轉碼見「明確不做」）。
 
 ---
 
@@ -130,11 +131,46 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 - [x] **59. #58 follow-ups** — Issue [#59](https://github.com/william563214/intelligent-dam/issues/59)：grapheme truncate、段長 255 bytes、skip 不重進碰撞、suffix 查 DB、去掉 API 冗餘 `existing_path`、occupant 覆寫 ErrorLog、startup 掃描 sidecars、hardlink occupant、N4 覆寫 crash 重啟完成 commit（NOCASE／NFD／尾端分隔／Volume 前綴見 [#63](https://github.com/william563214/intelligent-dam/issues/63)）
 
 
+#### 整理安全與搜尋（peach 概念，#73–#77）
+
+> **參考來源與授權限制**：v0.2 新增項（#73–#77）與 Phase 4 各項借鏡 [peach-mitao/peach](https://github.com/peach-mitao/peach)（AGPL-3.0）。**只參考概念，不得複製其程式碼，以 Rust 自行重寫**；PR 審查時需確認無 AGPL 程式碼混入。
+
+- [ ] **73. 整批整理預覽／確認／一鍵還原** — Issue [#73](https://github.com/william563214/intelligent-dam/issues/73)：schema v8 批次 log，基於 #69 `pending_move_to`
+- [ ] **74. 消失檔案兩段式對帳** — Issue [#74](https://github.com/william563214/intelligent-dam/issues/74)：唯讀檢查→確認後清理；清孤兒 sprite／VTT；有個人資料的列標「已消失」保留，再出現自動接回；可一併處理 [#72](https://github.com/william563214/intelligent-dam/issues/72)
+- [ ] **75. 縮圖前檢查磁碟空間＋抽幀密度檔位** — Issue [#75](https://github.com/william563214/intelligent-dam/issues/75)
+- [ ] **76. FTS5 trigram 全文搜尋** — Issue [#76](https://github.com/william563214/intelligent-dam/issues/76)：短查詢（<3 字元）退回 `LIKE`
+- [ ] **77. NFO 只補空欄位＋接手已有收藏** — Issue [#77](https://github.com/william563214/intelligent-dam/issues/77)：覆蓋既有值需複核、手動欄位不被覆蓋；先寫 ADR
+
+### Phase 4（Issues #78–#87）
+
+> **參考來源與授權限制**：v0.2 新增項（#73–#77）與 Phase 4 各項借鏡 [peach-mitao/peach](https://github.com/peach-mitao/peach)（AGPL-3.0）。**只參考概念，不得複製其程式碼，以 Rust 自行重寫**；PR 審查時需確認無 AGPL 程式碼混入。
+
+建議順序：**追更第一**、人臉偵測最後。
+
+- [ ] **78. 追更＋想要清單**（優先第一）— Issue [#78](https://github.com/william563214/intelligent-dam/issues/78)：追蹤創作者／系列／女優，定期刮外站列新作，只通知不下載；**只抓公開頁面、不代登入、不用 cookie、請求頻率限制**；來源可插拔、站台改版可降級；想要清單表
+- [ ] **80. 番號規則（正則＋設定檔）** — Issue [#80](https://github.com/william563214/intelligent-dam/issues/80)：#83／#85／#86 的前置
+- [ ] **79. 本機口味分析** — Issue [#79](https://github.com/william563214/intelligent-dam/issues/79)：只用本機觀看與評分紀錄
+- [ ] **86. 瀏覽器一鍵加入** — Issue [#86](https://github.com/william563214/intelligent-dam/issues/86)：擴充或 `idam://`，只加進想要清單、不下載（依賴 #78、#80）
+- [ ] **85. 跨站關注** — Issue [#85](https://github.com/william563214/intelligent-dam/issues/85)：只彙整使用者提供的 RSS／網址，同作品合一卡；不代登入、不用 cookie
+- [ ] **83. 播放牆挑片** — Issue [#83](https://github.com/william563214/intelligent-dam/issues/83)：全螢幕可拖動封面牆、原位播放、版本／分卷切換（前置 #80）
+- [ ] **84. 播放器字幕** — Issue [#84](https://github.com/william563214/intelligent-dam/issues/84)：本地 SRT／ASS、樣式可調；SubtitleCat 為可關閉外掛來源並標示可能機翻
+- [ ] **87. MCP 與 CLI 操控** — Issue [#87](https://github.com/william563214/intelligent-dam/issues/87)：`idam-core` → CLI／MCP（stdio、僅本機）；設計見 [ADR 0001](./docs/adr/0001-mcp-cli.md)（Proposed，並行方案待威廉決定）
+- [ ] **81. Sentry 遙測** — Issue [#81](https://github.com/william563214/intelligent-dam/issues/81)：預設關閉、自選開啟、遮蔽檔案路徑
+- [ ] **82. 人臉偵測（ONNX）**（排最後）— Issue [#82](https://github.com/william563214/intelligent-dam/issues/82)：需先確認模型授權；與 #13 協調
+
+> 播放牆（#83）與字幕（#84）放 Phase 4 而非 v0.2：兩者都是新增 UI 功能而非既有流程的安全／正確性修補，且 #83 依賴 #80 番號規則、#84 含外部來源外掛，規模超出 v0.2「小到中」範圍。
+
+### 明確不做 (Out of scope)
+
+- 手機與 Web 存取（MCP 也僅 stdio 本機，不開網路埠）
+- 即時轉碼
+- 網盤與磁力下載（追更／想要清單／瀏覽器加入都只記錄與通知，不下載）
+
 ### Deferred / Later（第三階段 / Issue #13 — 明確延後，現階段不要開工）
 
 - [ ] ONNX Runtime + CLIP
 - [ ] 語意搜尋／向量（sqlite-vss 等）
-- [ ] 即時轉碼（例如 H.265 → H.264 串流）
+- [ ] ~~即時轉碼（例如 H.265 → H.264 串流）~~ — 已改列「明確不做」
 
 追蹤：Issue [#13](https://github.com/william563214/intelligent-dam/issues/13)。
 
