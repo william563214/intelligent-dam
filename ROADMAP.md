@@ -18,7 +18,7 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
 | （發行） | **v0.1.0** ✅ | tag `v0.1.0` @ `6d19ef9`（[#29](https://github.com/william563214/intelligent-dam/pull/29) merge commit）；Linux + Windows 安裝包已上架（見下方） |
 | （README／SPEC 未單列） | **v0.2**（Issues #31–#40、#73–#77） | CI、DB／佇列硬化、整合測試、Watcher／Windows／phash 強化、macOS workflow、Handlebars／碰撞 UI |
 | （peach 概念） | **Phase 4**（Issues #78–#87） | 追更／想要清單、番號規則、口味分析、播放牆、字幕、跨站關注、瀏覽器加入、MCP／CLI、遙測、人臉偵測 |
-| **第三階段** AI 整合 | **Deferred / Later**（#13） | ONNX / CLIP、語意搜尋、即時轉碼 — **現階段不要開工** |
+| **第三階段** AI 整合 | **Deferred / Later**（#13） | ONNX / CLIP、語意搜尋 — **現階段不要開工**（即時轉碼已改列「明確不做」） |
 
 ---
 
@@ -35,7 +35,7 @@ SPECIFICATION / README 使用「第 N 階段」；本檔的 wrap-up / automation
   - **Linux**：`.deb`／`.rpm`／`.AppImage`（校驗：`SHA256SUMS`）
   - **Windows**：MSI／NSIS（經 PR [#30](https://github.com/william563214/intelligent-dam/pull/30) `release-windows.yml` 上傳至既有 Release；**未簽章**，安裝時可能觸發 SmartScreen；校驗：`SHA256SUMS-windows.txt`）
   - **macOS**：`release-macos.yml`（Issue [#39](https://github.com/william563214/intelligent-dam/issues/39)）**workflow 已就緒，待首次發佈**（universal `.dmg` + `SHA256SUMS-macos.txt`）。**未簽章／未公證**；若系統擋下 App，請至 **系統設定 → 隱私權與安全性 → 強制打開**，或執行 `xattr -dr com.apple.quarantine "/Applications/Intelligent DAM.app"`（macOS 15+ 右鍵「打開」已無效）
-- **明確延後（第三階段 / #13）**：ONNX / CLIP、語意搜尋、即時轉碼。
+- **明確延後（第三階段 / #13）**：ONNX / CLIP、語意搜尋（即時轉碼見「明確不做」）。
 
 ---
 
@@ -147,10 +147,10 @@ Checklist **項目編號 = Issue 編號**（修正舊稿 item 7/8 與 Issue #7/#
 
 建議順序：**追更第一**、人臉偵測最後。
 
-- [ ] **78. 追更＋想要清單**（優先第一）— Issue [#78](https://github.com/william563214/intelligent-dam/issues/78)：追蹤創作者／系列／女優，定期刮外站列新作，只通知不下載；來源可插拔、站台改版可降級；想要清單表
+- [ ] **78. 追更＋想要清單**（優先第一）— Issue [#78](https://github.com/william563214/intelligent-dam/issues/78)：追蹤創作者／系列／女優，定期刮外站列新作，只通知不下載；**只抓公開頁面、不代登入、不用 cookie、請求頻率限制**；來源可插拔、站台改版可降級；想要清單表
 - [ ] **80. 番號規則（正則＋設定檔）** — Issue [#80](https://github.com/william563214/intelligent-dam/issues/80)：#83／#85／#86 的前置
 - [ ] **79. 本機口味分析** — Issue [#79](https://github.com/william563214/intelligent-dam/issues/79)：只用本機觀看與評分紀錄
-- [ ] **86. 瀏覽器一鍵加入** — Issue [#86](https://github.com/william563214/intelligent-dam/issues/86)：擴充或 `idam://`，只加進想要清單、不下載（依賴 #78）
+- [ ] **86. 瀏覽器一鍵加入** — Issue [#86](https://github.com/william563214/intelligent-dam/issues/86)：擴充或 `idam://`，只加進想要清單、不下載（依賴 #78、#80）
 - [ ] **85. 跨站關注** — Issue [#85](https://github.com/william563214/intelligent-dam/issues/85)：只彙整使用者提供的 RSS／網址，同作品合一卡；不代登入、不用 cookie
 - [ ] **83. 播放牆挑片** — Issue [#83](https://github.com/william563214/intelligent-dam/issues/83)：全螢幕可拖動封面牆、原位播放、版本／分卷切換（前置 #80）
 - [ ] **84. 播放器字幕** — Issue [#84](https://github.com/william563214/intelligent-dam/issues/84)：本地 SRT／ASS、樣式可調；SubtitleCat 為可關閉外掛來源並標示可能機翻

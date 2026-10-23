@@ -11,12 +11,14 @@
 ## 決策
 1. **共用核心**：把現有 Tauri commands 的業務邏輯抽成 `idam-core` crate（DB、掃描、刮削、整理、標籤）。Tauri app、`idam` CLI、MCP server 三者都只是 `idam-core` 的薄包裝。
 2. **MCP 傳輸**：只走 **stdio**、僅本機；**不開任何網路埠**。
-3. **權限分級**：
-   - 唯讀：預設開放。
-   - 寫入／搬檔：先回傳預覽（diff），使用者確認後才套用，且可還原——沿用 v0.2 整批預覽與還原（#73，schema v8 批次 log、#69 `pending_move_to`）。
-   - 刪除：另需明確確認（獨立 confirm token，不能與一般寫入共用）。
+3. **權限分級**（每個寫入工具必須歸入下列其中一層，不可未分類）：
+   - **唯讀**：預設開放；不改 DB、不動檔案。
+   - **低風險寫入**：僅改 DB metadata（標籤、追更／想要清單等），**不搬檔、不刪檔、不覆寫刮削欄位**；變更應可經 #73 schema v8 批次 log 還原。此層不需預覽→確認流程，但仍記錄批次 log。
+   - **高風險寫入**：會搬檔／觸碰檔案系統，或覆寫既有 metadata（例如 `organize_apply`、會寫入檔案或覆寫欄位的 `scan`／`scrape`）。必須走 **預覽 → 確認 → 可還原**（沿用 #73 批次 log、#69 `pending_move_to`）。
+   - **刪除**：未列入初版工具；若日後加入，另需獨立 confirm token（不可與一般寫入共用）。
+4. **確認必須由人類完成**：高風險寫入與刪除的確認，只能經 app GUI 確認、MCP elicitation，或 CLI 互動式提示。**AI client 不得自行持有或代簽 confirm token**（刪除 token 尤其禁止）。
 
-## 並行方案（**待威廉決定**）
+## 並行方案（**建議採用：預設 WAL+busy_timeout，長操作走 app 本機 socket（待威廉確認）**）
 App 與 CLI／MCP 可能同時存取同一個 SQLite。
 
 | 面向 | (A) WAL + `busy_timeout` 重試 | (B) 透過 app 內本機 socket 轉送 |
@@ -28,7 +30,10 @@ App 與 CLI／MCP 可能同時存取同一個 SQLite。
 | 複雜度 | 低，改動少 | 中高：IPC 協定、驗證、跨平台 socket |
 | 安全 | 只依賴檔案權限 | 需確保 socket 僅本機、限目前使用者 |
 
-**建議**：先採 (A) 讓唯讀工具與小型寫入可用；搬檔／整批套用這類長操作在 app 開著時優先走 (B)，未開時用 (A) 並持有 #73 的批次 log。**此建議尚待威廉決定。**
+**建議採用**：預設 (A) WAL + `busy_timeout`，讓唯讀與低風險寫入可用；搬檔／整批套用等高風險長操作在 app 開著時走 (B) 本機 socket，未開時用 (A) 並持有 #73 的批次 log。**待威廉確認**（非已決定）。
+
+### (A) 下 app 如何察覺 CLI／MCP 寫入並刷新
+在採 (A) 時，GUI 行程需偵測他方對同一 DB 的寫入並重讀狀態，避免顯示過期資料。建議以週期 `PRAGMA data_version`（或等效的 schema／user_version 輪詢）比對上次快取值；若版本前進則使相關查詢／列表失效並從 DB 重載。細部間隔與失效範圍實作時再定，本 ADR 只要求有明確刷新機制。
 
 ## 工具清單（初版）
 
@@ -36,13 +41,16 @@ App 與 CLI／MCP 可能同時存取同一個 SQLite。
 |---|---|
 | 搜尋（`search`） | 唯讀 |
 | 取得詳情（`get_details`） | 唯讀 |
-| 加標籤（`add_tags`） | 寫入 |
 | 整理預覽（`organize_preview`） | 唯讀 |
-| 整理套用（`organize_apply`） | 寫入·需確認·可還原 |
-| 追更清單（`follow_list` 讀／`follow_add` 寫，#78） | 唯讀／寫入 |
-| 想要清單（`wishlist_list` 讀／`wishlist_add` 寫，#78） | 唯讀／寫入 |
-| 觸發掃描／刮削（`scan`／`scrape`） | 寫入 |
-| 刪除（未列入初版） | 刪除·另需明確確認 |
+| 追更清單讀（`follow_list`，#78） | 唯讀 |
+| 想要清單讀（`wishlist_list`，#78） | 唯讀 |
+| 加標籤（`add_tags`） | 低風險寫入 |
+| 追更清單加（`follow_add`，#78） | 低風險寫入 |
+| 想要清單加（`wishlist_add`，#78） | 低風險寫入 |
+| 整理套用（`organize_apply`） | 高風險寫入（預覽→人類確認→可還原） |
+| 觸發掃描（`scan`） | 高風險寫入（預覽→人類確認→可還原；可能觸碰檔案／寫入 DB） |
+| 觸發刮削（`scrape`） | 高風險寫入（預覽→人類確認→可還原；可能覆寫 metadata） |
+| 刪除（未列入初版） | 刪除·另需人類確認與獨立 token（禁止 AI 自簽） |
 
 ## 後果
 - 需先重構出 `idam-core`，會動到大量 command 檔；應分多個 PR。
