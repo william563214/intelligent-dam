@@ -1,5 +1,5 @@
 use crate::file_status;
-use crate::path_template::normalize_db_path;
+use crate::path_template::{normalize_db_path, FsFileId};
 use crate::phash;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,34 @@ pub struct PathCollisionRow {
     pub resolution: String,
 }
 
+/// Files row with a non-null `pending_move_to` (#66).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMoveRow {
+    pub file_id: i64,
+    pub path: String,
+    pub pending_move_to: String,
+    /// Source volume id at pending write time (Unix st_dev / Win volume serial)
+    pub pending_source_vol: Option<i64>,
+    /// Source file index at pending write time (Unix st_ino / Win file index)
+    pub pending_source_idx: Option<i64>,
+    pub size: u64,
+    pub phash: Option<String>,
+    pub status: String,
+}
+
+impl PendingMoveRow {
+    /// Recorded source filesystem identity when both halves were stored
+    pub fn pending_source_fs_id(&self) -> Option<FsFileId> {
+        match (self.pending_source_vol, self.pending_source_idx) {
+            (Some(volume), Some(index)) => Some(FsFileId {
+                volume: volume as u64,
+                index: index as u64,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Confirmed-duplicate tombstone (DuplicateTombstones table).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -160,7 +188,8 @@ pub struct Database {
 /// 4 = #38 SuspectedDuplicates（near-phash 疑似重複）
 /// 5 = #38 DuplicateTombstones + Files.organized_at（durable organized）
 /// 6 = #40 PathCollisions（模板目的地碰撞）
-const SCHEMA_USER_VERSION: i32 = 6;
+/// 7 = #66 Files.pending_move_to + pending_source_vol/idx（搬檔前意圖／來源 fs id）
+const SCHEMA_USER_VERSION: i32 = 7;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
 #[cfg(any(test, feature = "test-support"))]
@@ -202,6 +231,11 @@ impl Database {
         let version_after = self.get_user_version()?;
         if version_after >= 5 {
             self.ensure_v5_columns()?;
+        }
+        // Mid-flight 7996aae stamped user_version=7 with only pending_move_to;
+        // later builds added pending_source_vol/idx — repair without re-running mig7.
+        if version_after >= 7 {
+            self.ensure_v7_columns()?;
         }
         // #61 / #63: idempotent repair of legacy path strings (no schema bump).
         // Trailing seps + Windows prefixes/separators; NFC rewrite only on macOS.
@@ -722,6 +756,7 @@ impl Database {
             4 => self.migration_4_suspected_duplicates(),
             5 => self.migration_5_duplicate_tombstones(),
             6 => self.migration_6_path_collisions(),
+            7 => self.migration_7_pending_move_to(),
             other => {
                 // 用 SqliteFailure 而非 InvalidParameterName
                 // 避免顯示 Invalid parameter name 前綴
@@ -816,6 +851,104 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    /// Idempotent v7 column repair: `pending_source_vol` / `pending_source_idx`.
+    ///
+    /// Same class of bug as [`Self::ensure_v5_columns`] / #55: mid-flight 7996aae
+    /// stamped `user_version=7` with only `pending_move_to`. Opening those DBs must
+    /// ALTER the fs-id columns or `set_pending_move_to` fails. Shared helper below
+    /// is also used by migration_7 so there is one ADD COLUMN path.
+    ///
+    /// Skips `BEGIN IMMEDIATE` when both columns already exist (common open path).
+    fn ensure_v7_columns(&self) -> SqliteResult<()> {
+        let need_vol = !self.files_column_exists("pending_source_vol")?;
+        let need_idx = !self.files_column_exists("pending_source_idx")?;
+        if !need_vol && !need_idx {
+            return Ok(());
+        }
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            // Re-check inside the tx (another connection may have raced)
+            self.ensure_pending_source_fs_id_columns()?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after ensure_v7_columns error: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// ADD `pending_source_vol` / `pending_source_idx` when missing (no transaction).
+    fn ensure_pending_source_fs_id_columns(&self) -> SqliteResult<()> {
+        if !self.files_column_exists("pending_source_vol")? {
+            self.conn.execute(
+                "ALTER TABLE Files ADD COLUMN pending_source_vol INTEGER",
+                [],
+            )?;
+        }
+        if !self.files_column_exists("pending_source_idx")? {
+            self.conn.execute(
+                "ALTER TABLE Files ADD COLUMN pending_source_idx INTEGER",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// #66 Files.pending_move_to + source fs id — durable move intent for crash recovery
+    ///
+    /// Idempotent: skips ADD COLUMN when the column already exists (re-open / partial).
+    fn migration_7_pending_move_to(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            if !self.files_column_exists("pending_move_to")? {
+                self.conn.execute(
+                    "ALTER TABLE Files ADD COLUMN pending_move_to TEXT",
+                    [],
+                )?;
+            }
+            self.ensure_pending_source_fs_id_columns()?;
+            self.conn.execute_batch(
+                "
+                CREATE INDEX IF NOT EXISTS idx_files_pending_move_to
+                    ON Files(pending_move_to)
+                    WHERE pending_move_to IS NOT NULL;
+                ",
+            )?;
+            self.set_user_version(7)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after pending_move_to migration error: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn files_column_exists(&self, name: &str) -> SqliteResult<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(Files)")?;
+        let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for c in cols {
+            if c? == name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// #38 DuplicateTombstones + Files.organized_at（確認重複墓碑；durable organized）
@@ -2097,9 +2230,9 @@ impl Database {
         }
     }
 
-    /// #50: after crash mid-move, atomically repair Files.path when FS already moved
+    /// #50 / #66: after crash mid-move, atomically repair Files.path when FS already moved
     /// Re-checks occupancy (NOCASE where applicable), expected old path, path update,
-    /// organized_at, and missing→ready in one BEGIN IMMEDIATE transaction
+    /// clears `pending_move_to`, organized_at, and missing→ready in one BEGIN IMMEDIATE
     pub fn heal_moved_path(
         &self,
         file_id: i64,
@@ -2127,7 +2260,11 @@ impl Database {
             }
 
             self.conn.execute(
-                "UPDATE Files SET path = ?1 WHERE id = ?2",
+                "UPDATE Files SET path = ?1,
+                     pending_move_to = NULL,
+                     pending_source_vol = NULL,
+                     pending_source_idx = NULL
+                 WHERE id = ?2",
                 params![new_path, file_id],
             )?;
             self.mark_file_organized(file_id)?;
@@ -2160,6 +2297,127 @@ impl Database {
                 Err(e)
             }
         }
+    }
+
+    /// #66: record move intent + source fs id before any filesystem rename / overwrite
+    pub fn set_pending_move_to(
+        &self,
+        file_id: i64,
+        dest: &str,
+        source_fs_id: Option<FsFileId>,
+    ) -> SqliteResult<()> {
+        let dest = normalize_db_path(dest);
+        let (vol, idx) = match source_fs_id {
+            Some(id) => (Some(id.volume as i64), Some(id.index as i64)),
+            None => (None, None),
+        };
+        self.conn.execute(
+            "UPDATE Files SET pending_move_to = ?1,
+                 pending_source_vol = ?2,
+                 pending_source_idx = ?3
+             WHERE id = ?4",
+            params![dest, vol, idx, file_id],
+        )?;
+        Ok(())
+    }
+
+    /// #66: clear move intent (pre-FS abort or successful commit)
+    pub fn clear_pending_move_to(&self, file_id: i64) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE Files SET pending_move_to = NULL,
+                 pending_source_vol = NULL,
+                 pending_source_idx = NULL
+             WHERE id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear pending intent; on failure write ErrorLog (do not silently drop)
+    pub fn clear_pending_move_to_logged(
+        &self,
+        file_id: i64,
+        path_for_log: Option<&str>,
+    ) -> SqliteResult<()> {
+        match self.clear_pending_move_to(file_id) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let detail = e.to_string();
+                if let Err(log_err) = self.insert_error_log(
+                    "move",
+                    Some(file_id),
+                    path_for_log,
+                    "failed to clear pending_move_to",
+                    Some(&detail),
+                ) {
+                    eprintln!(
+                        "warn: clear pending_move_to failed ({detail}) and ErrorLog failed: {log_err}"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// #66: read `pending_move_to` for one file (normalized when present)
+    pub fn get_pending_move_to(&self, file_id: i64) -> SqliteResult<Option<String>> {
+        Ok(self.get_pending_move_row(file_id)?.map(|r| r.pending_move_to))
+    }
+
+    /// #66: one pending-move row (path + source fs id) or None
+    pub fn get_pending_move_row(&self, file_id: i64) -> SqliteResult<Option<PendingMoveRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, pending_move_to, pending_source_vol, pending_source_idx,
+                    size, phash, status
+             FROM Files WHERE id = ?1
+               AND pending_move_to IS NOT NULL AND TRIM(pending_move_to) != ''",
+        )?;
+        let mut rows = stmt.query(params![file_id])?;
+        match rows.next()? {
+            Some(row) => {
+                let pending: String = row.get(2)?;
+                Ok(Some(PendingMoveRow {
+                    file_id: row.get(0)?,
+                    path: row.get(1)?,
+                    pending_move_to: normalize_db_path(&pending),
+                    pending_source_vol: row.get(3)?,
+                    pending_source_idx: row.get(4)?,
+                    size: row.get::<_, i64>(5)? as u64,
+                    phash: row.get(6)?,
+                    status: row.get(7)?,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// #66: all rows with a non-null pending destination (startup recovery)
+    pub fn list_pending_moves(&self) -> SqliteResult<Vec<PendingMoveRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, path, pending_move_to, pending_source_vol, pending_source_idx,
+                    size, phash, status
+             FROM Files
+             WHERE pending_move_to IS NOT NULL AND TRIM(pending_move_to) != ''
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let pending: String = row.get(2)?;
+            Ok(PendingMoveRow {
+                file_id: row.get(0)?,
+                path: row.get(1)?,
+                pending_move_to: normalize_db_path(&pending),
+                pending_source_vol: row.get(3)?,
+                pending_source_idx: row.get(4)?,
+                size: row.get::<_, i64>(5)? as u64,
+                phash: row.get(6)?,
+                status: row.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     /// After a successful overwrite filesystem move: one transaction updates the
@@ -2234,7 +2492,11 @@ impl Database {
                 )));
             }
             self.conn.execute(
-                "UPDATE Files SET path = ?1 WHERE id = ?2",
+                "UPDATE Files SET path = ?1,
+                     pending_move_to = NULL,
+                     pending_source_vol = NULL,
+                     pending_source_idx = NULL
+                 WHERE id = ?2",
                 params![new_path, mover_id],
             )?;
             self.mark_file_organized(mover_id)?;
@@ -3144,10 +3406,18 @@ impl Database {
         Ok(())
     }
 
+    /// Test / recovery helper: rewrite `Files.path` and clear `pending_move_to`.
+    /// Production moves use `heal_moved_path` / `commit_path_collision_overwrite`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn update_file_path(&self, file_id: i64, new_path: &str) -> SqliteResult<()> {
         let new_path = normalize_db_path(new_path);
+        // Path rewrite outside move commit also drops stale pending intent (#66)
         self.conn.execute(
-            "UPDATE Files SET path = ?1 WHERE id = ?2",
+            "UPDATE Files SET path = ?1,
+                 pending_move_to = NULL,
+                 pending_source_vol = NULL,
+                 pending_source_idx = NULL
+             WHERE id = ?2",
             params![new_path, file_id],
         )?;
         Ok(())
@@ -5659,7 +5929,7 @@ mod tests {
     fn fresh_db_creates_jobs_and_suspected_tables_at_current_version() {
         let db = open_memory_db();
         assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
-        assert_eq!(SCHEMA_USER_VERSION, 6);
+        assert_eq!(SCHEMA_USER_VERSION, 7);
         assert!(db.jobs_table_exists().expect("Jobs exists"));
         assert!(db
             .suspected_duplicates_table_exists()
@@ -6050,10 +6320,10 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_lands_at_schema_v6() {
+    fn fresh_db_lands_at_schema_v7() {
         let db = open_memory_db();
-        assert_eq!(db.get_user_version().expect("uv"), 6);
-        assert_eq!(SCHEMA_USER_VERSION, 6);
+        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert_eq!(SCHEMA_USER_VERSION, 7);
         let n: i64 = db
             .conn
             .query_row(
@@ -6064,18 +6334,26 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 1);
+        assert!(
+            files_has_column(&db, "pending_move_to"),
+            "fresh DB must have pending_move_to"
+        );
     }
 
     #[test]
-    fn v5_with_organized_at_upgrades_to_v6_path_collisions() {
-        let path = temp_db_path("v5-to-v6-path-collisions");
+    fn v5_with_organized_at_upgrades_to_v7_path_collisions_and_pending() {
+        let path = temp_db_path("v5-to-v7-path-collisions");
         write_v5_with_organized_at(&path);
         assert_eq!(raw_user_version(&path), 5);
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 6);
+        assert_eq!(db.get_user_version().expect("uv"), 7);
         assert!(
             files_has_column(&db, "organized_at"),
-            "organized_at must survive v5→v6"
+            "organized_at must survive v5→v7"
+        );
+        assert!(
+            files_has_column(&db, "pending_move_to"),
+            "pending_move_to must land via v7"
         );
         assert!(
             db.is_organized_file(1).expect("organized"),
@@ -6124,6 +6402,311 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 0, "failed mig must not leave PathCollisions table");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Populated schema-v6 DB (PathCollisions + several Files rows) for v6→v7 upgrade
+    fn write_v6_populated(path: &Path) {
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+            CREATE TABLE Files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                phash TEXT,
+                status TEXT NOT NULL DEFAULT 'ready',
+                organized_at DATETIME
+            );
+            CREATE TABLE Metadata (
+                file_id INTEGER PRIMARY KEY,
+                title TEXT,
+                studio TEXT,
+                release_date TEXT,
+                summary TEXT,
+                cover_image TEXT,
+                sprite_sheet_path TEXT,
+                source_type TEXT,
+                FOREIGN KEY(file_id) REFERENCES Files(id)
+            );
+            CREATE TABLE Tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                category TEXT
+            );
+            CREATE TABLE FileTags (
+                file_id INTEGER NOT NULL,
+                tag_id INTEGER NOT NULL,
+                confidence REAL,
+                PRIMARY KEY (file_id, tag_id),
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(tag_id) REFERENCES Tags(id)
+            );
+            CREATE TABLE ErrorLog (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                category TEXT NOT NULL,
+                file_id INTEGER,
+                path TEXT,
+                message TEXT NOT NULL,
+                detail TEXT
+            );
+            CREATE TABLE Jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT NOT NULL CHECK (
+                    status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')
+                ),
+                type TEXT NOT NULL CHECK (type IN ('pipeline', 'phash')),
+                payload TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                error TEXT,
+                retryable INTEGER NOT NULL DEFAULT 1 CHECK (retryable IN (0, 1)),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE SuspectedDuplicates (
+                file_id INTEGER PRIMARY KEY,
+                keeper_id INTEGER NOT NULL,
+                distance INTEGER NOT NULL CHECK (distance BETWEEN 0 AND 64),
+                resolution TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (resolution IN ('pending', 'confirmed', 'ignored')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(keeper_id) REFERENCES Files(id)
+            );
+            CREATE TABLE DuplicateTombstones (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER,
+                phash TEXT,
+                keeper_id INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE PathCollisions (
+                file_id INTEGER PRIMARY KEY,
+                desired_path TEXT NOT NULL,
+                existing_path TEXT NOT NULL,
+                occupant_file_id INTEGER,
+                resolution TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (resolution IN ('pending', 'suffix', 'skip', 'overwrite')),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_id) REFERENCES Files(id),
+                FOREIGN KEY(occupant_file_id) REFERENCES Files(id)
+            );
+            INSERT INTO Files (id, path, size, phash, status, organized_at) VALUES
+                (1, '/lib/a.mp4', 100, 'aaaaaaaaaaaaaaaa', 'ready', CURRENT_TIMESTAMP),
+                (2, '/lib/b.mp4', 200, NULL, 'ready', NULL),
+                (3, '/inbox/c.mp4', 300, 'bbbbbbbbbbbbbbbb', 'path_collision', NULL);
+            INSERT INTO PathCollisions (file_id, desired_path, existing_path, occupant_file_id, resolution)
+            VALUES (3, '/lib/a.mp4', '/lib/a.mp4', 1, 'pending');
+            INSERT INTO Metadata (file_id, title, studio, release_date, summary)
+            VALUES (1, 'Alpha', 'StudioA', '2024-01-15', 'seed summary');
+            INSERT INTO Tags (id, name, category) VALUES (1, 'ActorOne', 'Actor');
+            INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (1, 1, 0.95);
+            PRAGMA user_version = 6;
+            ",
+        )
+        .expect("seed v6 populated");
+    }
+
+    #[test]
+    fn v6_populated_upgrades_to_v7_pending_move_to() {
+        let path = temp_db_path("v6-to-v7-pending");
+        write_v6_populated(&path);
+        assert_eq!(raw_user_version(&path), 6);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let cols: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA table_info(Files)").unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .map(|c| c.unwrap())
+                    .collect()
+            };
+            assert!(
+                !cols.iter().any(|c| c == "pending_move_to"),
+                "v6 seed must not already have pending_move_to"
+            );
+        }
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert!(files_has_column(&db, "pending_move_to"));
+        assert!(files_has_column(&db, "pending_source_vol"));
+        assert!(files_has_column(&db, "pending_source_idx"));
+        // Populated rows survive
+        let a = db.get_file_by_id(1).expect("file 1");
+        assert_eq!(a.path, normalize_db_path("/lib/a.mp4"));
+        assert_eq!(a.size, 100);
+        assert_eq!(db.get_pending_move_to(1).expect("pending"), None);
+        let meta = db.get_metadata(1).expect("meta").expect("file 1 metadata");
+        assert_eq!(meta.title.as_deref(), Some("Alpha"));
+        assert_eq!(meta.studio.as_deref(), Some("StudioA"));
+        assert_eq!(meta.release_date.as_deref(), Some("2024-01-15"));
+        assert_eq!(meta.summary.as_deref(), Some("seed summary"));
+        let tags = db.get_file_tags(1).expect("filetags");
+        assert_eq!(tags.len(), 1, "FileTags must survive v6→v7");
+        assert_eq!(tags[0].name, "ActorOne");
+        assert_eq!(tags[0].category.as_deref(), Some("Actor"));
+        let conf = filetag_confidence(&db, 1, tags[0].id);
+        assert!((conf - 0.95).abs() < f64::EPSILON, "FileTags confidence={conf}");
+        let collision = db
+            .get_pending_path_collision(3)
+            .expect("collision")
+            .expect("pending collision");
+        assert_eq!(collision.desired_path, normalize_db_path("/lib/a.mp4"));
+        // Idempotent re-open
+        drop(db);
+        let db2 = Database::new(path.to_str().expect("utf8")).expect("reopen");
+        assert_eq!(db2.get_user_version().expect("uv"), 7);
+        assert!(files_has_column(&db2, "pending_move_to"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_7_is_idempotent_when_column_already_present() {
+        let path = temp_db_path("v6-mig7-idempotent");
+        write_v6_populated(&path);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute("ALTER TABLE Files ADD COLUMN pending_move_to TEXT", [])
+                .expect("pre-add column");
+            // Stay at user_version 6 so migration_7 still runs
+            assert_eq!(raw_user_version(&path), 6);
+        }
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert!(files_has_column(&db, "pending_move_to"));
+        db.set_pending_move_to(2, "/lib/dest.mp4", None).expect("set");
+        assert_eq!(
+            db.get_pending_move_to(2).expect("get"),
+            Some(normalize_db_path("/lib/dest.mp4"))
+        );
+        assert!(files_has_column(&db, "pending_source_vol"));
+        assert!(files_has_column(&db, "pending_source_idx"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Mid-flight 7996aae shape: user_version=7 with pending_move_to only
+    fn write_v7_without_source_fs_id_columns(path: &Path) {
+        write_v6_populated(path);
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "
+            ALTER TABLE Files ADD COLUMN pending_move_to TEXT;
+            CREATE INDEX IF NOT EXISTS idx_files_pending_move_to
+                ON Files(pending_move_to)
+                WHERE pending_move_to IS NOT NULL;
+            PRAGMA user_version = 7;
+            ",
+        )
+        .expect("seed v7 without source fs id columns");
+    }
+
+    #[test]
+    fn v7_without_source_fs_id_columns_is_repaired_on_open() {
+        let path = temp_db_path("v7-no-source-fs-id");
+        write_v7_without_source_fs_id_columns(&path);
+        assert_eq!(raw_user_version(&path), 7);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let cols: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA table_info(Files)").unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .map(|c| c.unwrap())
+                    .collect()
+            };
+            assert!(
+                cols.iter().any(|c| c == "pending_move_to"),
+                "precondition: pending_move_to present"
+            );
+            assert!(
+                !cols.iter().any(|c| c == "pending_source_vol"),
+                "precondition: pending_source_vol absent"
+            );
+            assert!(
+                !cols.iter().any(|c| c == "pending_source_idx"),
+                "precondition: pending_source_idx absent"
+            );
+        }
+
+        let db = Database::new(path.to_str().expect("utf8")).expect("open repair");
+        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert!(
+            files_has_column(&db, "pending_source_vol"),
+            "ensure_v7_columns must ADD pending_source_vol on already-v7 DBs"
+        );
+        assert!(
+            files_has_column(&db, "pending_source_idx"),
+            "ensure_v7_columns must ADD pending_source_idx on already-v7 DBs"
+        );
+        db.set_pending_move_to(
+            2,
+            "/lib/dest.mp4",
+            Some(crate::path_template::FsFileId {
+                volume: 1,
+                index: 42,
+            }),
+        )
+        .expect("set_pending_move_to must succeed after repair");
+        assert_eq!(
+            db.get_pending_move_to(2).expect("get"),
+            Some(normalize_db_path("/lib/dest.mp4"))
+        );
+        let row = db
+            .get_pending_move_row(2)
+            .expect("row")
+            .expect("pending row");
+        assert_eq!(row.pending_source_vol, Some(1));
+        assert_eq!(row.pending_source_idx, Some(42));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_7_failure_rolls_back_stays_at_v6() {
+        // Poison index name as a table so CREATE INDEX fails inside mig7 tx
+        let path = temp_db_path("v6-mig7-rollback");
+        write_v6_populated(&path);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute_batch("CREATE TABLE idx_files_pending_move_to (x INTEGER);")
+                .expect("poison index name");
+        }
+        match Database::new(path.to_str().expect("utf8")) {
+            Ok(_) => panic!("mig should fail when index name is taken by a table"),
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("index")
+                        || msg.contains("already")
+                        || msg.contains("table")
+                        || msg.contains("exists"),
+                    "expected index/name conflict error, got {msg}"
+                );
+            }
+        }
+        assert_eq!(raw_user_version(&path), 6, "failed mig must not bump version");
+        {
+            let conn = Connection::open(&path).expect("reopen");
+            let cols: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA table_info(Files)").unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(1))
+                    .unwrap()
+                    .map(|c| c.unwrap())
+                    .collect()
+            };
+            assert!(
+                !cols.iter().any(|c| c == "pending_move_to"),
+                "failed mig must not leave pending_move_to column"
+            );
+            assert!(
+                !cols.iter().any(|c| c == "pending_source_vol"),
+                "failed mig must not leave pending_source_vol column"
+            );
+        }
         let _ = std::fs::remove_file(&path);
     }
 

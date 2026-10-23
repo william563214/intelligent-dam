@@ -27,8 +27,11 @@ pub use crate::database::{
 pub use crate::file_stability::StabilityOptions;
 pub use crate::path_template::{
     discard_overwrite_backup, is_same_file_identity, move_file_overwrite_via_copy, overwrite_fault,
+    read_fs_file_id, FsFileId,
 };
-pub use crate::pipeline::{heal_identity_override, PipelineOptions};
+pub use crate::pipeline::{
+    heal_identity_override, recover_pending_move_for, recover_pending_moves, PipelineOptions,
+};
 pub use crate::settings::{AppSettings, SettingsStore};
 pub use crate::task_queue::{max_terminal_jobs, JobKind, TaskQueue};
 pub use crate::watcher::{WatcherManager, WatcherOptions, WatcherStatus};

@@ -127,6 +127,28 @@ pub fn run() {
             // Arc so Watcher ingest worker can share the same mutex
             let db = Arc::new(Mutex::new(db));
 
+            // #66: finish durable pending_move_to intents left by a mid-move crash
+            match pipeline::recover_pending_moves(&db) {
+                Ok(n) if n > 0 => {
+                    eprintln!("info: recovered {n} pending_move_to row(s) on startup");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("warn: pending_move_to startup recovery failed: {e:#}");
+                    if let Ok(guard) = db.lock() {
+                        if let Err(log_err) = guard.insert_error_log(
+                            "move",
+                            None,
+                            None,
+                            &format!("pending_move_to startup recovery failed: {e:#}"),
+                            None,
+                        ) {
+                            eprintln!("warn: ErrorLog after pending recovery failure: {log_err}");
+                        }
+                    }
+                }
+            }
+
             // #59 S2: scan leftover sidecars off the UI thread (large / network roots)
             // Only `scan_directories` are walked absolute-template output roots are
             // not covered (see PR notes). Dedup ErrorLog by category+path+message.

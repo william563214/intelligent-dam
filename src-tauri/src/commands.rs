@@ -503,9 +503,9 @@ pub fn resolve_path_collision(
                 supp.suppress(&desired);
             }
 
-            // N4 / #59: crash after FS overwrite before DB commit leaves source gone,
+            // N4 / #59 / #66: crash after FS overwrite before DB commit leaves source gone,
             // desired holding mover bytes, and occupant often in `.idam-bak`. On restart,
-            // finish the DB commit when dest matches mover identity; keep bak for cleanup.
+            // finish the DB commit from pending_move_to (size/phash backup); keep bak.
             if !source.is_file() {
                 return complete_crashed_overwrite(
                     db,
@@ -517,10 +517,40 @@ pub fn resolve_path_collision(
                 );
             }
 
-            // Filesystem first (backup occupant); no DB writes until commit
+            let desired_str = desired
+                .to_str()
+                .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
+                .to_string();
+            // #66: durable intent + optional source fs id before overwrite FS ops
+            if !source.is_file() {
+                return Err(format!("Source is not a file: {source_path_str}"));
+            }
+            // Windows: missing index → None (size/phash only)
+            let source_fs_id = path_template::read_fs_file_id(&source).unwrap_or_else(|e| {
+                eprintln!(
+                    "warn: source fs id unavailable ({source_path_str}): {e}; pending without fs id"
+                );
+                None
+            });
+            {
+                let guard = db
+                    .lock()
+                    .map_err(|e| format!("Database lock error: {}", e))?;
+                guard
+                    .set_pending_move_to(file_id, &desired_str, source_fs_id)
+                    .map_err(|e| format!("Failed to set pending_move_to: {e}"))?;
+            }
+
+            // Filesystem next (backup occupant); commit clears pending_move_to
             let outcome = match path_template::move_file_overwrite(&source, &desired) {
                 Ok(o) => o,
                 Err(e) => {
+                    if let Ok(guard) = db.lock() {
+                        let _ = guard.clear_pending_move_to_logged(
+                            file_id,
+                            source.to_str(),
+                        );
+                    }
                     let detail = format!("{e:#}");
                     let message = format!("Failed to overwrite move: {detail}");
                     // Occupant may sit in .idam-bak — surface bak path + ErrorLog
@@ -545,10 +575,7 @@ pub fn resolve_path_collision(
                 supp.suppress(&desired);
             }
 
-            let new_path = desired
-                .to_str()
-                .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
-                .to_string();
+            let new_path = desired_str;
 
             let commit = {
                 let guard = db
@@ -568,6 +595,7 @@ pub fn resolve_path_collision(
                     &desired,
                     outcome.backup.as_deref(),
                 ) {
+                    // Leave pending_move_to so startup can finish the commit
                     let bak_hint = outcome
                         .backup
                         .as_ref()
@@ -595,6 +623,13 @@ pub fn resolve_path_collision(
                     }
                     return Err(format!("{message}; commit: {e}; restore: {detail}"));
                 }
+                // FS restored to pre-overwrite — drop stale intent
+                if let Ok(guard) = db.lock() {
+                    let _ = guard.clear_pending_move_to_logged(
+                        file_id,
+                        source.to_str(),
+                    );
+                }
                 return Err(format!("Failed to commit overwrite: {e}"));
             }
 
@@ -609,17 +644,14 @@ pub fn resolve_path_collision(
     }
 }
 
-/// Finish an overwrite whose filesystem step already succeeded before a crash (#59 N4 / B1)
+/// Finish an overwrite whose filesystem step already succeeded before a crash (#59 N4 / B1 / #66)
 ///
 /// Never auto-deletes `.idam-bak` — that file is the occupant's only copy until the
 /// user cleans it up. Recovery accepts only the primary bak name.
 ///
-/// N1: when bak is already gone but dest matches mover identity (same as #60 heal),
-/// still complete the DB commit instead of marking the mover missing.
-///
-/// Without a bak, size/phash identity cannot tell an exact-duplicate occupant apart
-/// from the mover that already landed on dest; #66 (`pending_move_to`) is required
-/// before recovery can disambiguate those cases.
+/// Commit when pending matches desired AND size/phash match (and same-volume fs id
+/// when recorded). Without pending, size/phash alone (legacy). Disagree → refuse
+/// and keep pending.
 fn complete_crashed_overwrite(
     db: &Arc<Mutex<Database>>,
     file_id: i64,
@@ -633,6 +665,13 @@ fn complete_crashed_overwrite(
     if !pipeline::source_parent_reachable(source) {
         return Err(format!(
             "overwrite crash recovery deferred: source parent unreachable (retryable): {source_path_str}"
+        ));
+    }
+    // S1: dest volume offline → keep pending
+    if !pipeline::source_parent_reachable(desired) {
+        return Err(format!(
+            "overwrite crash recovery deferred: dest parent unreachable (retryable): {}",
+            desired.display()
         ));
     }
 
@@ -661,6 +700,7 @@ fn complete_crashed_overwrite(
 
     if !desired.is_file() {
         if let Ok(guard) = db.lock() {
+            let _ = guard.clear_pending_move_to_logged(file_id, Some(source_path_str));
             let _ = guard.update_file_status(file_id, file_status::missing);
         }
         return Err(format!(
@@ -668,9 +708,30 @@ fn complete_crashed_overwrite(
         ));
     }
 
-    let matches = pipeline::dest_matches_mover_identity(desired, mover_size, mover_phash)
+    let new_path = desired
+        .to_str()
+        .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
+        .to_string();
+    let pending_row = {
+        let guard = db
+            .lock()
+            .map_err(|e| format!("Database lock error: {}", e))?;
+        guard
+            .get_pending_move_row(file_id)
+            .map_err(|e| format!("Failed to read pending_move_to: {e}"))?
+    };
+    let pending_matches = pending_row
+        .as_ref()
+        .map(|r| {
+            path_template::normalize_db_path(&r.pending_move_to)
+                == path_template::normalize_db_path(&new_path)
+        })
+        .unwrap_or(false);
+    let identity_matches = pipeline::dest_matches_mover_identity(desired, mover_size, mover_phash)
         .map_err(|e| format!("overwrite crash identity check failed: {e:#}"))?;
-    if !matches {
+
+    // B1: pending alone is never enough; identity alone only when no pending row
+    if pending_matches && !identity_matches {
         let dest_size = std::fs::metadata(desired)
             .map(|m| m.len())
             .unwrap_or(0);
@@ -688,20 +749,64 @@ fn complete_crashed_overwrite(
                 "path_collision",
                 Some(file_id),
                 desired.to_str(),
+                "overwrite crash recovery refused: pending set but destination does not match size/phash; keeping pending",
+                Some(&detail),
+            );
+        }
+        return Err(
+            "overwrite crash recovery refused: pending set but destination does not match size/phash".into(),
+        );
+    }
+
+    let allow = (pending_row.is_none() || pending_matches) && identity_matches;
+    if !allow {
+        let dest_size = std::fs::metadata(desired)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let bak_hint = bak
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(no bak)".to_string());
+        let detail = format!(
+            "source={source_path_str} dest={} db_size={mover_size} dest_size={dest_size} phash={:?} pending={:?} bak={bak_hint}",
+            desired.display(),
+            mover_phash,
+            pending_row.as_ref().map(|r| r.pending_move_to.clone())
+        );
+        if let Ok(guard) = db.lock() {
+            let _ = guard.insert_error_log(
+                "path_collision",
+                Some(file_id),
+                desired.to_str(),
                 "overwrite crash recovery refused: destination does not match recorded file",
                 Some(&detail),
             );
         }
-        // Leave mover at path_collision; keep bak for the user
         return Err(
             "overwrite crash recovery refused: destination does not match recorded file".into(),
         );
     }
 
-    let new_path = desired
-        .to_str()
-        .ok_or_else(|| "Destination path is not valid UTF-8".to_string())?
-        .to_string();
+    // S3: same rules as pipeline::pending_fs_id_allows_commit — unreadable dest
+    // id must refuse (not the previous `_ => {}` silent skip).
+    if let Some(ref row) = pending_row {
+        if let Err(msg) = pipeline::pending_fs_id_allows_commit(row, desired) {
+            if let Ok(guard) = db.lock() {
+                let _ = guard.insert_error_log(
+                    "path_collision",
+                    Some(file_id),
+                    desired.to_str(),
+                    "overwrite crash recovery refused: destination fs id does not match pending source; keeping pending",
+                    Some(&msg),
+                );
+            }
+            return Err(
+                "overwrite crash recovery refused: destination fs id does not match pending source"
+                    .into(),
+            );
+        }
+    }
+
     let phash_note = mover_phash
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -724,13 +829,18 @@ fn complete_crashed_overwrite(
                 "bak=(none)".to_string(),
             ),
         };
+        let pending_note = if pending_matches {
+            "pending=matched+identity"
+        } else {
+            "pending=(none-identity-backup)"
+        };
         let _ = guard.insert_error_log(
             "path_collision",
             Some(file_id),
             Some(&new_path),
             message,
             Some(&format!(
-                "{bak_detail} size={mover_size} phash={phash_note}"
+                "{bak_detail} {pending_note} size={mover_size} phash={phash_note}"
             )),
         );
     }
