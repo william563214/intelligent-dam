@@ -2577,8 +2577,8 @@ mod tests {
     }
 
     #[test]
-    fn step_move_heals_via_pending_when_identity_would_fail() {
-        // B1: pending matches but size differs → refuse and keep pending
+    fn step_move_refuses_heal_when_pending_matches_but_size_mismatches() {
+        // B1: pending matches but size differs → refuse and keep pending (does not heal)
         let dir = unique_temp_dir("pending_over_identity");
         let src = dir.join("ABC-100.mp4");
         fs::write(&src, b"original").unwrap();
