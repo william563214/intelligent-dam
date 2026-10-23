@@ -787,33 +787,23 @@ fn complete_crashed_overwrite(
         );
     }
 
-    // S3: same-volume fs id must match when recorded
+    // S3: same rules as pipeline::pending_fs_id_allows_commit — unreadable dest
+    // id must refuse (not the previous `_ => {}` silent skip).
     if let Some(ref row) = pending_row {
-        if let Some(stored) = row.pending_source_fs_id() {
-            match path_template::read_fs_file_id(desired) {
-                Ok(Some(dest_id))
-                    if path_template::fs_file_id_same_volume(stored, dest_id)
-                        && stored != dest_id =>
-                {
-                    let detail = format!(
-                        "stored={stored:?} dest={dest_id:?} path={}",
-                        desired.display()
-                    );
-                    if let Ok(guard) = db.lock() {
-                        let _ = guard.insert_error_log(
-                            "path_collision",
-                            Some(file_id),
-                            desired.to_str(),
-                            "overwrite crash recovery refused: destination fs id does not match pending source; keeping pending",
-                            Some(&detail),
-                        );
-                    }
-                    return Err(
-                        "overwrite crash recovery refused: destination fs id does not match pending source".into(),
-                    );
-                }
-                _ => {}
+        if let Err(msg) = pipeline::pending_fs_id_allows_commit(row, desired) {
+            if let Ok(guard) = db.lock() {
+                let _ = guard.insert_error_log(
+                    "path_collision",
+                    Some(file_id),
+                    desired.to_str(),
+                    "overwrite crash recovery refused: destination fs id does not match pending source; keeping pending",
+                    Some(&msg),
+                );
             }
+            return Err(
+                "overwrite crash recovery refused: destination fs id does not match pending source"
+                    .into(),
+            );
         }
     }
 

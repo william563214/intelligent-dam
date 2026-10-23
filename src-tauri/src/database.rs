@@ -859,9 +859,17 @@ impl Database {
     /// stamped `user_version=7` with only `pending_move_to`. Opening those DBs must
     /// ALTER the fs-id columns or `set_pending_move_to` fails. Shared helper below
     /// is also used by migration_7 so there is one ADD COLUMN path.
+    ///
+    /// Skips `BEGIN IMMEDIATE` when both columns already exist (common open path).
     fn ensure_v7_columns(&self) -> SqliteResult<()> {
+        let need_vol = !self.files_column_exists("pending_source_vol")?;
+        let need_idx = !self.files_column_exists("pending_source_idx")?;
+        if !need_vol && !need_idx {
+            return Ok(());
+        }
         self.conn.execute("BEGIN IMMEDIATE", [])?;
         let tx_result = (|| -> SqliteResult<()> {
+            // Re-check inside the tx (another connection may have raced)
             self.ensure_pending_source_fs_id_columns()?;
             self.conn.execute("COMMIT", [])?;
             Ok(())
