@@ -22,6 +22,9 @@
 //!   fallback: a writer that stalls longer than the stability window without
 //!   holding a lock is treated as complete
 //!   (https://github.com/william563214/intelligent-dam/issues/68).
+//!   Same-process flock on macOS is process-scoped: a second fd in the writer
+//!   process can take the lock while the first still holds it, so e2e pause
+//!   tests must use a cross-process writer (#93).
 //! - **Windows**: many copy tools do not take an advisory lock; size+mtime
 //!   plus the FILE_SHARE_READ open probe are the primary signals.
 //! - **mtime granularity**: FAT and some SMB mounts update mtime in 2s (or

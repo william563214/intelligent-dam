@@ -76,3 +76,9 @@ required-features = ["test-support"]
 name = "watcher_e2e"
 path = "tests/watcher_e2e.rs"
 required-features = ["test-support"]
+
+# Cross-process writer for paused_then_resumed watcher_e2e (#93)
+[[bin]]
+name = "idam_pause_writer"
+path = "tests/bin/pause_writer.rs"
+required-features = ["test-support"]

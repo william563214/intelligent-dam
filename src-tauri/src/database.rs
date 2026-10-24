@@ -1295,18 +1295,25 @@ impl Database {
         Ok(())
     }
 
-    /// 將非空 Tags_mig 改名備份 處理同一秒碰撞
+    /// 將非空 Tags_mig 改名備份 處理同一毫秒碰撞
     fn backup_nonempty_tags_mig(&self) -> SqliteResult<String> {
-        let base_secs = SystemTime::now()
+        self.backup_nonempty_tags_mig_at(SystemTime::now())
+    }
+
+    /// 用固定時鐘配置備份名 測試可注入避免 Windows 牆鐘前進造成 flake (#94)
+    fn backup_nonempty_tags_mig_at(&self, now: SystemTime) -> SqliteResult<String> {
+        // Millis not secs: second-granularity names raced on slow Windows CI when
+        // Database::new outlived the test's 2-second pre-book window (#94).
+        let base_millis = now
             .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
+            .map(|d| d.as_millis())
             .unwrap_or(0);
 
         for suffix in 0u32..1000 {
             let backup_name = if suffix == 0 {
-                format!("Tags_mig_backup_{base_secs}")
+                format!("Tags_mig_backup_{base_millis}")
             } else {
-                format!("Tags_mig_backup_{base_secs}_{suffix}")
+                format!("Tags_mig_backup_{base_millis}_{suffix}")
             };
             if self.table_exists(&backup_name)? {
                 continue;
@@ -3570,6 +3577,7 @@ mod swap_tags_fault {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn open_memory_db() -> Database {
         Database::new(":memory:").expect("open memory db")
@@ -4796,14 +4804,9 @@ mod tests {
     #[test]
     fn startup_backups_nonempty_tags_mig_when_tags_also_nonempty() {
         let path = temp_db_path("both-nonempty");
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         {
             let conn = Connection::open(&path).expect("raw open");
-            // 預佔用附近秒數的備份名 迫使走碰撞後綴
-            let mut ddl = String::from(
+            conn.execute_batch(
                 "
                 CREATE TABLE Files (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -4831,29 +4834,13 @@ mod tests {
                     confidence FLOAT DEFAULT 1.0,
                     PRIMARY KEY (file_id, tag_id)
                 );
-                ",
-            );
-            // 僅預佔用當前秒與鄰近一秒 迫使走碰撞後綴
-            for offset in [0u64, 1] {
-                ddl.push_str(&format!(
-                    "CREATE TABLE Tags_mig_backup_{} (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        category TEXT,
-                        UNIQUE(name, category)
-                    );",
-                    secs.saturating_add(offset)
-                ));
-            }
-            ddl.push_str(
-                "
                 INSERT INTO Files (id, path, size) VALUES (1, '/tmp/both.mp4', 1);
                 INSERT INTO Tags (id, name, category) VALUES (10, 'KeepTags', 'Tag');
                 INSERT INTO Tags_mig (id, name, category) VALUES (20, 'FromMig', 'Actor');
                 INSERT INTO FileTags (file_id, tag_id, confidence) VALUES (1, 10, 1.0);
                 ",
-            );
-            conn.execute_batch(&ddl).expect("seed both nonempty");
+            )
+            .expect("seed both nonempty");
         }
 
         let db = Database::new(path.to_str().expect("utf8")).expect("startup");
@@ -4895,10 +4882,9 @@ mod tests {
             })
             .expect("backup holding FromMig")
             .clone();
-        // Tags_mig_backup_<secs> 已有三個底線 碰撞後綴會變成第四個或結尾 _1
         assert!(
-            backup_name.ends_with("_1") || backup_name.matches('_').count() >= 4,
-            "expected collision suffix in {backup_name}"
+            backup_name.starts_with("Tags_mig_backup_"),
+            "unexpected backup name {backup_name}"
         );
         let logs = db.list_error_logs(20).expect("error logs");
         assert!(
@@ -4909,6 +4895,50 @@ mod tests {
             }),
             "expected ErrorLog entry for Tags_mig backup got {logs:?}"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn backup_tags_mig_collision_suffix_uses_injected_clock() {
+        // Deterministic collision path: fixed millis + pre-occupied base name (#94).
+        let path = temp_db_path("mig-collision-clock");
+        let db = Database::new(path.to_str().expect("utf8")).expect("open");
+        db.conn
+            .execute_batch(
+                "
+                CREATE TABLE Tags_mig (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    category TEXT,
+                    UNIQUE(name, category)
+                );
+                CREATE TABLE Tags_mig_backup_1700000000123 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    category TEXT,
+                    UNIQUE(name, category)
+                );
+                INSERT INTO Tags_mig (id, name, category) VALUES (20, 'FromMig', 'Actor');
+                ",
+            )
+            .expect("seed collision");
+
+        let fixed = UNIX_EPOCH + Duration::from_millis(1_700_000_000_123);
+        let backup_name = db
+            .backup_nonempty_tags_mig_at(fixed)
+            .expect("backup with collision");
+        assert_eq!(backup_name, "Tags_mig_backup_1700000000123_1");
+        assert!(!db.table_exists("Tags_mig").expect("renamed"));
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM Tags_mig_backup_1700000000123_1
+                 WHERE id = 20 AND name = 'FromMig'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("from mig rows");
+        assert_eq!(count, 1);
         let _ = std::fs::remove_file(&path);
     }
 

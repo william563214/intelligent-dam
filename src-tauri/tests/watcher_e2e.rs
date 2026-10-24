@@ -3,6 +3,7 @@
 //! Lives under `tests/` so Windows harnesses pick up Common-Controls v6 via
 //! `cargo:rustc-link-arg-tests` (see build.rs). Requires `--features test-support`.
 
+#[cfg(windows)]
 use fs4::FileExt;
 use intelligent_dam_lib::test_support::{
     get_all_files, Database, PipelineOptions, TaskQueue, WatcherManager, WatcherOptions,
@@ -10,6 +11,7 @@ use intelligent_dam_lib::test_support::{
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -133,51 +135,39 @@ fn write_chunked(path: &Path, chunks: usize, chunk_bytes: usize, pause: Duration
 
 #[test]
 fn paused_then_resumed_write_ingests_only_after_completion() {
-    // Pause longer than for_watcher_e2e stability (~500ms) while holding the
-    // write handle (+ advisory lock). Size+mtime alone would look done; the
-    // lock / Windows FILE_SHARE_READ probes must keep waiting until resume
-    // finishes and the handle is released.
+    // Pause longer than for_watcher_e2e stability (~500ms) while a *child*
+    // process holds the write handle (+ advisory lock). Same-process flock on
+    // macOS is process-scoped so a same-thread writer made the probe Free and
+    // ingested size 512 mid-pause (#93 / #68). Cross-process lock keeps Held.
     let fx = Fixture::new("pause_resume");
     let dest = fx.path("pause-resume.mp4");
     let half = 512usize;
     let total = half * 2;
-    let writer_done = Arc::new(Mutex::new(false));
-    let mid_at = Arc::new(Mutex::new(None::<Instant>));
-    let done_flag = Arc::clone(&writer_done);
-    let mid_flag = Arc::clone(&mid_at);
-    let dest_writer = dest.clone();
+    let mid = dest.with_extension("mid");
+    let _ = fs::remove_file(&mid);
 
-    let writer = thread::spawn(move || {
-        let mut file = File::create(&dest_writer).expect("create");
-        file.write_all(&vec![0x11u8; half]).expect("first half");
-        file.flush().expect("flush half");
-        // Hold lock for the whole pause so Unix advisory probe stays Held;
-        // on Windows the open write handle alone fails FILE_SHARE_READ open.
-        FileExt::try_lock(&file).expect("hold exclusive during pause");
-        *mid_flag.lock().expect("mid") = Some(Instant::now());
-
-        // Generous margin vs 100ms×5 (~500ms) stability window for CI skew
-        thread::sleep(Duration::from_millis(1800));
-
-        file.write_all(&vec![0x22u8; half]).expect("second half");
-        file.flush().expect("flush full");
-        let _ = FileExt::unlock(&file);
-        drop(file);
-        *done_flag.lock().expect("done") = true;
-    });
+    let pause_ms = 1800u64;
+    let mut writer = Command::new(env!("CARGO_BIN_EXE_idam_pause_writer"))
+        .args([
+            dest.to_str().expect("utf8 dest"),
+            &half.to_string(),
+            &pause_ms.to_string(),
+        ])
+        .spawn()
+        .expect("spawn cross-process pause writer");
 
     assert!(
-        wait_until(ingest_timeout, || mid_at.lock().expect("mid").is_some()),
+        wait_until(ingest_timeout, || mid.exists()),
         "writer should reach mid-pause"
     );
-    let pause_started = mid_at.lock().expect("mid").expect("recorded by writer");
-    // Deadline anchored to writer clock (not when main noticed the flag)
+    let pause_started = Instant::now();
+    // Deadline anchored to mid signal (not when main noticed the flag)
     let pause_deadline = pause_started + Duration::from_millis(1400);
 
     let mut samples = 0u32;
     while Instant::now() < pause_deadline {
         assert!(
-            !*writer_done.lock().expect("done"),
+            writer.try_wait().expect("writer poll").is_none(),
             "writer finished earlier than expected"
         );
         assert_eq!(
@@ -190,8 +180,8 @@ fn paused_then_resumed_write_ingests_only_after_completion() {
     }
     assert!(samples >= 10, "need enough pause samples, got {samples}");
 
-    writer.join().expect("writer");
-    assert!(*writer_done.lock().expect("done"));
+    let status = writer.wait().expect("writer wait");
+    assert!(status.success(), "pause writer exit {status}");
 
     assert!(
         wait_until(ingest_timeout, || fx.has_file_named("pause-resume.mp4")),
