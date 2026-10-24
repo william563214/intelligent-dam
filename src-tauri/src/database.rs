@@ -199,6 +199,9 @@ pub enum OrganizedAtWrite {
     Restore(Option<String>),
 }
 
+/// Max retryable undo refusals before an item becomes permanent `undo_failed`
+pub const MAX_ORGANIZE_UNDO_ATTEMPTS: i64 = 3;
+
 /// Durable task-queue row (`Jobs` table / #34)
 #[derive(Debug, Clone)]
 pub struct JobRow {
@@ -1166,7 +1169,10 @@ impl Database {
                     ) THEN i.status
                     ELSE 'failed'
                 END,
-                i.collision, i.error, NULL, 0
+                i.collision, i.error,
+                -- Draft v8 had no src_organized_at column; rebuilt rows get NULL
+                NULL,
+                0
             FROM OrganizeBatchItems_mig i
             LEFT JOIN Files f ON f.id = i.file_id;
             DROP TABLE OrganizeBatchItems_mig;
@@ -3967,7 +3973,7 @@ impl Database {
                         item_id,
                         false,
                         "interrupted before undo filesystem move completed",
-                        3,
+                        MAX_ORGANIZE_UNDO_ATTEMPTS,
                     )?;
                     updated += 1;
                 }

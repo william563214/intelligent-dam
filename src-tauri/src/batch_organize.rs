@@ -5,6 +5,7 @@
 
 use crate::database::{
     Database, NewOrganizeBatchItem, OrganizeBatch, OrganizeBatchItem, OrganizedAtWrite,
+    MAX_ORGANIZE_UNDO_ATTEMPTS,
 };
 use crate::file_status;
 use crate::path_suppression::PathSuppression;
@@ -23,9 +24,6 @@ const OUTCOME_COLLISION: &str = "collision";
 const OUTCOME_MISSING: &str = "missing";
 const OUTCOME_ERROR: &str = "error";
 const OUTCOME_BLOCKED: &str = "blocked";
-
-/// Max retryable undo refusals before an item becomes permanent `undo_failed`
-const MAX_UNDO_ATTEMPTS: i64 = 3;
 
 /// One row in a read-only organize preview
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -615,12 +613,33 @@ pub fn undo_last_organize_batch(
             Err(e) => {
                 let detail = format!("{e:#}");
                 if let Ok(guard) = db.lock() {
-                    let _ = guard.record_organize_undo_refusal(
-                        item.id,
-                        false,
-                        &detail,
-                        MAX_UNDO_ATTEMPTS,
-                    );
+                    let still_pending = item
+                        .file_id
+                        .map(|fid| {
+                            guard
+                                .get_pending_move_to(fid)
+                                .ok()
+                                .flatten()
+                                .map(|p| !p.trim().is_empty())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if still_pending {
+                        // Mirror execute: leave undoing so startup reconcile can finish
+                        let _ = guard.update_organize_batch_item_status(
+                            item.id,
+                            "undoing",
+                            Some(&detail),
+                        );
+                    } else {
+                        let _ = guard.record_organize_undo_refusal(
+                            item.id,
+                            false,
+                            &detail,
+                            MAX_ORGANIZE_UNDO_ATTEMPTS,
+                        );
+                        refused += 1;
+                    }
                     let _ = guard.insert_error_log(
                         "batch_undo",
                         item.file_id,
@@ -628,8 +647,9 @@ pub fn undo_last_organize_batch(
                         "batch undo failed",
                         Some(&detail),
                     );
+                } else {
+                    refused += 1;
                 }
-                refused += 1;
             }
         }
     }
@@ -809,7 +829,12 @@ fn refuse_undo(
     let guard = db
         .lock()
         .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
-    guard.record_organize_undo_refusal(item.id, permanent, detail, MAX_UNDO_ATTEMPTS)?;
+    guard.record_organize_undo_refusal(
+        item.id,
+        permanent,
+        detail,
+        MAX_ORGANIZE_UNDO_ATTEMPTS,
+    )?;
     let _ = guard.insert_error_log(
         "batch_undo",
         item.file_id,
@@ -832,7 +857,7 @@ pub fn reconcile_organize_batches_after_recovery(db: &Arc<Mutex<Database>>) -> R
 mod tests {
     use super::*;
     use crate::database::Metadata;
-    use crate::pipeline::recover_pending_moves;
+    use crate::pipeline::{finalize_move_fault, recover_pending_moves};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -898,6 +923,29 @@ mod tests {
     }
 
     #[test]
+    fn dedupe_plans_keeps_first_per_file_id() {
+        let plans = vec![
+            OrganizeExecutePlanItem {
+                file_id: 1,
+                dst_path: "/a".into(),
+            },
+            OrganizeExecutePlanItem {
+                file_id: 2,
+                dst_path: "/b".into(),
+            },
+            OrganizeExecutePlanItem {
+                file_id: 1,
+                dst_path: "/a-dup".into(),
+            },
+        ];
+        let out = dedupe_plans(plans);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].file_id, 1);
+        assert_eq!(out[0].dst_path, "/a");
+        assert_eq!(out[1].file_id, 2);
+    }
+
+    #[test]
     fn preview_is_read_only_no_fs_or_db_path_change() {
         let root = temp_root("preview-ro");
         let db = open_db(&root);
@@ -910,8 +958,20 @@ mod tests {
         let preview = preview_batch_organize(&db, &settings, Some(vec![id])).expect("preview");
         assert_eq!(preview.move_count, 1);
         assert_eq!(preview.items[0].outcome, OUTCOME_MOVE);
+        assert!(preview.items[0].dst_path.contains("Studio"));
         assert!(src.is_file(), "preview must not move the file");
         assert_eq!(fs::read(&src).expect("read"), before);
+        let guard = db.lock().expect("lock");
+        let file = guard.get_file_by_id(id).expect("file");
+        assert_eq!(
+            path_template::normalize_db_path(&file.path),
+            path_template::normalize_db_path(src.to_str().unwrap()),
+            "preview must not change Files.path"
+        );
+        assert!(
+            guard.latest_undoable_organize_batch().unwrap().is_none(),
+            "preview must not create a batch"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -959,6 +1019,11 @@ mod tests {
         assert_eq!(exec.moved, 0);
         assert_eq!(exec.plan_changed, 1);
         assert!(src.is_file(), "plan_changed must not move");
+        assert!(
+            exec.items.iter().any(|i| i.status == "plan_changed"),
+            "expected plan_changed item got {:?}",
+            exec.items
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1147,6 +1212,74 @@ mod tests {
     }
 
     #[test]
+    fn undo_finalize_fail_with_pending_leaves_undoing() {
+        let root = temp_root("undo-pending");
+        let db = open_db(&root);
+        let src = root.join("inbox").join("a.mp4");
+        fs::create_dir_all(src.parent().unwrap()).expect("mkdir");
+        let id = seed_file(&db, &src, "Alpha");
+        let settings = settings_with_template("lib/{{title}}.{{ext}}");
+        let preview = preview_batch_organize(&db, &settings, Some(vec![id])).expect("preview");
+        let exec =
+            execute_batch_organize(&db, &settings, plans_from_preview(&preview), None)
+                .expect("exec");
+        assert_eq!(exec.moved, 1);
+        let dest = PathBuf::from(
+            &exec
+                .items
+                .iter()
+                .find(|i| i.status == "moved")
+                .unwrap()
+                .dst_path,
+        );
+
+        // FS restores to src, heal never runs → pending left set (mirrors crash mid-undo)
+        finalize_move_fault::arm_fail_after_fs_leave_pending();
+        let undo = undo_last_organize_batch(&db, None).expect("undo");
+        finalize_move_fault::clear();
+
+        assert_eq!(undo.undone, 0);
+        assert_eq!(undo.refused, 0);
+        assert!(
+            undo.items.iter().any(|i| i.status == "undoing"),
+            "pending present → leave undoing, got {:?}",
+            undo.items
+        );
+        assert!(src.is_file(), "file restored on disk");
+        assert!(!dest.is_file());
+        {
+            let guard = db.lock().expect("lock");
+            assert!(
+                guard.get_pending_move_to(id).unwrap().is_some(),
+                "pending must remain for recover/reconcile"
+            );
+            // Files.path still at dest until recover heals
+            let file = guard.get_file_by_id(id).unwrap();
+            assert_eq!(
+                path_template::normalize_db_path(&file.path),
+                path_template::normalize_db_path(dest.to_str().unwrap())
+            );
+        }
+
+        // Startup path: recover then reconcile → undone (not undo_failed)
+        let n = recover_pending_moves(&db).expect("recover");
+        assert_eq!(n, 1);
+        let reconciled = reconcile_organize_batches_after_recovery(&db).expect("reconcile");
+        assert!(reconciled >= 1);
+        {
+            let guard = db.lock().expect("lock");
+            let items = guard.list_organize_batch_items(exec.batch_id).unwrap();
+            assert_eq!(items[0].status, "undone");
+            let file = guard.get_file_by_id(id).unwrap();
+            assert_eq!(
+                path_template::normalize_db_path(&file.path),
+                path_template::normalize_db_path(src.to_str().unwrap())
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn undo_permanent_failure_not_latest_undoable() {
         let root = temp_root("undo-permanent");
         let db = open_db(&root);
@@ -1200,14 +1333,27 @@ mod tests {
 
         let preview =
             preview_batch_organize(&db, &settings, Some(vec![id_ok, id_bad])).expect("preview");
+        assert_eq!(
+            preview
+                .items
+                .iter()
+                .find(|i| i.file_id == id_bad)
+                .map(|i| i.outcome.as_str()),
+            Some(OUTCOME_COLLISION)
+        );
+
+        // Only move-outcome plans are confirmed; collision stays out of the batch
         let exec =
             execute_batch_organize(&db, &settings, plans_from_preview(&preview), None)
                 .expect("exec");
-        assert_eq!(exec.moved, 1);
+        assert_eq!(exec.moved, 1, "only ok file moves");
+        assert!(src_bad.is_file(), "failed/skipped source stays");
+
         let undo = undo_last_organize_batch(&db, None).expect("undo");
         assert_eq!(undo.undone, 1);
+        assert_eq!(undo.refused, 0);
         assert!(src_ok.is_file());
-        assert!(src_bad.is_file());
+        assert!(src_bad.is_file(), "skipped item must stay put");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -1238,10 +1384,20 @@ mod tests {
         let undo = undo_last_organize_batch(&db, None).expect("undo");
         assert_eq!(undo.refused, 1);
         assert_eq!(undo.undone, 1);
-        assert!(undo.can_retry);
+        assert!(undo.can_retry, "refused items remain retryable");
+        assert!(undo.hint.is_some());
+        assert!(dest1.is_file(), "refused file stays at dest");
         {
             let guard = db.lock().expect("lock");
-            assert!(guard.latest_undoable_organize_batch().unwrap().is_some());
+            let logs = guard.list_error_logs(20).expect("logs");
+            assert!(
+                logs.iter().any(|l| l.category == "batch_undo"),
+                "expected ErrorLog for refused undo got {logs:?}"
+            );
+            assert!(
+                guard.latest_undoable_organize_batch().unwrap().is_some(),
+                "undo_refused batch stays undoable for retry"
+            );
         }
         let _ = fs::remove_dir_all(&root);
     }
@@ -1290,6 +1446,15 @@ mod tests {
         assert!(reconciled >= 1);
         {
             let guard = db.lock().expect("lock");
+            let file = guard.get_file_by_id(id).expect("file");
+            assert_eq!(
+                path_template::normalize_db_path(&file.path),
+                path_template::normalize_db_path(dest.to_str().unwrap())
+            );
+            assert!(
+                guard.get_pending_move_to(id).unwrap().is_none(),
+                "pending must be cleared after recover"
+            );
             let items = guard.list_organize_batch_items(batch_id).expect("items");
             assert_eq!(items[0].status, "moved");
         }
@@ -1425,10 +1590,19 @@ mod tests {
             .expect("seed draft v8");
         }
         let db = Database::new(path.to_str().unwrap()).expect("open repair");
+        let batch = db.get_organize_batch(1).expect("batch");
+        assert_eq!(batch.status, "completed");
+        let items = db.list_organize_batch_items(1).expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].status, "moved");
+        assert_eq!(items[0].src_path, "/a");
+        assert_eq!(items[0].dst_path, "/b");
+        // Draft rows lacked src_organized_at; rebuild copies NULL (cannot invent a snapshot)
+        assert!(items[0].src_organized_at.is_none());
+        assert_eq!(items[0].file_id, Some(1));
         // After rebuild, deleting the Files row must succeed (ON DELETE SET NULL)
         db.delete_file_record(1).expect("delete must succeed");
         let items = db.list_organize_batch_items(1).expect("items");
-        assert_eq!(items.len(), 1);
         assert!(
             items[0].file_id.is_none(),
             "rebuild must use ON DELETE SET NULL"

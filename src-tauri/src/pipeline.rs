@@ -782,6 +782,35 @@ pub mod heal_identity_override {
     }
 }
 
+/// Test hook: after FS rename succeeds, fail before heal and leave `pending_move_to` set
+#[cfg(any(test, feature = "test-support"))]
+pub mod finalize_move_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LEAVE_PENDING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn arm_fail_after_fs_leave_pending() {
+        LEAVE_PENDING.with(|f| f.set(true));
+    }
+
+    pub fn clear() {
+        LEAVE_PENDING.with(|f| f.set(false));
+    }
+
+    pub fn should_fail_after_fs_leave_pending() -> bool {
+        LEAVE_PENDING.with(|f| {
+            if f.get() {
+                f.set(false);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
 fn resolve_dest_phash_for_heal(dest: &Path) -> Option<String> {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(p) = heal_identity_override::take_dest_phash() {
@@ -1476,6 +1505,14 @@ fn finalize_move_inner(
             let _ = guard.clear_pending_move_to_logged(file_id, source.to_str());
         }
         return Err(e);
+    }
+
+    // Test hook: FS moved + pending set, heal never runs (simulates crash mid-finalize)
+    #[cfg(any(test, feature = "test-support"))]
+    if finalize_move_fault::should_fail_after_fs_leave_pending() {
+        return Err(anyhow::anyhow!(
+            "injected finalize failure after FS move (pending left set)"
+        ));
     }
 
     if let Some(supp) = suppressions {

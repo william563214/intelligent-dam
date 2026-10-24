@@ -37,7 +37,8 @@ pub use crate::path_template::{
     read_fs_file_id, FsFileId,
 };
 pub use crate::pipeline::{
-    heal_identity_override, recover_pending_move_for, recover_pending_moves, PipelineOptions,
+    finalize_move_fault, heal_identity_override, recover_pending_move_for, recover_pending_moves,
+    PipelineOptions,
 };
 pub use crate::settings::{AppSettings, SettingsStore};
 pub use crate::task_queue::{max_terminal_jobs, JobKind, TaskQueue};
