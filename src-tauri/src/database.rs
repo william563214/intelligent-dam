@@ -3906,10 +3906,14 @@ impl Database {
 
     /// After pending_move recovery: promote `moving` items whose Files.path already
     /// matches dst, or mark failed when still at src with no pending intent.
+    ///
+    /// For `undoing` → `undone`, also restore `Files.organized_at` from the item's
+    /// `src_organized_at` in the same transaction — `recover_pending_moves` heals
+    /// with MarkNow, which would otherwise leave organized_at=now after undo.
     pub fn reconcile_organize_batch_items_after_recovery(&self) -> SqliteResult<usize> {
         let mut stmt = self.conn.prepare(
             "SELECT i.id, i.file_id, i.src_path, i.dst_path, i.status,
-                    f.path, f.pending_move_to
+                    f.path, f.pending_move_to, i.src_organized_at
              FROM OrganizeBatchItems i
              LEFT JOIN Files f ON f.id = i.file_id
              WHERE i.status IN ('moving', 'undoing')",
@@ -3923,12 +3927,15 @@ impl Database {
                 row.get::<_, String>(4)?,
                 row.get::<_, Option<String>>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut updated = 0usize;
         let collected: Vec<_> = rows.collect::<SqliteResult<Vec<_>>>()?;
-        for (item_id, file_id, src, dst, item_status, file_path, pending) in collected {
-            let Some(_fid) = file_id else {
+        for (item_id, file_id, src, dst, item_status, file_path, pending, src_organized_at) in
+            collected
+        {
+            let Some(fid) = file_id else {
                 let status = if item_status == "undoing" {
                     "undo_failed"
                 } else {
@@ -3966,7 +3973,11 @@ impl Database {
                 }
             } else if item_status == "undoing" {
                 if path_n == src_n {
-                    self.update_organize_batch_item_status(item_id, "undone", None)?;
+                    self.complete_undoing_item_after_recovery(
+                        item_id,
+                        fid,
+                        src_organized_at.as_deref(),
+                    )?;
                     updated += 1;
                 } else if path_n == dst_n && !pending_set {
                     self.record_organize_undo_refusal(
@@ -3981,6 +3992,46 @@ impl Database {
         }
         self.refresh_organize_batch_statuses()?;
         Ok(updated)
+    }
+
+    /// Mark item `undone` and restore `Files.organized_at` from the pre-batch snapshot.
+    fn complete_undoing_item_after_recovery(
+        &self,
+        item_id: i64,
+        file_id: i64,
+        src_organized_at: Option<&str>,
+    ) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.conn.execute(
+                "UPDATE OrganizeBatchItems SET status = 'undone', error = NULL WHERE id = ?1",
+                params![item_id],
+            )?;
+            match src_organized_at {
+                None => {
+                    self.clear_file_organized_at(file_id)?;
+                }
+                Some(ts) => {
+                    self.conn.execute(
+                        "UPDATE Files SET organized_at = ?1 WHERE id = ?2",
+                        params![ts, file_id],
+                    )?;
+                }
+            }
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after complete_undoing_item_after_recovery: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Recompute batch header status from item rows

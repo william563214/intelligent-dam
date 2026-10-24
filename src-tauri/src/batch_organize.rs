@@ -1218,20 +1218,35 @@ mod tests {
         let src = root.join("inbox").join("a.mp4");
         fs::create_dir_all(src.parent().unwrap()).expect("mkdir");
         let id = seed_file(&db, &src, "Alpha");
+        // Unset before batch: recover MarkNow would leave organized_at=now unless
+        // reconcile restores the NULL snapshot when undoing → undone.
+        {
+            let guard = db.lock().expect("lock");
+            assert!(!file_has_organized_at_col(&guard, id));
+        }
         let settings = settings_with_template("lib/{{title}}.{{ext}}");
         let preview = preview_batch_organize(&db, &settings, Some(vec![id])).expect("preview");
         let exec =
             execute_batch_organize(&db, &settings, plans_from_preview(&preview), None)
                 .expect("exec");
         assert_eq!(exec.moved, 1);
-        let dest = PathBuf::from(
-            &exec
-                .items
-                .iter()
-                .find(|i| i.status == "moved")
-                .unwrap()
-                .dst_path,
+        let moved = exec
+            .items
+            .iter()
+            .find(|i| i.status == "moved")
+            .unwrap();
+        let dest = PathBuf::from(&moved.dst_path);
+        assert!(
+            moved.src_organized_at.is_none(),
+            "pre-batch organized_at was null"
         );
+        {
+            let guard = db.lock().expect("lock");
+            assert!(
+                file_has_organized_at_col(&guard, id),
+                "forward move MarkNow sets organized_at"
+            );
+        }
 
         // FS restores to src, heal never runs → pending left set (mirrors crash mid-undo)
         finalize_move_fault::arm_fail_after_fs_leave_pending();
@@ -1261,9 +1276,16 @@ mod tests {
             );
         }
 
-        // Startup path: recover then reconcile → undone (not undo_failed)
+        // Startup path: recover (MarkNow) then reconcile → undone + restore snapshot
         let n = recover_pending_moves(&db).expect("recover");
         assert_eq!(n, 1);
+        {
+            let guard = db.lock().expect("lock");
+            assert!(
+                file_has_organized_at_col(&guard, id),
+                "recover MarkNow leaves organized_at set until reconcile restores"
+            );
+        }
         let reconciled = reconcile_organize_batches_after_recovery(&db).expect("reconcile");
         assert!(reconciled >= 1);
         {
@@ -1274,6 +1296,10 @@ mod tests {
             assert_eq!(
                 path_template::normalize_db_path(&file.path),
                 path_template::normalize_db_path(src.to_str().unwrap())
+            );
+            assert!(
+                !file_has_organized_at_col(&guard, id),
+                "reconcile undoing→undone must restore src_organized_at (NULL), not leave MarkNow"
             );
         }
         let _ = fs::remove_dir_all(&root);
