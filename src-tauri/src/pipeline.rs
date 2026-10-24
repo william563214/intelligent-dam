@@ -1403,7 +1403,26 @@ pub fn finalize_move(
     dest: &Path,
     suppressions: Option<&PathSuppression>,
 ) -> Result<()> {
-    finalize_move_inner(db, file_id, source, dest, suppressions)
+    finalize_move_inner(
+        db,
+        file_id,
+        source,
+        dest,
+        suppressions,
+        crate::database::OrganizedAtWrite::MarkNow,
+    )
+}
+
+/// Like [`finalize_move`] but controls `organized_at` in the path-commit transaction (#73 undo)
+pub fn finalize_move_with_organized(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+    source: &Path,
+    dest: &Path,
+    suppressions: Option<&PathSuppression>,
+    organized: crate::database::OrganizedAtWrite,
+) -> Result<()> {
+    finalize_move_inner(db, file_id, source, dest, suppressions, organized)
 }
 
 fn finalize_move_inner(
@@ -1412,6 +1431,7 @@ fn finalize_move_inner(
     source: &Path,
     dest: &Path,
     suppressions: Option<&PathSuppression>,
+    organized: crate::database::OrganizedAtWrite,
 ) -> Result<()> {
     let new_path_str = dest
         .to_str()
@@ -1475,9 +1495,14 @@ fn finalize_move_inner(
                 file.path
             ))
         } else {
-            // heal_moved_path clears pending_move_to in the same transaction
+            // heal clears pending_move_to and applies organized_at in the same transaction
             guard
-                .heal_moved_path(file_id, &file.path, &new_path_str)
+                .heal_moved_path_with_organized(
+                    file_id,
+                    &file.path,
+                    &new_path_str,
+                    organized,
+                )
                 .map_err(|e| anyhow::anyhow!("Failed to commit moved path: {}", e))
         }
     };

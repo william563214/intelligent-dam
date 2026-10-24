@@ -190,7 +190,7 @@ export interface OrganizePreviewResult {
 export interface OrganizeBatchItem {
   id: number;
   batchId: number;
-  fileId: number;
+  fileId: number | null;
   srcPath: string;
   dstPath: string;
   size: number;
@@ -198,6 +198,8 @@ export interface OrganizeBatchItem {
   status: string;
   collision: string | null;
   error: string | null;
+  srcOrganizedAt: string | null;
+  undoAttempts: number;
 }
 
 export interface OrganizeBatch {
