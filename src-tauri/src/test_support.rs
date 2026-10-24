@@ -13,7 +13,8 @@ pub use crate::commands::{
     ResolveSuspectedOutcome, ScanResult,
 };
 pub use crate::batch_organize::{
-    OrganizeExecuteResult, OrganizePreviewItem, OrganizePreviewResult, OrganizeUndoResult,
+    OrganizeExecutePlanItem, OrganizeExecuteResult, OrganizePreviewItem, OrganizePreviewResult,
+    OrganizeUndoResult,
 };
 
 /// Convenience wrapper without pipeline enqueue (integration tests).

@@ -1007,13 +1007,20 @@ impl Database {
     }
 
     /// CREATE TABLE / INDEX for batch organize log (no transaction wrapper).
+    ///
+    /// CHECK + FK apply to newly created tables (CREATE IF NOT EXISTS). Mid-flight
+    /// DBs that already have the tables keep their original DDL; behavior is enforced
+    /// in application code as well.
     fn ensure_organize_batch_schema(&self) -> SqliteResult<()> {
         self.conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS OrganizeBatches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                status TEXT NOT NULL DEFAULT 'executing',
+                status TEXT NOT NULL DEFAULT 'executing'
+                    CHECK (status IN (
+                        'executing', 'undoing', 'completed', 'undone', 'partially_undone'
+                    )),
                 note TEXT
             );
             CREATE TABLE IF NOT EXISTS OrganizeBatchItems (
@@ -1024,10 +1031,15 @@ impl Database {
                 dst_path TEXT NOT NULL,
                 size INTEGER NOT NULL,
                 phash TEXT,
-                status TEXT NOT NULL DEFAULT 'planned',
+                status TEXT NOT NULL DEFAULT 'planned'
+                    CHECK (status IN (
+                        'planned', 'moving', 'moved', 'skipped', 'failed',
+                        'undoing', 'undone', 'undo_refused', 'plan_changed'
+                    )),
                 collision TEXT,
                 error TEXT,
-                FOREIGN KEY (batch_id) REFERENCES OrganizeBatches(id) ON DELETE CASCADE
+                FOREIGN KEY (batch_id) REFERENCES OrganizeBatches(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_id) REFERENCES Files(id)
             );
             CREATE INDEX IF NOT EXISTS idx_organize_batch_items_batch
                 ON OrganizeBatchItems(batch_id);
@@ -1897,11 +1909,26 @@ impl Database {
         Ok(v.filter(|s| !s.trim().is_empty()).is_some())
     }
 
+    /// Test helper: true when `Files.organized_at` column is non-null (#73 undo)
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn organized_at_is_set(&self, file_id: i64) -> SqliteResult<bool> {
+        self.file_has_organized_at(file_id)
+    }
+
     /// Persist organized marker (scrape/move success). Idempotent.
     pub fn mark_file_organized(&self, file_id: i64) -> SqliteResult<()> {
         self.conn.execute(
             "UPDATE Files SET organized_at = COALESCE(organized_at, CURRENT_TIMESTAMP)
              WHERE id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Clear organized marker after batch undo returns a file to its pre-batch path (#73)
+    pub fn clear_file_organized_at(&self, file_id: i64) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE Files SET organized_at = NULL WHERE id = ?1",
             params![file_id],
         )?;
         Ok(())
@@ -3485,12 +3512,48 @@ impl Database {
     }
 
     /// #73: create a batch header (status typically `executing`)
+    ///
+    /// Production execute path uses [`Self::create_organize_batch_with_items`].
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_organize_batch(&self, status: &str, note: Option<&str>) -> SqliteResult<i64> {
         self.conn.execute(
             "INSERT INTO OrganizeBatches (status, note) VALUES (?1, ?2)",
             params![status, note],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// #73: insert batch header + all items in one BEGIN IMMEDIATE transaction
+    pub fn create_organize_batch_with_items(
+        &self,
+        status: &str,
+        note: Option<&str>,
+        items: &[NewOrganizeBatchItem<'_>],
+    ) -> SqliteResult<i64> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<i64> {
+            self.conn.execute(
+                "INSERT INTO OrganizeBatches (status, note) VALUES (?1, ?2)",
+                params![status, note],
+            )?;
+            let batch_id = self.conn.last_insert_rowid();
+            for item in items {
+                self.insert_organize_batch_item(batch_id, item)?;
+            }
+            self.conn.execute("COMMIT", [])?;
+            Ok(batch_id)
+        })();
+        match tx_result {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after create_organize_batch_with_items: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn set_organize_batch_status(&self, batch_id: i64, status: &str) -> SqliteResult<()> {
@@ -3516,14 +3579,15 @@ impl Database {
         )
     }
 
-    /// Latest batch that still has `moved` items (for one-click undo)
+    /// Latest batch that still has `moved` or retryable `undo_refused` items
     pub fn latest_undoable_organize_batch(&self) -> SqliteResult<Option<OrganizeBatch>> {
         let mut stmt = self.conn.prepare(
             "SELECT b.id, b.created_at, b.status, b.note
              FROM OrganizeBatches b
              WHERE EXISTS (
                  SELECT 1 FROM OrganizeBatchItems i
-                 WHERE i.batch_id = b.id AND i.status = 'moved'
+                 WHERE i.batch_id = b.id
+                   AND i.status IN ('moved', 'undo_refused')
              )
              ORDER BY b.id DESC
              LIMIT 1",
@@ -3545,8 +3609,16 @@ impl Database {
         batch_id: i64,
         item: &NewOrganizeBatchItem<'_>,
     ) -> SqliteResult<i64> {
-        let src = normalize_db_path(item.src_path);
-        let dst = normalize_db_path(item.dst_path);
+        let src = if item.src_path.trim().is_empty() {
+            format!("(unknown file_id={})", item.file_id)
+        } else {
+            normalize_db_path(item.src_path)
+        };
+        let dst = if item.dst_path.trim().is_empty() {
+            src.clone()
+        } else {
+            normalize_db_path(item.dst_path)
+        };
         self.conn.execute(
             "INSERT INTO OrganizeBatchItems (
                 batch_id, file_id, src_path, dst_path, size, phash, status, collision
@@ -3696,10 +3768,11 @@ impl Database {
                 "undoing"
             } else if moved > 0 && (undone > 0 || undo_refused > 0) {
                 "partially_undone"
-            } else if moved == 0 && undone > 0 && undo_refused == 0 {
-                "undone"
-            } else if moved == 0 && undone > 0 {
+            } else if moved == 0 && undo_refused > 0 {
+                // All remaining targets refused — still retryable via undo
                 "partially_undone"
+            } else if moved == 0 && undone > 0 {
+                "undone"
             } else {
                 "completed"
             };

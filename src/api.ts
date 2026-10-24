@@ -7,6 +7,7 @@ import type {
   ErrorLogEntry,
   FileWithMetadata,
   OrganizeBatch,
+  OrganizeExecutePlanItem,
   OrganizeExecuteResult,
   OrganizePreviewResult,
   OrganizeUndoResult,
@@ -165,11 +166,11 @@ export async function previewBatchOrganize(
   });
 }
 
-/** #73: confirm and execute batch moves */
+/** #73: confirm and execute batch moves from previewed (fileId, dstPath) pairs */
 export async function executeBatchOrganize(
-  fileIds: number[]
+  plans: OrganizeExecutePlanItem[]
 ): Promise<OrganizeExecuteResult> {
-  return await invoke("execute_batch_organize_command", { fileIds });
+  return await invoke("execute_batch_organize_command", { plans });
 }
 
 /** #73: undo last organize batch */

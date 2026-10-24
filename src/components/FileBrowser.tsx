@@ -21,6 +21,11 @@ import {
   collision_success_message,
   handle_resolve_path_collision,
 } from "../utils/resolvePathCollision";
+import {
+  handle_confirm_batch_organize,
+  handle_confirm_batch_undo,
+  plans_from_preview_items,
+} from "../utils/batchOrganizeConfirm";
 import VideoCard from "./VideoCard";
 
 export default function FileBrowser() {
@@ -215,27 +220,21 @@ export default function FileBrowser() {
     if (!organizePreview) {
       return;
     }
-    const moveIds = organizePreview.items
-      .filter((i) => i.outcome === "move")
-      .map((i) => i.fileId);
-    if (moveIds.length === 0) {
+    const plans = plans_from_preview_items(organizePreview.items);
+    if (plans.length === 0) {
       setBatchMessage("沒有可執行的搬移項目");
       return;
     }
-    if (
-      !confirm(
-        `確認執行 ${moveIds.length} 筆模板搬移？完成後可用「還原上一批」復原。`
-      )
-    ) {
+    if (!(await handle_confirm_batch_organize(plans.length))) {
       return;
     }
     try {
       setBatchBusy(true);
       setBatchMessage(null);
-      const result = await executeBatchOrganize(moveIds);
+      const result = await executeBatchOrganize(plans);
       setOrganizePreview(null);
       setBatchMessage(
-        `批次整理完成：成功 ${result.moved}，略過 ${result.skipped}，失敗 ${result.failed}（batch #${result.batchId}）`
+        `批次整理完成：成功 ${result.moved}，略過 ${result.skipped}，計畫變更 ${result.planChanged}，失敗 ${result.failed}（batch #${result.batchId}）`
       );
       await loadFiles();
       await refreshUndoable();
@@ -249,21 +248,16 @@ export default function FileBrowser() {
   };
 
   const handleUndoLastBatch = async () => {
-    if (
-      !confirm(
-        undoableBatch
-          ? `還原批次 #${undoableBatch.id}？狀態不符的檔案會拒絕並寫入錯誤日誌。`
-          : "還原上一批整理？"
-      )
-    ) {
+    if (!(await handle_confirm_batch_undo(undoableBatch?.id))) {
       return;
     }
     try {
       setBatchBusy(true);
       setBatchMessage(null);
       const result = await undoLastOrganizeBatch();
+      const hint = result.hint ? ` — ${result.hint}` : "";
       setBatchMessage(
-        `還原完成：成功 ${result.undone}，拒絕 ${result.refused}（batch #${result.batchId}，狀態 ${result.batch.status}）`
+        `還原完成：成功 ${result.undone}，拒絕 ${result.refused}（batch #${result.batchId}，狀態 ${result.batch.status}）${hint}`
       );
       await loadFiles();
       await refreshUndoable();

@@ -207,11 +207,17 @@ export interface OrganizeBatch {
   note: string | null;
 }
 
+export interface OrganizeExecutePlanItem {
+  fileId: number;
+  dstPath: string;
+}
+
 export interface OrganizeExecuteResult {
   batchId: number;
   moved: number;
   skipped: number;
   failed: number;
+  planChanged: number;
   items: OrganizeBatchItem[];
 }
 
@@ -219,6 +225,8 @@ export interface OrganizeUndoResult {
   batchId: number;
   undone: number;
   refused: number;
+  canRetry: boolean;
+  hint: string | null;
   batch: OrganizeBatch;
   items: OrganizeBatchItem[];
 }

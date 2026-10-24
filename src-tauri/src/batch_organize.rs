@@ -13,6 +13,7 @@ use crate::pipeline::{self, dest_matches_mover_identity};
 use crate::settings::AppSettings;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -52,6 +53,14 @@ pub struct OrganizePreviewResult {
     pub skip_count: usize,
 }
 
+/// Confirmed plan entry from a prior preview (file_id + previewed dst)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeExecutePlanItem {
+    pub file_id: i64,
+    pub dst_path: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OrganizeExecuteResult {
@@ -59,6 +68,7 @@ pub struct OrganizeExecuteResult {
     pub moved: usize,
     pub skipped: usize,
     pub failed: usize,
+    pub plan_changed: usize,
     pub items: Vec<OrganizeBatchItem>,
 }
 
@@ -68,6 +78,9 @@ pub struct OrganizeUndoResult {
     pub batch_id: i64,
     pub undone: usize,
     pub refused: usize,
+    /// True when any refused item can be retried via undo again
+    pub can_retry: bool,
+    pub hint: Option<String>,
     pub batch: OrganizeBatch,
     pub items: Vec<OrganizeBatchItem>,
 }
@@ -97,6 +110,7 @@ pub fn preview_batch_organize(
     for file_id in ids {
         items.push(preview_one(db, template, file_id)?);
     }
+    dedupe_batch_destinations(&mut items);
     let move_count = items.iter().filter(|i| i.outcome == outcome_move).count();
     let skip_count = items.len().saturating_sub(move_count);
     Ok(OrganizePreviewResult {
@@ -104,6 +118,33 @@ pub fn preview_batch_organize(
         move_count,
         skip_count,
     })
+}
+
+/// Within one preview batch, only the first file may claim a normalized destination
+fn dedupe_batch_destinations(items: &mut [OrganizePreviewItem]) {
+    let mut claimed: HashMap<String, i64> = HashMap::new();
+    for item in items.iter_mut() {
+        if item.outcome != outcome_move {
+            continue;
+        }
+        if item.dst_path.trim().is_empty() {
+            continue;
+        }
+        let key = path_template::normalize_db_path(&item.dst_path);
+        if let Some(&first_id) = claimed.get(&key) {
+            item.outcome = outcome_collision.to_string();
+            item.detail = Some(format!(
+                "batch destination already claimed by file_id={first_id}"
+            ));
+            item.occupant_file_id = Some(first_id);
+        } else {
+            claimed.insert(key, item.file_id);
+        }
+    }
+}
+
+fn unknown_src_placeholder(file_id: i64) -> String {
+    format!("(unknown file_id={file_id})")
 }
 
 fn preview_one(
@@ -119,8 +160,8 @@ fn preview_one(
         Err(e) => {
             return Ok(OrganizePreviewItem {
                 file_id,
-                src_path: String::new(),
-                dst_path: String::new(),
+                src_path: unknown_src_placeholder(file_id),
+                dst_path: unknown_src_placeholder(file_id),
                 size: 0,
                 phash: None,
                 outcome: outcome_error.to_string(),
@@ -148,7 +189,7 @@ fn preview_one(
         return Ok(OrganizePreviewItem {
             file_id,
             src_path: file.path.clone(),
-            dst_path: String::new(),
+            dst_path: file.path.clone(),
             size: file.size,
             phash: file.phash.clone(),
             outcome: outcome_missing.to_string(),
@@ -181,7 +222,7 @@ fn preview_one(
             return Ok(OrganizePreviewItem {
                 file_id,
                 src_path: file.path.clone(),
-                dst_path: String::new(),
+                dst_path: file.path.clone(),
                 size: file.size,
                 phash: file.phash.clone(),
                 outcome: outcome_error.to_string(),
@@ -237,62 +278,105 @@ fn preview_one(
     })
 }
 
-/// Confirm and execute moves for previewed `move` outcomes; writes schema v8 batch log
+/// Confirm and execute moves for previewed `(file_id, dst_path)` pairs
+///
+/// Recomputes the live plan; destinations that differ from the preview are recorded
+/// as `plan_changed` and skipped. Writes schema v8 batch log in one transaction.
 pub fn execute_batch_organize(
     db: &Arc<Mutex<Database>>,
     settings: &AppSettings,
-    file_ids: Vec<i64>,
+    plans: Vec<OrganizeExecutePlanItem>,
     suppressions: Option<&PathSuppression>,
 ) -> Result<OrganizeExecuteResult> {
+    if plans.is_empty() {
+        anyhow::bail!("execute plan is empty");
+    }
+    let template = settings.output_template.trim();
+    if template.is_empty() {
+        anyhow::bail!("output_template is empty");
+    }
+
+    let file_ids: Vec<i64> = plans.iter().map(|p| p.file_id).collect();
     let preview = preview_batch_organize(db, settings, Some(file_ids))?;
-    let to_move: Vec<_> = preview
+    let preview_by_id: HashMap<i64, OrganizePreviewItem> = preview
         .items
-        .iter()
-        .filter(|i| i.outcome == outcome_move)
-        .cloned()
+        .into_iter()
+        .map(|i| (i.file_id, i))
         .collect();
-    let skipped = preview.items.len().saturating_sub(to_move.len());
+
+    let mut new_items: Vec<(OrganizePreviewItem, &'static str, Option<&'static str>)> =
+        Vec::with_capacity(plans.len());
+    let mut plan_changed = 0usize;
+    let mut skipped = 0usize;
+
+    for plan in &plans {
+        let planned_dst = path_template::normalize_db_path(&plan.dst_path);
+        let Some(live) = preview_by_id.get(&plan.file_id) else {
+            skipped += 1;
+            new_items.push((
+                OrganizePreviewItem {
+                    file_id: plan.file_id,
+                    src_path: unknown_src_placeholder(plan.file_id),
+                    dst_path: planned_dst,
+                    size: 0,
+                    phash: None,
+                    outcome: outcome_error.to_string(),
+                    detail: Some("file missing from recomputed preview".into()),
+                    occupant_file_id: None,
+                },
+                "skipped",
+                None,
+            ));
+            continue;
+        };
+
+        let live_dst = path_template::normalize_db_path(&live.dst_path);
+        if live.outcome == outcome_move && live_dst != planned_dst {
+            plan_changed += 1;
+            let mut changed = live.clone();
+            changed.detail = Some(format!(
+                "preview dst changed: planned={planned_dst} live={live_dst}"
+            ));
+            new_items.push((changed, "plan_changed", Some("plan_changed")));
+            continue;
+        }
+
+        if live.outcome != outcome_move {
+            skipped += 1;
+            let collision = if live.outcome == outcome_collision {
+                Some("destination_exists")
+            } else {
+                None
+            };
+            new_items.push((live.clone(), "skipped", collision));
+            continue;
+        }
+
+        new_items.push((live.clone(), "planned", None));
+    }
+
+    let batch_rows: Vec<NewOrganizeBatchItem<'_>> = new_items
+        .iter()
+        .map(|(item, status, collision)| NewOrganizeBatchItem {
+            file_id: item.file_id,
+            src_path: item.src_path.as_str(),
+            dst_path: item.dst_path.as_str(),
+            size: item.size,
+            phash: item.phash.as_deref(),
+            status,
+            collision: *collision,
+        })
+        .collect();
 
     let batch_id = {
         let guard = db
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
-        let batch_id = guard.create_organize_batch("executing", Some("batch organize"))?;
-        for item in &preview.items {
-            let status = if item.outcome == outcome_move {
-                "planned"
-            } else {
-                "skipped"
-            };
-            let collision = if item.outcome == outcome_collision {
-                Some("destination_exists")
-            } else {
-                None
-            };
-            let src = if item.src_path.is_empty() {
-                ""
-            } else {
-                item.src_path.as_str()
-            };
-            let dst = if item.dst_path.is_empty() {
-                src
-            } else {
-                item.dst_path.as_str()
-            };
-            guard.insert_organize_batch_item(
-                batch_id,
-                &NewOrganizeBatchItem {
-                    file_id: item.file_id,
-                    src_path: src,
-                    dst_path: dst,
-                    size: item.size,
-                    phash: item.phash.as_deref(),
-                    status,
-                    collision,
-                },
-            )?;
-        }
-        batch_id
+        guard.create_organize_batch_with_items(
+            "executing",
+            Some("batch organize"),
+            &batch_rows,
+        )?
     };
 
     let mut moved = 0usize;
@@ -310,15 +394,39 @@ pub fn execute_batch_organize(
     };
 
     for item in planned_ids {
+        let source = PathBuf::from(&item.src_path);
+        let dest = PathBuf::from(&item.dst_path);
+        let dst_norm = path_template::normalize_db_path(&item.dst_path);
+
+        // Recheck collision / occupant under the same lock before marking moving
         {
             let guard = db
                 .lock()
                 .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
+            if path_template::destination_collides(&source, &dest) {
+                guard.update_organize_batch_item_status(
+                    item.id,
+                    "skipped",
+                    Some("destination_collides at execute"),
+                )?;
+                skipped += 1;
+                continue;
+            }
+            if let Some(occupant) = guard.find_file_occupying_path(&dst_norm, item.file_id)? {
+                guard.update_organize_batch_item_status(
+                    item.id,
+                    "skipped",
+                    Some(&format!(
+                        "destination occupied by file_id={} at execute",
+                        occupant.id
+                    )),
+                )?;
+                skipped += 1;
+                continue;
+            }
             guard.update_organize_batch_item_status(item.id, "moving", None)?;
         }
 
-        let source = PathBuf::from(&item.src_path);
-        let dest = PathBuf::from(&item.dst_path);
         match pipeline::finalize_move(db, item.file_id, &source, &dest, suppressions) {
             Ok(()) => {
                 let guard = db
@@ -359,11 +467,12 @@ pub fn execute_batch_organize(
         moved,
         skipped,
         failed,
+        plan_changed,
         items,
     })
 }
 
-/// One-click undo of the latest batch that still has `moved` items
+/// One-click undo of the latest batch that still has `moved` / `undo_refused` items
 pub fn undo_last_organize_batch(
     db: &Arc<Mutex<Database>>,
     suppressions: Option<&PathSuppression>,
@@ -384,12 +493,12 @@ pub fn undo_last_organize_batch(
         guard.set_organize_batch_status(batch.id, "undoing")?;
     }
 
-    let moved_items = {
+    let undo_items = {
         let guard = db
             .lock()
             .map_err(|e| anyhow::anyhow!("Database lock error: {}", e))?;
         let mut items = guard.list_organize_batch_items(batch.id)?;
-        items.retain(|i| i.status == "moved");
+        items.retain(|i| i.status == "moved" || i.status == "undo_refused");
         items.reverse();
         items
     };
@@ -397,7 +506,7 @@ pub fn undo_last_organize_batch(
     let mut undone = 0usize;
     let mut refused = 0usize;
 
-    for item in moved_items {
+    for item in undo_items {
         match undo_one_item(db, &item, suppressions) {
             Ok(true) => undone += 1,
             Ok(false) => refused += 1,
@@ -432,10 +541,22 @@ pub fn undo_last_organize_batch(
         (batch, items)
     };
 
+    let can_retry = refused > 0
+        && items
+            .iter()
+            .any(|i| i.status == "undo_refused" || i.status == "moved");
+    let hint = if can_retry {
+        Some("部分檔案還原被拒絕（可再次點「還原上一批」重試符合條件者）".into())
+    } else {
+        None
+    };
+
     Ok(OrganizeUndoResult {
         batch_id: batch.id,
         undone,
         refused,
+        can_retry,
+        hint,
         batch,
         items,
     })
@@ -533,6 +654,8 @@ fn undo_one_item(
                 expected_src
             );
         }
+        // finalize_move/heal marks organized_at; undo restores pre-batch path so clear it
+        guard.clear_file_organized_at(item.file_id)?;
         guard.update_organize_batch_item_status(item.id, "undone", None)?;
     }
     Ok(true)
@@ -618,6 +741,22 @@ mod tests {
         id
     }
 
+    fn plans_from_preview(preview: &OrganizePreviewResult) -> Vec<OrganizeExecutePlanItem> {
+        preview
+            .items
+            .iter()
+            .filter(|i| i.outcome == outcome_move)
+            .map(|i| OrganizeExecutePlanItem {
+                file_id: i.file_id,
+                dst_path: i.dst_path.clone(),
+            })
+            .collect()
+    }
+
+    fn file_has_organized_at_col(db: &Database, file_id: i64) -> bool {
+        db.organized_at_is_set(file_id).expect("organized_at probe")
+    }
+
     #[test]
     fn preview_is_read_only_no_fs_or_db_path_change() {
         let root = temp_root("preview-ro");
@@ -645,7 +784,96 @@ mod tests {
     }
 
     #[test]
-    fn execute_then_undo_restores_paths() {
+    fn preview_dedupes_same_destination_within_batch() {
+        let root = temp_root("preview-dedupe");
+        let db = open_db(&root);
+        let src_a = root.join("inbox").join("a.mp4");
+        let src_b = root.join("inbox").join("b.mp4");
+        fs::create_dir_all(src_a.parent().unwrap()).expect("mkdir");
+        let id_a = seed_file(&db, &src_a, "SameTitle");
+        let id_b = seed_file(&db, &src_b, "SameTitle");
+        // Same title → same rendered destination
+        let settings = settings_with_template("lib/{{title}}.{{ext}}");
+
+        let preview =
+            preview_batch_organize(&db, &settings, Some(vec![id_a, id_b])).expect("preview");
+        assert_eq!(preview.move_count, 1);
+        let outcomes: HashMap<i64, String> = preview
+            .items
+            .iter()
+            .map(|i| (i.file_id, i.outcome.clone()))
+            .collect();
+        assert_eq!(outcomes.get(&id_a).map(String::as_str), Some(outcome_move));
+        assert_eq!(
+            outcomes.get(&id_b).map(String::as_str),
+            Some(outcome_collision)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execute_skips_when_preview_destination_changed() {
+        let root = temp_root("plan-changed");
+        let db = open_db(&root);
+        let src = root.join("inbox").join("a.mp4");
+        fs::create_dir_all(src.parent().unwrap()).expect("mkdir");
+        let id = seed_file(&db, &src, "Alpha");
+        let settings = settings_with_template("lib/{{title}}.{{ext}}");
+        let preview = preview_batch_organize(&db, &settings, Some(vec![id])).expect("preview");
+        let mut plans = plans_from_preview(&preview);
+        assert_eq!(plans.len(), 1);
+        plans[0].dst_path = root.join("lib").join("Stale.mp4").to_string_lossy().into();
+
+        let exec = execute_batch_organize(&db, &settings, plans, None).expect("exec");
+        assert_eq!(exec.moved, 0);
+        assert_eq!(exec.plan_changed, 1);
+        assert!(src.is_file(), "plan_changed must not move");
+        assert!(
+            exec.items.iter().any(|i| i.status == "plan_changed"),
+            "expected plan_changed item got {:?}",
+            exec.items
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execute_rechecks_collision_before_finalize() {
+        let root = temp_root("exec-recheck");
+        let db = open_db(&root);
+        let src_a = root.join("inbox").join("a.mp4");
+        let src_b = root.join("inbox").join("b.mp4");
+        fs::create_dir_all(src_a.parent().unwrap()).expect("mkdir");
+        let id_a = seed_file(&db, &src_a, "TitleA");
+        let id_b = seed_file(&db, &src_b, "TitleB");
+        let settings = settings_with_template("lib/{{title}}.{{ext}}");
+        let preview =
+            preview_batch_organize(&db, &settings, Some(vec![id_a, id_b])).expect("preview");
+        assert_eq!(preview.move_count, 2);
+        // Force both plans onto the same destination after preview (simulates race)
+        let shared = preview.items[0].dst_path.clone();
+        let plans = vec![
+            OrganizeExecutePlanItem {
+                file_id: id_a,
+                dst_path: shared.clone(),
+            },
+            OrganizeExecutePlanItem {
+                file_id: id_b,
+                dst_path: shared,
+            },
+        ];
+        // Live recomputation marks second as plan_changed OR first moves and second
+        // hits destination_collides — either way only one file lands at shared path.
+        let exec = execute_batch_organize(&db, &settings, plans, None).expect("exec");
+        assert!(
+            exec.moved <= 1,
+            "must not silently overwrite; moved={}",
+            exec.moved
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn execute_then_undo_restores_paths_and_clears_organized_at() {
         let root = temp_root("exec-undo");
         let db = open_db(&root);
         let src = root.join("inbox").join("a.mp4");
@@ -653,7 +881,10 @@ mod tests {
         let id = seed_file(&db, &src, "Alpha");
         let settings = settings_with_template("lib/{{title}}.{{ext}}");
 
-        let exec = execute_batch_organize(&db, &settings, vec![id], None).expect("exec");
+        let preview = preview_batch_organize(&db, &settings, Some(vec![id])).expect("preview");
+        let exec =
+            execute_batch_organize(&db, &settings, plans_from_preview(&preview), None)
+                .expect("exec");
         assert_eq!(exec.moved, 1);
         assert_eq!(exec.failed, 0);
         let dest = PathBuf::from(&exec.items.iter().find(|i| i.status == "moved").unwrap().dst_path);
@@ -661,10 +892,9 @@ mod tests {
         assert!(!src.is_file());
         {
             let guard = db.lock().expect("lock");
-            let file = guard.get_file_by_id(id).expect("file");
-            assert_eq!(
-                path_template::normalize_db_path(&file.path),
-                path_template::normalize_db_path(dest.to_str().unwrap())
+            assert!(
+                file_has_organized_at_col(&guard, id),
+                "move marks organized_at"
             );
         }
 
@@ -681,6 +911,10 @@ mod tests {
                 path_template::normalize_db_path(src.to_str().unwrap())
             );
             assert_eq!(undo.batch.status, "undone");
+            assert!(
+                !file_has_organized_at_col(&guard, id),
+                "undo must clear organized_at column"
+            );
         }
         let _ = fs::remove_dir_all(&root);
     }
@@ -694,7 +928,6 @@ mod tests {
         fs::create_dir_all(src_ok.parent().unwrap()).expect("mkdir");
         let id_ok = seed_file(&db, &src_ok, "OkTitle");
         let id_bad = seed_file(&db, &src_bad, "BadTitle");
-        // Template is relative to source parent (inbox/) so collide at inbox/out/...
         let bad_dest = root.join("inbox").join("out").join("BadTitle.mp4");
         fs::create_dir_all(bad_dest.parent().unwrap()).expect("mkdir");
         fs::write(&bad_dest, b"occupant").expect("occupant");
@@ -712,9 +945,9 @@ mod tests {
         );
 
         let exec =
-            execute_batch_organize(&db, &settings, vec![id_ok, id_bad], None).expect("exec");
+            execute_batch_organize(&db, &settings, plans_from_preview(&preview), None)
+                .expect("exec");
         assert_eq!(exec.moved, 1, "only ok file moves");
-        assert!(exec.skipped >= 1, "collision skipped");
         assert!(src_bad.is_file(), "failed/skipped source stays");
 
         let undo = undo_last_organize_batch(&db, None).expect("undo");
@@ -726,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_refuses_size_mismatch_and_continues() {
+    fn undo_refuses_size_mismatch_and_continues_with_retry_hint() {
         let root = temp_root("undo-refuse");
         let db = open_db(&root);
         let src1 = root.join("inbox").join("one.mp4");
@@ -736,31 +969,35 @@ mod tests {
         let id2 = seed_file(&db, &src2, "Two");
         let settings = settings_with_template("lib/{{title}}.{{ext}}");
 
-        let exec = execute_batch_organize(&db, &settings, vec![id1, id2], None).expect("exec");
+        let preview =
+            preview_batch_organize(&db, &settings, Some(vec![id1, id2])).expect("preview");
+        let exec =
+            execute_batch_organize(&db, &settings, plans_from_preview(&preview), None)
+                .expect("exec");
         assert_eq!(exec.moved, 2);
 
         let dest1 = {
             let guard = db.lock().expect("lock");
             PathBuf::from(guard.get_file_by_id(id1).unwrap().path)
         };
-        // Tamper destination size so undo refuses this file
         fs::write(&dest1, b"tampered-different-size!!!!").expect("tamper");
 
         let undo = undo_last_organize_batch(&db, None).expect("undo");
         assert_eq!(undo.refused, 1);
         assert_eq!(undo.undone, 1);
+        assert!(undo.can_retry, "refused items remain retryable");
+        assert!(undo.hint.is_some());
         assert!(dest1.is_file(), "refused file stays at dest");
-        assert!(src2.is_file() || {
-            let guard = db.lock().unwrap();
-            path_template::normalize_db_path(&guard.get_file_by_id(id2).unwrap().path)
-                == path_template::normalize_db_path(src2.to_str().unwrap())
-        });
         {
             let guard = db.lock().expect("lock");
             let logs = guard.list_error_logs(20).expect("logs");
             assert!(
                 logs.iter().any(|l| l.category == "batch_undo"),
                 "expected ErrorLog for refused undo got {logs:?}"
+            );
+            assert!(
+                guard.latest_undoable_organize_batch().unwrap().is_some(),
+                "undo_refused batch stays undoable for retry"
             );
         }
         let _ = fs::remove_dir_all(&root);
@@ -795,7 +1032,6 @@ mod tests {
                     },
                 )
                 .expect("item");
-            // Simulate: pending set + FS moved + DB not committed
             let fs_id = path_template::read_fs_file_id(&src).ok().flatten();
             guard
                 .set_pending_move_to(id, dest.to_str().unwrap(), fs_id)
@@ -831,6 +1067,21 @@ mod tests {
         assert_eq!(guard.read_user_version().unwrap(), 8);
         let batch = guard.create_organize_batch("completed", None).unwrap();
         assert!(batch > 0);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn error_preview_does_not_use_empty_src_path() {
+        let root = temp_root("error-src");
+        let db = open_db(&root);
+        let settings = settings_with_template("lib/{{title}}.{{ext}}");
+        let preview =
+            preview_batch_organize(&db, &settings, Some(vec![999_999])).expect("preview");
+        assert_eq!(preview.items[0].outcome, outcome_error);
+        assert!(
+            !preview.items[0].src_path.is_empty(),
+            "error row must keep a non-empty src_path"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
