@@ -565,6 +565,53 @@ mod tests {
     }
 
     #[test]
+    fn size_change_resets_stability_even_when_mtime_fixed() {
+        // Refs #68: isolate the size check — grow size each poll, keep mtime fixed.
+        // Deterministic via should_abort (same pattern as mtime-churn test).
+        let path = unique_temp_file("size_churn");
+        fs::write(&path, b"x").unwrap();
+
+        let path_for_cb = path.clone();
+        let tick = Cell::new(0u64);
+        let fixed_mtime = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        let opts = StabilityOptions {
+            poll_interval: Duration::from_millis(25),
+            stable_checks: 3,
+            timeout: Duration::from_millis(600),
+            missing_grace: Duration::from_millis(100),
+            held_degrade_after: Duration::from_secs(30),
+        };
+
+        let err = wait_until_stable(&path, &opts, || {
+            let next = tick.get().saturating_add(1);
+            tick.set(next);
+            let mut file = File::options()
+                .write(true)
+                .open(&path_for_cb)
+                .expect("open for size churn");
+            file.seek(SeekFrom::End(0)).expect("seek end");
+            file.write_all(b"x").expect("append byte");
+            // Re-stamp the same mtime so only size can reset the stable streak
+            file.set_modified(fixed_mtime).expect("set_modified fixed");
+            file.sync_all().expect("sync after append");
+            drop(file);
+            let meta = fs::metadata(&path_for_cb).expect("meta");
+            assert_eq!(
+                meta.modified().ok(),
+                Some(fixed_mtime),
+                "mtime must stay fixed"
+            );
+            assert_eq!(meta.len(), 1 + next, "size must grow each poll");
+            false
+        })
+        .expect_err("size churn");
+        assert!(matches!(err, StabilityError::TimedOut { .. }));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn mtime_change_resets_stability_even_when_size_unchanged() {
         // Refs #68: gate must treat mtime churn (size fixed) as not-complete.
         // Deterministic: bump mtime inside should_abort (called every poll) so
