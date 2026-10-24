@@ -782,6 +782,35 @@ pub mod heal_identity_override {
     }
 }
 
+/// Test hook: after FS rename succeeds, fail before heal and leave `pending_move_to` set
+#[cfg(any(test, feature = "test-support"))]
+pub mod finalize_move_fault {
+    use std::cell::Cell;
+
+    thread_local! {
+        static LEAVE_PENDING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn arm_fail_after_fs_leave_pending() {
+        LEAVE_PENDING.with(|f| f.set(true));
+    }
+
+    pub fn clear() {
+        LEAVE_PENDING.with(|f| f.set(false));
+    }
+
+    pub fn should_fail_after_fs_leave_pending() -> bool {
+        LEAVE_PENDING.with(|f| {
+            if f.get() {
+                f.set(false);
+                true
+            } else {
+                false
+            }
+        })
+    }
+}
+
 fn resolve_dest_phash_for_heal(dest: &Path) -> Option<String> {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(p) = heal_identity_override::take_dest_phash() {
@@ -1403,7 +1432,26 @@ pub fn finalize_move(
     dest: &Path,
     suppressions: Option<&PathSuppression>,
 ) -> Result<()> {
-    finalize_move_inner(db, file_id, source, dest, suppressions)
+    finalize_move_inner(
+        db,
+        file_id,
+        source,
+        dest,
+        suppressions,
+        crate::database::OrganizedAtWrite::MarkNow,
+    )
+}
+
+/// Like [`finalize_move`] but controls `organized_at` in the path-commit transaction (#73 undo)
+pub fn finalize_move_with_organized(
+    db: &Arc<Mutex<Database>>,
+    file_id: i64,
+    source: &Path,
+    dest: &Path,
+    suppressions: Option<&PathSuppression>,
+    organized: crate::database::OrganizedAtWrite,
+) -> Result<()> {
+    finalize_move_inner(db, file_id, source, dest, suppressions, organized)
 }
 
 fn finalize_move_inner(
@@ -1412,6 +1460,7 @@ fn finalize_move_inner(
     source: &Path,
     dest: &Path,
     suppressions: Option<&PathSuppression>,
+    organized: crate::database::OrganizedAtWrite,
 ) -> Result<()> {
     let new_path_str = dest
         .to_str()
@@ -1458,6 +1507,14 @@ fn finalize_move_inner(
         return Err(e);
     }
 
+    // Test hook: FS moved + pending set, heal never runs (simulates crash mid-finalize)
+    #[cfg(any(test, feature = "test-support"))]
+    if finalize_move_fault::should_fail_after_fs_leave_pending() {
+        return Err(anyhow::anyhow!(
+            "injected finalize failure after FS move (pending left set)"
+        ));
+    }
+
     if let Some(supp) = suppressions {
         supp.suppress(dest);
     }
@@ -1475,9 +1532,14 @@ fn finalize_move_inner(
                 file.path
             ))
         } else {
-            // heal_moved_path clears pending_move_to in the same transaction
+            // heal clears pending_move_to and applies organized_at in the same transaction
             guard
-                .heal_moved_path(file_id, &file.path, &new_path_str)
+                .heal_moved_path_with_organized(
+                    file_id,
+                    &file.path,
+                    &new_path_str,
+                    organized,
+                )
                 .map_err(|e| anyhow::anyhow!("Failed to commit moved path: {}", e))
         }
     };

@@ -147,6 +147,61 @@ pub struct ErrorLogEntry {
     pub detail: Option<String>,
 }
 
+/// Header row for a batch organize / undo log (#73)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeBatch {
+    pub id: i64,
+    pub created_at: String,
+    pub status: String,
+    pub note: Option<String>,
+}
+
+/// One planned / executed move inside a batch (#73)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeBatchItem {
+    pub id: i64,
+    pub batch_id: i64,
+    /// Nullable: ON DELETE SET NULL when Files row is removed
+    pub file_id: Option<i64>,
+    pub src_path: String,
+    pub dst_path: String,
+    pub size: u64,
+    pub phash: Option<String>,
+    pub status: String,
+    pub collision: Option<String>,
+    pub error: Option<String>,
+    /// Snapshot of Files.organized_at before the batch move (restore on undo)
+    pub src_organized_at: Option<String>,
+    pub undo_attempts: i64,
+}
+
+/// Fields for inserting a batch item before / during execute
+#[derive(Debug, Clone)]
+pub struct NewOrganizeBatchItem<'a> {
+    pub file_id: Option<i64>,
+    pub src_path: &'a str,
+    pub dst_path: &'a str,
+    pub size: u64,
+    pub phash: Option<&'a str>,
+    pub status: &'a str,
+    pub collision: Option<&'a str>,
+    pub src_organized_at: Option<&'a str>,
+}
+
+/// How `heal_moved_path` should write `Files.organized_at`
+#[derive(Debug, Clone)]
+pub enum OrganizedAtWrite {
+    /// Mark organized now (forward organize / pipeline move)
+    MarkNow,
+    /// Restore pre-batch value (None clears the column)
+    Restore(Option<String>),
+}
+
+/// Max retryable undo refusals before an item becomes permanent `undo_failed`
+pub const MAX_ORGANIZE_UNDO_ATTEMPTS: i64 = 3;
+
 /// Durable task-queue row (`Jobs` table / #34)
 #[derive(Debug, Clone)]
 pub struct JobRow {
@@ -189,7 +244,8 @@ pub struct Database {
 /// 5 = #38 DuplicateTombstones + Files.organized_at（durable organized）
 /// 6 = #40 PathCollisions（模板目的地碰撞）
 /// 7 = #66 Files.pending_move_to + pending_source_vol/idx（搬檔前意圖／來源 fs id）
-const SCHEMA_USER_VERSION: i32 = 7;
+/// 8 = #73 OrganizeBatches / OrganizeBatchItems（整批整理 log 與一鍵還原）
+const SCHEMA_USER_VERSION: i32 = 8;
 
 /// 對外查詢目前程式支援的 schema user_version（整合測試用）
 #[cfg(any(test, feature = "test-support"))]
@@ -236,6 +292,10 @@ impl Database {
         // later builds added pending_source_vol/idx — repair without re-running mig7.
         if version_after >= 7 {
             self.ensure_v7_columns()?;
+        }
+        // Mid-flight v8 may stamp user_version without both batch tables — repair.
+        if version_after >= 8 {
+            self.ensure_v8_tables()?;
         }
         // #61 / #63: idempotent repair of legacy path strings (no schema bump).
         // Trailing seps + Windows prefixes/separators; NFC rewrite only on macOS.
@@ -589,13 +649,9 @@ impl Database {
             )?;
         }
         // Backfill semantics unchanged (#54 tracks rule changes separately).
-        self.conn.execute_batch(
+        // Jobs may be absent on incomplete mid-flight DBs — guard the subquery.
+        let jobs_clause = if self.table_exists("Jobs")? {
             "
-            UPDATE Files SET organized_at = CURRENT_TIMESTAMP
-            WHERE organized_at IS NULL
-              AND (
-                id IN (SELECT file_id FROM Metadata)
-                OR id IN (SELECT file_id FROM FileTags)
                 OR id IN (
                     SELECT CAST(
                         CASE WHEN json_valid(payload)
@@ -606,9 +662,21 @@ impl Database {
                     FROM Jobs
                     WHERE type = 'pipeline' AND status = 'succeeded'
                 )
+            "
+        } else {
+            ""
+        };
+        self.conn.execute_batch(&format!(
+            "
+            UPDATE Files SET organized_at = CURRENT_TIMESTAMP
+            WHERE organized_at IS NULL
+              AND (
+                id IN (SELECT file_id FROM Metadata)
+                OR id IN (SELECT file_id FROM FileTags)
+                {jobs_clause}
               );
-            ",
-        )?;
+            "
+        ))?;
         Ok(())
     }
 
@@ -757,6 +825,7 @@ impl Database {
             5 => self.migration_5_duplicate_tombstones(),
             6 => self.migration_6_path_collisions(),
             7 => self.migration_7_pending_move_to(),
+            8 => self.migration_8_organize_batches(),
             other => {
                 // 用 SqliteFailure 而非 InvalidParameterName
                 // 避免顯示 Invalid parameter name 前綴
@@ -899,6 +968,217 @@ impl Database {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// #73 OrganizeBatches + OrganizeBatchItems — durable batch move log for undo
+    ///
+    /// Idempotent via CREATE TABLE IF NOT EXISTS / CREATE INDEX IF NOT EXISTS.
+    fn migration_8_organize_batches(&self) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.ensure_organize_batch_schema()?;
+            self.set_user_version(8)?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after organize_batches migration error: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Idempotent v8 table repair when user_version >= 8 but tables/indexes missing
+    /// or earlier draft DDL lacks nullable file_id / CHECK / undo columns.
+    fn ensure_v8_tables(&self) -> SqliteResult<()> {
+        let need_batches = !self.table_exists("OrganizeBatches")?;
+        let need_items = !self.table_exists("OrganizeBatchItems")?;
+        let need_rebuild = !need_batches
+            && !need_items
+            && self.organize_batch_schema_stale()?;
+        if !need_batches && !need_items && !need_rebuild {
+            self.conn.execute_batch(
+                "
+                CREATE INDEX IF NOT EXISTS idx_organize_batch_items_batch
+                    ON OrganizeBatchItems(batch_id);
+                CREATE INDEX IF NOT EXISTS idx_organize_batches_created
+                    ON OrganizeBatches(created_at DESC);
+                ",
+            )?;
+            return Ok(());
+        }
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.ensure_organize_batch_schema()?;
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!("warn: ROLLBACK failed after ensure_v8_tables error: {rb}");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// True when existing OrganizeBatchItems lacks nullable file_id / undo columns /
+    /// ON DELETE SET NULL (earlier draft v8 DDL).
+    fn organize_batch_schema_stale(&self) -> SqliteResult<bool> {
+        if !self.table_exists("OrganizeBatchItems")? {
+            return Ok(false);
+        }
+        let mut stmt = self.conn.prepare("PRAGMA table_info(OrganizeBatchItems)")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(3)?, // notnull
+            ))
+        })?;
+        let mut file_id_notnull: Option<i64> = None;
+        let mut has_src_organized = false;
+        let mut has_undo_attempts = false;
+        for row in rows {
+            let (name, notnull) = row?;
+            match name.as_str() {
+                "file_id" => file_id_notnull = Some(notnull),
+                "src_organized_at" => has_src_organized = true,
+                "undo_attempts" => has_undo_attempts = true,
+                _ => {}
+            }
+        }
+        if file_id_notnull != Some(0) || !has_src_organized || !has_undo_attempts {
+            return Ok(true);
+        }
+        // Draft v8 sometimes omitted ON DELETE SET NULL on file_id
+        let mut fk_stmt = self
+            .conn
+            .prepare("PRAGMA foreign_key_list(OrganizeBatchItems)")?;
+        let fk_rows = fk_stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(3)?, // from
+                row.get::<_, String>(6)?, // on_delete
+            ))
+        })?;
+        let mut file_id_on_delete: Option<String> = None;
+        for row in fk_rows {
+            let (from, on_delete) = row?;
+            if from == "file_id" {
+                file_id_on_delete = Some(on_delete);
+            }
+        }
+        Ok(file_id_on_delete.as_deref() != Some("SET NULL"))
+    }
+
+    /// CREATE / rebuild batch organize tables (no outer transaction required).
+    ///
+    /// Earlier draft v8 DBs used NOT NULL file_id without ON DELETE SET NULL and
+    /// lacked CHECK / undo columns — those are rebuilt here (data copied).
+    fn ensure_organize_batch_schema(&self) -> SqliteResult<()> {
+        let both = self.table_exists("OrganizeBatches")?
+            && self.table_exists("OrganizeBatchItems")?;
+        if both && self.organize_batch_schema_stale()? {
+            self.rebuild_organize_batch_tables()?;
+        } else if !both {
+            self.create_organize_batch_tables_fresh()?;
+        }
+        self.conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_organize_batch_items_batch
+                ON OrganizeBatchItems(batch_id);
+            CREATE INDEX IF NOT EXISTS idx_organize_batches_created
+                ON OrganizeBatches(created_at DESC);
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn create_organize_batch_tables_fresh(&self) -> SqliteResult<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS OrganizeBatches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL DEFAULT 'executing'
+                    CHECK (status IN (
+                        'executing', 'undoing', 'completed', 'undone', 'partially_undone'
+                    )),
+                note TEXT
+            );
+            CREATE TABLE IF NOT EXISTS OrganizeBatchItems (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                file_id INTEGER,
+                src_path TEXT NOT NULL,
+                dst_path TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                phash TEXT,
+                status TEXT NOT NULL DEFAULT 'planned'
+                    CHECK (status IN (
+                        'planned', 'moving', 'moved', 'skipped', 'failed',
+                        'undoing', 'undone', 'undo_refused', 'undo_failed', 'plan_changed'
+                    )),
+                collision TEXT,
+                error TEXT,
+                src_organized_at TEXT,
+                undo_attempts INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (batch_id) REFERENCES OrganizeBatches(id) ON DELETE CASCADE,
+                FOREIGN KEY (file_id) REFERENCES Files(id) ON DELETE SET NULL
+            );
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn rebuild_organize_batch_tables(&self) -> SqliteResult<()> {
+        self.conn.execute_batch(
+            "
+            DROP TABLE IF EXISTS OrganizeBatchItems_mig;
+            DROP TABLE IF EXISTS OrganizeBatches_mig;
+            ALTER TABLE OrganizeBatchItems RENAME TO OrganizeBatchItems_mig;
+            ALTER TABLE OrganizeBatches RENAME TO OrganizeBatches_mig;
+            ",
+        )?;
+        self.create_organize_batch_tables_fresh()?;
+        self.conn.execute_batch(
+            "
+            INSERT INTO OrganizeBatches (id, created_at, status, note)
+            SELECT id, created_at, status, note FROM OrganizeBatches_mig;
+            INSERT INTO OrganizeBatchItems (
+                id, batch_id, file_id, src_path, dst_path, size, phash,
+                status, collision, error, src_organized_at, undo_attempts
+            )
+            SELECT
+                i.id, i.batch_id,
+                CASE WHEN f.id IS NULL THEN NULL ELSE i.file_id END,
+                i.src_path, i.dst_path, i.size, i.phash,
+                CASE
+                    WHEN i.status IN (
+                        'planned', 'moving', 'moved', 'skipped', 'failed',
+                        'undoing', 'undone', 'undo_refused', 'undo_failed', 'plan_changed'
+                    ) THEN i.status
+                    ELSE 'failed'
+                END,
+                i.collision, i.error,
+                -- Draft v8 had no src_organized_at column; rebuilt rows get NULL
+                NULL,
+                0
+            FROM OrganizeBatchItems_mig i
+            LEFT JOIN Files f ON f.id = i.file_id;
+            DROP TABLE OrganizeBatchItems_mig;
+            DROP TABLE OrganizeBatches_mig;
+            ",
+        )?;
         Ok(())
     }
 
@@ -1761,6 +2041,12 @@ impl Database {
         Ok(v.filter(|s| !s.trim().is_empty()).is_some())
     }
 
+    /// Test helper: true when `Files.organized_at` column is non-null (#73 undo)
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn organized_at_is_set(&self, file_id: i64) -> SqliteResult<bool> {
+        self.file_has_organized_at(file_id)
+    }
+
     /// Persist organized marker (scrape/move success). Idempotent.
     pub fn mark_file_organized(&self, file_id: i64) -> SqliteResult<()> {
         self.conn.execute(
@@ -1769,6 +2055,35 @@ impl Database {
             params![file_id],
         )?;
         Ok(())
+    }
+
+    /// Clear organized marker after batch undo returns a file to its pre-batch path (#73)
+    pub fn clear_file_organized_at(&self, file_id: i64) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE Files SET organized_at = NULL WHERE id = ?1",
+            params![file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Raw `Files.organized_at` string (None when unset) for batch undo restore
+    pub fn get_file_organized_at(&self, file_id: i64) -> SqliteResult<Option<String>> {
+        let v: Option<String> = self.conn.query_row(
+            "SELECT organized_at FROM Files WHERE id = ?1",
+            params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(v.filter(|s| !s.trim().is_empty()))
+    }
+
+    /// True when a Files row with this id exists
+    pub fn file_row_exists(&self, file_id: i64) -> SqliteResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM Files WHERE id = ?1)",
+            params![file_id],
+            |row| row.get(0),
+        )?;
+        Ok(n != 0)
     }
 
     pub fn has_file_tags(&self, file_id: i64) -> SqliteResult<bool> {
@@ -2232,12 +2547,28 @@ impl Database {
 
     /// #50 / #66: after crash mid-move, atomically repair Files.path when FS already moved
     /// Re-checks occupancy (NOCASE where applicable), expected old path, path update,
-    /// clears `pending_move_to`, organized_at, and missing→ready in one BEGIN IMMEDIATE
+    /// clears `pending_move_to`, marks organized, and missing→ready in one BEGIN IMMEDIATE
     pub fn heal_moved_path(
         &self,
         file_id: i64,
         expected_old_path: &str,
         new_path: &str,
+    ) -> SqliteResult<()> {
+        self.heal_moved_path_with_organized(
+            file_id,
+            expected_old_path,
+            new_path,
+            OrganizedAtWrite::MarkNow,
+        )
+    }
+
+    /// Like [`Self::heal_moved_path`] but controls `organized_at` in the same transaction
+    pub fn heal_moved_path_with_organized(
+        &self,
+        file_id: i64,
+        expected_old_path: &str,
+        new_path: &str,
+        organized: OrganizedAtWrite,
     ) -> SqliteResult<()> {
         // #61: all path comparisons go through normalize_db_path (same as overwrite)
         let expected_old_path = normalize_db_path(expected_old_path);
@@ -2267,7 +2598,20 @@ impl Database {
                  WHERE id = ?2",
                 params![new_path, file_id],
             )?;
-            self.mark_file_organized(file_id)?;
+            match &organized {
+                OrganizedAtWrite::MarkNow => {
+                    self.mark_file_organized(file_id)?;
+                }
+                OrganizedAtWrite::Restore(None) => {
+                    self.clear_file_organized_at(file_id)?;
+                }
+                OrganizedAtWrite::Restore(Some(ts)) => {
+                    self.conn.execute(
+                        "UPDATE Files SET organized_at = ?1 WHERE id = ?2",
+                        params![ts, file_id],
+                    )?;
+                }
+            }
 
             // S2: reconcile may have marked missing while source path was gone
             let after = self.get_file_by_id(file_id)?;
@@ -3346,6 +3690,390 @@ impl Database {
             out.push(row?);
         }
         Ok(out)
+    }
+
+    /// #73: create a batch header (status typically `executing`)
+    ///
+    /// Production execute path uses [`Self::create_organize_batch_with_items`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn create_organize_batch(&self, status: &str, note: Option<&str>) -> SqliteResult<i64> {
+        self.conn.execute(
+            "INSERT INTO OrganizeBatches (status, note) VALUES (?1, ?2)",
+            params![status, note],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// #73: insert batch header + all items in one BEGIN IMMEDIATE transaction
+    pub fn create_organize_batch_with_items(
+        &self,
+        status: &str,
+        note: Option<&str>,
+        items: &[NewOrganizeBatchItem<'_>],
+    ) -> SqliteResult<i64> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<i64> {
+            self.conn.execute(
+                "INSERT INTO OrganizeBatches (status, note) VALUES (?1, ?2)",
+                params![status, note],
+            )?;
+            let batch_id = self.conn.last_insert_rowid();
+            for item in items {
+                self.insert_organize_batch_item(batch_id, item)?;
+            }
+            self.conn.execute("COMMIT", [])?;
+            Ok(batch_id)
+        })();
+        match tx_result {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after create_organize_batch_with_items: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    pub fn set_organize_batch_status(&self, batch_id: i64, status: &str) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE OrganizeBatches SET status = ?1 WHERE id = ?2",
+            params![status, batch_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_organize_batch(&self, batch_id: i64) -> SqliteResult<OrganizeBatch> {
+        self.conn.query_row(
+            "SELECT id, created_at, status, note FROM OrganizeBatches WHERE id = ?1",
+            params![batch_id],
+            |row| {
+                Ok(OrganizeBatch {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    status: row.get(2)?,
+                    note: row.get(3)?,
+                })
+            },
+        )
+    }
+
+    /// Latest batch that still has `moved` or retryable `undo_refused` items
+    pub fn latest_undoable_organize_batch(&self) -> SqliteResult<Option<OrganizeBatch>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT b.id, b.created_at, b.status, b.note
+             FROM OrganizeBatches b
+             WHERE EXISTS (
+                 SELECT 1 FROM OrganizeBatchItems i
+                 WHERE i.batch_id = b.id
+                   AND i.status IN ('moved', 'undo_refused')
+             )
+             ORDER BY b.id DESC
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(OrganizeBatch {
+                id: row.get(0)?,
+                created_at: row.get(1)?,
+                status: row.get(2)?,
+                note: row.get(3)?,
+            })),
+            None => Ok(None),
+        }
+    }
+
+    pub fn insert_organize_batch_item(
+        &self,
+        batch_id: i64,
+        item: &NewOrganizeBatchItem<'_>,
+    ) -> SqliteResult<i64> {
+        let id_label = item
+            .file_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "?".into());
+        let src = if item.src_path.trim().is_empty() {
+            format!("(unknown file_id={id_label})")
+        } else {
+            normalize_db_path(item.src_path)
+        };
+        let dst = if item.dst_path.trim().is_empty() {
+            src.clone()
+        } else {
+            normalize_db_path(item.dst_path)
+        };
+        // Never insert a dangling file_id (FK would fail if row already deleted)
+        let file_id = match item.file_id {
+            Some(id) if self.file_row_exists(id)? => Some(id),
+            _ => None,
+        };
+        self.conn.execute(
+            "INSERT INTO OrganizeBatchItems (
+                batch_id, file_id, src_path, dst_path, size, phash, status, collision,
+                src_organized_at, undo_attempts
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
+            params![
+                batch_id,
+                file_id,
+                src,
+                dst,
+                item.size as i64,
+                item.phash,
+                item.status,
+                item.collision,
+                item.src_organized_at
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn update_organize_batch_item_status(
+        &self,
+        item_id: i64,
+        status: &str,
+        error: Option<&str>,
+    ) -> SqliteResult<()> {
+        self.conn.execute(
+            "UPDATE OrganizeBatchItems SET status = ?1, error = ?2 WHERE id = ?3",
+            params![status, error, item_id],
+        )?;
+        Ok(())
+    }
+
+    /// Record an undo refusal; permanent failures or attempts ≥ max → `undo_failed`
+    pub fn record_organize_undo_refusal(
+        &self,
+        item_id: i64,
+        permanent: bool,
+        detail: &str,
+        max_attempts: i64,
+    ) -> SqliteResult<()> {
+        let attempts: i64 = self.conn.query_row(
+            "SELECT undo_attempts FROM OrganizeBatchItems WHERE id = ?1",
+            params![item_id],
+            |row| row.get(0),
+        )?;
+        let next = attempts + 1;
+        let status = if permanent || next >= max_attempts {
+            "undo_failed"
+        } else {
+            "undo_refused"
+        };
+        self.conn.execute(
+            "UPDATE OrganizeBatchItems
+             SET status = ?1, error = ?2, undo_attempts = ?3
+             WHERE id = ?4",
+            params![status, detail, next, item_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_organize_batch_items(
+        &self,
+        batch_id: i64,
+    ) -> SqliteResult<Vec<OrganizeBatchItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, batch_id, file_id, src_path, dst_path, size, phash,
+                    status, collision, error, src_organized_at, undo_attempts
+             FROM OrganizeBatchItems
+             WHERE batch_id = ?1
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![batch_id], |row| {
+            Ok(OrganizeBatchItem {
+                id: row.get(0)?,
+                batch_id: row.get(1)?,
+                file_id: row.get(2)?,
+                src_path: row.get(3)?,
+                dst_path: row.get(4)?,
+                size: row.get::<_, i64>(5)? as u64,
+                phash: row.get(6)?,
+                status: row.get(7)?,
+                collision: row.get(8)?,
+                error: row.get(9)?,
+                src_organized_at: row.get(10)?,
+                undo_attempts: row.get(11)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// After pending_move recovery: promote `moving` items whose Files.path already
+    /// matches dst, or mark failed when still at src with no pending intent.
+    ///
+    /// For `undoing` → `undone`, also restore `Files.organized_at` from the item's
+    /// `src_organized_at` in the same transaction — `recover_pending_moves` heals
+    /// with MarkNow, which would otherwise leave organized_at=now after undo.
+    pub fn reconcile_organize_batch_items_after_recovery(&self) -> SqliteResult<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT i.id, i.file_id, i.src_path, i.dst_path, i.status,
+                    f.path, f.pending_move_to, i.src_organized_at
+             FROM OrganizeBatchItems i
+             LEFT JOIN Files f ON f.id = i.file_id
+             WHERE i.status IN ('moving', 'undoing')",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+        let mut updated = 0usize;
+        let collected: Vec<_> = rows.collect::<SqliteResult<Vec<_>>>()?;
+        for (item_id, file_id, src, dst, item_status, file_path, pending, src_organized_at) in
+            collected
+        {
+            let Some(fid) = file_id else {
+                let status = if item_status == "undoing" {
+                    "undo_failed"
+                } else {
+                    "failed"
+                };
+                self.update_organize_batch_item_status(
+                    item_id,
+                    status,
+                    Some("file row deleted during batch"),
+                )?;
+                updated += 1;
+                continue;
+            };
+            let Some(file_path) = file_path else {
+                continue;
+            };
+            let path_n = normalize_db_path(&file_path);
+            let src_n = normalize_db_path(&src);
+            let dst_n = normalize_db_path(&dst);
+            let pending_set = pending
+                .as_ref()
+                .map(|p| !p.trim().is_empty())
+                .unwrap_or(false);
+            if item_status == "moving" {
+                if path_n == dst_n {
+                    self.update_organize_batch_item_status(item_id, "moved", None)?;
+                    updated += 1;
+                } else if path_n == src_n && !pending_set {
+                    self.update_organize_batch_item_status(
+                        item_id,
+                        "failed",
+                        Some("interrupted before filesystem move completed"),
+                    )?;
+                    updated += 1;
+                }
+            } else if item_status == "undoing" {
+                if path_n == src_n {
+                    self.complete_undoing_item_after_recovery(
+                        item_id,
+                        fid,
+                        src_organized_at.as_deref(),
+                    )?;
+                    updated += 1;
+                } else if path_n == dst_n && !pending_set {
+                    self.record_organize_undo_refusal(
+                        item_id,
+                        false,
+                        "interrupted before undo filesystem move completed",
+                        MAX_ORGANIZE_UNDO_ATTEMPTS,
+                    )?;
+                    updated += 1;
+                }
+            }
+        }
+        self.refresh_organize_batch_statuses()?;
+        Ok(updated)
+    }
+
+    /// Mark item `undone` and restore `Files.organized_at` from the pre-batch snapshot.
+    fn complete_undoing_item_after_recovery(
+        &self,
+        item_id: i64,
+        file_id: i64,
+        src_organized_at: Option<&str>,
+    ) -> SqliteResult<()> {
+        self.conn.execute("BEGIN IMMEDIATE", [])?;
+        let tx_result = (|| -> SqliteResult<()> {
+            self.conn.execute(
+                "UPDATE OrganizeBatchItems SET status = 'undone', error = NULL WHERE id = ?1",
+                params![item_id],
+            )?;
+            match src_organized_at {
+                None => {
+                    self.clear_file_organized_at(file_id)?;
+                }
+                Some(ts) => {
+                    self.conn.execute(
+                        "UPDATE Files SET organized_at = ?1 WHERE id = ?2",
+                        params![ts, file_id],
+                    )?;
+                }
+            }
+            self.conn.execute("COMMIT", [])?;
+            Ok(())
+        })();
+        match tx_result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if let Err(rb) = self.conn.execute("ROLLBACK", []) {
+                    eprintln!(
+                        "warn: ROLLBACK failed after complete_undoing_item_after_recovery: {rb}"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Recompute batch header status from item rows
+    pub fn refresh_organize_batch_statuses(&self) -> SqliteResult<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM OrganizeBatches
+             WHERE status IN ('executing', 'undoing', 'completed', 'partially_undone')",
+        )?;
+        let ids: Vec<i64> = stmt
+            .query_map([], |row| row.get(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+        for batch_id in ids {
+            let items = self.list_organize_batch_items(batch_id)?;
+            if items.is_empty() {
+                continue;
+            }
+            let any_moving = items.iter().any(|i| i.status == "moving");
+            let any_undoing = items.iter().any(|i| i.status == "undoing");
+            let moved = items.iter().filter(|i| i.status == "moved").count();
+            let undone = items.iter().filter(|i| i.status == "undone").count();
+            let undo_refused = items.iter().filter(|i| i.status == "undo_refused").count();
+            let undo_failed = items.iter().filter(|i| i.status == "undo_failed").count();
+            let next = if any_moving {
+                "executing"
+            } else if any_undoing {
+                "undoing"
+            } else if moved > 0 && (undone > 0 || undo_refused > 0 || undo_failed > 0) {
+                "partially_undone"
+            } else if moved == 0 && undo_refused > 0 {
+                // Retryable refusals remain — still undoable
+                "partially_undone"
+            } else if moved == 0 && undone > 0 {
+                // undo_failed-only with undone still counts as undone batch
+                "undone"
+            } else if moved == 0 && undo_failed > 0 && undone == 0 && undo_refused == 0 {
+                "undone"
+            } else {
+                "completed"
+            };
+            self.set_organize_batch_status(batch_id, next)?;
+        }
+        Ok(())
     }
 
     pub fn update_file_status(&self, file_id: i64, status: &str) -> SqliteResult<()> {
@@ -5929,7 +6657,7 @@ mod tests {
     fn fresh_db_creates_jobs_and_suspected_tables_at_current_version() {
         let db = open_memory_db();
         assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
-        assert_eq!(SCHEMA_USER_VERSION, 7);
+        assert_eq!(SCHEMA_USER_VERSION, 8);
         assert!(db.jobs_table_exists().expect("Jobs exists"));
         assert!(db
             .suspected_duplicates_table_exists()
@@ -6320,10 +7048,10 @@ mod tests {
     }
 
     #[test]
-    fn fresh_db_lands_at_schema_v7() {
+    fn fresh_db_lands_at_schema_v8() {
         let db = open_memory_db();
-        assert_eq!(db.get_user_version().expect("uv"), 7);
-        assert_eq!(SCHEMA_USER_VERSION, 7);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
+        assert_eq!(SCHEMA_USER_VERSION, 8);
         let n: i64 = db
             .conn
             .query_row(
@@ -6338,6 +7066,26 @@ mod tests {
             files_has_column(&db, "pending_move_to"),
             "fresh DB must have pending_move_to"
         );
+        let batches: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'OrganizeBatches'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("batches");
+        let items: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'OrganizeBatchItems'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("items");
+        assert_eq!(batches, 1, "fresh DB must have OrganizeBatches");
+        assert_eq!(items, 1, "fresh DB must have OrganizeBatchItems");
     }
 
     #[test]
@@ -6346,7 +7094,7 @@ mod tests {
         write_v5_with_organized_at(&path);
         assert_eq!(raw_user_version(&path), 5);
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         assert!(
             files_has_column(&db, "organized_at"),
             "organized_at must survive v5→v7"
@@ -6532,7 +7280,7 @@ mod tests {
             );
         }
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         assert!(files_has_column(&db, "pending_move_to"));
         assert!(files_has_column(&db, "pending_source_vol"));
         assert!(files_has_column(&db, "pending_source_idx"));
@@ -6560,7 +7308,7 @@ mod tests {
         // Idempotent re-open
         drop(db);
         let db2 = Database::new(path.to_str().expect("utf8")).expect("reopen");
-        assert_eq!(db2.get_user_version().expect("uv"), 7);
+        assert_eq!(db2.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         assert!(files_has_column(&db2, "pending_move_to"));
         let _ = std::fs::remove_file(&path);
     }
@@ -6577,7 +7325,7 @@ mod tests {
             assert_eq!(raw_user_version(&path), 6);
         }
         let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
-        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         assert!(files_has_column(&db, "pending_move_to"));
         db.set_pending_move_to(2, "/lib/dest.mp4", None).expect("set");
         assert_eq!(
@@ -6634,7 +7382,7 @@ mod tests {
         }
 
         let db = Database::new(path.to_str().expect("utf8")).expect("open repair");
-        assert_eq!(db.get_user_version().expect("uv"), 7);
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
         assert!(
             files_has_column(&db, "pending_source_vol"),
             "ensure_v7_columns must ADD pending_source_vol on already-v7 DBs"
@@ -6707,6 +7455,136 @@ mod tests {
                 "failed mig must not leave pending_source_vol column"
             );
         }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Full v7 shape (pending columns) for v7→v8 upgrade tests
+    fn write_v7_pending_complete(path: &Path) {
+        write_v6_populated(path);
+        let conn = Connection::open(path).expect("open");
+        conn.execute_batch(
+            "
+            ALTER TABLE Files ADD COLUMN pending_move_to TEXT;
+            ALTER TABLE Files ADD COLUMN pending_source_vol INTEGER;
+            ALTER TABLE Files ADD COLUMN pending_source_idx INTEGER;
+            CREATE INDEX IF NOT EXISTS idx_files_pending_move_to
+                ON Files(pending_move_to)
+                WHERE pending_move_to IS NOT NULL;
+            PRAGMA user_version = 7;
+            ",
+        )
+        .expect("seed v7 complete");
+    }
+
+    #[test]
+    fn v7_upgrades_to_v8_organize_batches() {
+        let path = temp_db_path("v7-to-v8-batches");
+        write_v7_pending_complete(&path);
+        assert_eq!(raw_user_version(&path), 7);
+        let db = Database::new(path.to_str().expect("utf8")).expect("upgrade");
+        assert_eq!(db.get_user_version().expect("uv"), SCHEMA_USER_VERSION);
+        assert!(files_has_column(&db, "pending_move_to"));
+        let batches: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'OrganizeBatches'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("batches");
+        let items: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'OrganizeBatchItems'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("items");
+        assert_eq!(batches, 1);
+        assert_eq!(items, 1);
+        // Populated v7 rows survive
+        let a = db.get_file_by_id(1).expect("file 1");
+        assert_eq!(a.path, normalize_db_path("/lib/a.mp4"));
+        let batch_id = db
+            .create_organize_batch("completed", Some("smoke"))
+            .expect("create batch");
+        assert!(batch_id > 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn v8_without_batch_tables_is_repaired_on_open() {
+        let path = temp_db_path("v8-no-tables");
+        write_v7_pending_complete(&path);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute_batch("PRAGMA user_version = 8;")
+                .expect("stamp v8 without tables");
+        }
+        assert_eq!(raw_user_version(&path), 8);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = 'table' AND name = 'OrganizeBatches'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count");
+            assert_eq!(n, 0, "precondition: no OrganizeBatches");
+        }
+        let db = Database::new(path.to_str().expect("utf8")).expect("repair");
+        assert_eq!(db.get_user_version().expect("uv"), 8);
+        let n: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'OrganizeBatches'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(n, 1, "ensure_v8_tables must CREATE OrganizeBatches");
+        let item_n: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'OrganizeBatchItems'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("items");
+        assert_eq!(item_n, 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migration_8_failure_rolls_back_stays_at_v7() {
+        let path = temp_db_path("v7-mig8-rollback");
+        write_v7_pending_complete(&path);
+        {
+            let conn = Connection::open(&path).expect("raw");
+            // Poison table name as a view so CREATE TABLE IF NOT EXISTS is a no-op
+            // then CREATE INDEX on a view fails.
+            conn.execute_batch(
+                "CREATE VIEW OrganizeBatches AS SELECT 1 AS id, 'x' AS status;",
+            )
+            .expect("poison view");
+        }
+        match Database::new(path.to_str().expect("utf8")) {
+            Ok(_) => panic!("mig should fail when OrganizeBatches name is a view"),
+            Err(err) => {
+                let msg = err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("index") || msg.contains("view") || msg.contains("table"),
+                    "expected index/view error, got {msg}"
+                );
+            }
+        }
+        assert_eq!(raw_user_version(&path), 7, "failed mig must not bump version");
         let _ = std::fs::remove_file(&path);
     }
 

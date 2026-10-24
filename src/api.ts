@@ -6,6 +6,11 @@ import type {
   EnqueueResult,
   ErrorLogEntry,
   FileWithMetadata,
+  OrganizeBatch,
+  OrganizeExecutePlanItem,
+  OrganizeExecuteResult,
+  OrganizePreviewResult,
+  OrganizeUndoResult,
   PipelineOptionsInput,
   PreviewTemplateResult,
   ResolvePathCollisionOutcome,
@@ -150,6 +155,32 @@ export async function enqueuePipelineJobs(
 
 export async function organizeEligibleFiles(): Promise<EnqueueResult> {
   return await invoke("organize_eligible_files_command");
+}
+
+/** #73: read-only batch organize preview */
+export async function previewBatchOrganize(
+  fileIds?: number[]
+): Promise<OrganizePreviewResult> {
+  return await invoke("preview_batch_organize_command", {
+    fileIds: fileIds && fileIds.length > 0 ? fileIds : null,
+  });
+}
+
+/** #73: confirm and execute batch moves from previewed (fileId, dstPath) pairs */
+export async function executeBatchOrganize(
+  plans: OrganizeExecutePlanItem[]
+): Promise<OrganizeExecuteResult> {
+  return await invoke("execute_batch_organize_command", { plans });
+}
+
+/** #73: undo last organize batch */
+export async function undoLastOrganizeBatch(): Promise<OrganizeUndoResult> {
+  return await invoke("undo_last_organize_batch_command");
+}
+
+/** #73: latest undoable batch (or null) */
+export async function getLastUndoableOrganizeBatch(): Promise<OrganizeBatch | null> {
+  return await invoke("get_last_undoable_organize_batch_command");
 }
 
 export async function canonicalizePath(path: string): Promise<string> {

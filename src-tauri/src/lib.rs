@@ -1,4 +1,5 @@
 mod database;
+mod batch_organize;
 mod connectivity;
 mod file_stability;
 mod file_status;
@@ -149,6 +150,17 @@ pub fn run() {
                 }
             }
 
+            // #73: promote batch items left as moving/undoing after pending recovery
+            match batch_organize::reconcile_organize_batches_after_recovery(&db) {
+                Ok(n) if n > 0 => {
+                    eprintln!("info: reconciled {n} organize batch item(s) on startup");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("warn: organize batch reconcile failed: {e:#}");
+                }
+            }
+
             // #59 S2: scan leftover sidecars off the UI thread (large / network roots)
             // Only `scan_directories` are walked absolute-template output roots are
             // not covered (see PR notes). Dedup ErrorLog by category+path+message.
@@ -257,6 +269,10 @@ pub fn run() {
             commands::remove_duplicate_tombstone_command,
             commands::preview_output_template_command,
             commands::resolve_path_collision_command,
+            commands::preview_batch_organize_command,
+            commands::execute_batch_organize_command,
+            commands::undo_last_organize_batch_command,
+            commands::get_last_undoable_organize_batch_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
